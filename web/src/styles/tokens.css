@@ -1,0 +1,81 @@
+/* tokens.css — Workbenchens designtokens. FRUSET (CONTRACT §14).
+   Sammansmält ur tre känsloprototyper (Glas, Bläck, Ritning) och två domares bedömningar:
+   Glas yta, LED-prick och fjädrar · Bläcks djupblå, läsbara HUD och typografi · Ritnings snäpp till exakt rektangel. */
+:root {
+  /* Ytan: neutral grå med mjukt ljusfall (WebGL), en knappt synlig prickgrid i världen */
+  --wb-canvas-center: #b0b3b8;
+  --wb-canvas-edge: #85888e;
+  --wb-canvas: #9b9ea3;                /* reserv utan WebGL (radiell gradient center → kant) */
+  --wb-grid-spacing: 24;               /* världsenheter; fördubblas mjukt när avståndet < 12 skärm-px */
+  --wb-grid-darken: 0.085;
+
+  /* Accent: en enda blå, för streck, prick, glöd */
+  --wb-accent: #2f6bff;
+  --wb-accent-glow: rgba(47, 107, 255, 0.55);
+  --wb-amber: #f5a524;                 /* fel: prick */
+
+  /* Fönster: vita ark med mjuk, realistisk skugga */
+  --wb-win-radius: 16px;               /* i världsenheter (skalas med zoom) */
+  --wb-win-bg: #ffffff;
+  --wb-win-shadow: 0 1px 2px rgba(14, 18, 26, 0.08), 0 10px 24px -8px rgba(14, 18, 26, 0.2), 0 36px 84px -24px rgba(14, 18, 26, 0.4);
+  --wb-win-shadow-lift: 0 2px 4px rgba(14, 18, 26, 0.1), 0 18px 36px -10px rgba(14, 18, 26, 0.26), 0 56px 110px -28px rgba(14, 18, 26, 0.48);
+
+  /* Fröytan (ritad men ännu inte byggd app) */
+  --wb-seed-bg: rgba(255, 255, 255, 0.72);
+  --wb-seed-line: rgba(47, 107, 255, 0.22);
+
+  /* Ritstreck */
+  --wb-ink: #2f6bff;
+  --wb-ink-width: 2px;
+  --wb-ghost-stroke: rgba(47, 107, 255, 0.55);
+  --wb-ghost-fill: rgba(47, 107, 255, 0.04);
+
+  /* Pricken (LED): skärmfast, krymper i översikt */
+  --wb-dot-size: 10px;
+  --wb-dot-core: radial-gradient(circle at 40% 35%, #ffffff 0%, #d2e3ff 28%, #5b9bff 62%, #2a6ceb 100%);
+  --wb-dot-glow: 0 0 5px rgba(47, 107, 255, 0.85), 0 0 14px rgba(47, 107, 255, 0.55);
+  --wb-dot-halo: 44px;
+  --wb-dot-breath: 3.2s;               /* idle; building = samma animation med playbackRate 3.3 */
+
+  /* Greppet och sidprickarna under fönstret */
+  --wb-grip-w: 44px;
+  --wb-grip-h: 5px;
+  --wb-grip: rgba(20, 24, 32, 0.28);
+  --wb-grip-hover: rgba(20, 24, 32, 0.5);
+  --wb-face-dot: rgba(20, 24, 32, 0.3);
+  --wb-face-dot-on: rgba(20, 24, 32, 0.75);
+
+  /* HUD: blått glas. Det som ligger bakom syns igenom, suddigt, men mörkas i filtret (brightness 0,45) och färgas
+     av en tunn blå ton i stället för en ogenomskinlig fyllning. All text ≥ 4,5:1 över grått, vitt och mörkt
+     (tests/unit/hud-contrast.test.ts modellerar saturate() och brightness(), kalibrerat mot Chrome) */
+  --wb-hud-w: 360px;
+  --wb-hud-radius: 22px;
+  --wb-hud-bg: linear-gradient(170deg, rgba(14, 64, 236, 0.46) 0%, rgba(10, 46, 200, 0.5) 100%);
+  --wb-hud-blur: blur(28px) saturate(2) brightness(0.45);   /* 28 px: apptext suddas bort, former och färger syns */
+  --wb-hud-edge: inset 0 1px 0 rgba(255, 255, 255, 0.55), inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 14px 18px -14px rgba(196, 220, 255, 0.4);
+  --wb-hud-shadow: 0 0 0 0.5px rgba(8, 20, 70, 0.22), 0 22px 56px -18px rgba(8, 20, 70, 0.5), 0 4px 14px rgba(8, 20, 70, 0.16);
+  --wb-hud-text: #ffffff;              /* Claudes svar */
+  --wb-hud-user: rgba(255, 255, 255, 0.82); /* användarens rader: dämpade, ingen bubbla */
+  --wb-hud-muted: rgba(255, 255, 255, 0.79);
+  --wb-hud-error: #ffd6cf;
+  --wb-hud-composer: rgba(255, 255, 255, 0.05);
+  --wb-hud-card: rgba(255, 255, 255, 0.05);
+
+  /* Typografi */
+  --wb-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --wb-font-reply: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", system-ui, sans-serif;   /* Claudes svar: modern sans, vikt 450 i hud.css */
+  --wb-font-mono: ui-monospace, "SF Mono", Menlo, monospace;                  /* aktivitetsraden, detaljer */
+  --wb-text-ui: 14.5px;
+  --wb-text-reply: 16.5px;
+  --wb-text-mono: 12.5px;
+
+  /* Rörelse: dämpade fjädrar (massa 1, x'' = −k(x−1) − c·x') samplade till linear(); använd med sin längd.
+     Uträknade, inte uppskattade. Det mesta av rörelsen sker under första tredjedelen. */
+  --wb-spring-soft: linear(0, 0.0978, 0.3033, 0.5241, 0.7195, 0.8645, 0.9612, 1.0176, 1.0427, 1.0483, 1.0428, 1.0328, 1.0221, 1.0129, 1.0061, 1.0015, 0.999, 0.9979, 0.9977, 0.998, 0.9985, 0.999, 0.9994, 0.9997, 1);
+  --wb-spring-soft-ms: 773ms;          /* k230 c21, 4,8 % översläng: HUD:en glider ut, fönster läggs ned */
+  --wb-spring-pop: linear(0, 0.146, 0.4423, 0.7493, 0.977, 1.1064, 1.1496, 1.1351, 1.092, 1.0456, 1.0088, 0.9865, 0.9779, 0.9789, 0.9848, 0.9919, 0.9978, 1.0016, 1.0032, 1.0033, 1.0025, 1.0014, 1.0005, 0.9998, 1);
+  --wb-spring-pop-ms: 771ms;           /* k340 c19, 15 % översläng: bara små saker (pricken tänds, pricken "sväljer" HUD:en) */
+  --wb-spring-calm: linear(0, 0.0641, 0.1976, 0.3452, 0.4859, 0.6051, 0.7026, 0.7805, 0.8393, 0.8837, 0.9171, 0.9411, 0.9587, 0.971, 0.9799, 0.9861, 0.9905, 0.9935, 0.9956, 0.997, 0.998, 0.9987, 0.9991, 0.9994, 1);
+  --wb-spring-calm-ms: 785ms;          /* k150 c24, ingen översläng: kamera, prisma som vrids */
+  --wb-ease-snap: cubic-bezier(0.77, 0, 0.175, 1);   /* easeInOutQuart: streck → exakt rektangel, 270 ms */
+}

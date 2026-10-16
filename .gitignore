@@ -1,0 +1,19 @@
+# Projektets Obsidian-valv följer aldrig med i repot
+vault/
+.obsidian/
+
+node_modules/
+dist/
+.DS_Store
+
+# Användarens appar (varsitt git-repo) och workbenchens körtidsdata
+apps/
+data/
+
+# Byggarnas och testernas tillfälliga kataloger
+.scratch/
+
+# Hemligheter och loggar
+.env
+.env.*
+*.log

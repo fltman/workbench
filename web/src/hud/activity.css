@@ -1,0 +1,203 @@
+/* activity.css — aktivitetsradens puls och panelens kantljus (CONTRACT §13 punkt 3, §14). Ägs av panel.ts.
+   En liten LED-prick i början av raden andas i samma takt som appens prick under building, ett svagt ljus
+   sveper över etiketten, och panelens innerkant andas i takt med pricken. Bara befintliga tokens, så att allt
+   följer HUD:ens glas. Andningarna är WAAPI-animationer i panel.ts på en gemensam tidslinje; svepet är CSS här. */
+
+/* Halon får lysa utanför raden; spåret nedan klipper texten när en ny etikett glider upp. */
+.wbh-panel .wbh-activity {
+  overflow: visible;
+}
+
+/* Den lämnande raden (turen slut) står utanför flödet på sin plats medan den tonar ut, så att panelen
+   krymper en gång, tillsammans med att golvet släpps (panel.ts). */
+.wbh-panel .wbh-content {
+  position: relative;
+}
+
+.wbh-panel .wbh-activity.is-leaving {
+  position: absolute;
+  margin: 0;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------------ pricken */
+
+.wbh-act-dot {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -3.5px;
+  pointer-events: none;
+}
+
+.wbh-act-dot i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: block;
+  border-radius: 50%;
+}
+
+/* Halon är ljusare än världens (vit blandad med accenten): blått på det djupblå glaset syns inte. */
+.wbh-act-halo {
+  --wbh-halo: color-mix(in srgb, var(--wb-hud-text) 50%, var(--wb-accent));
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--wbh-halo) 62%, transparent) 0%,
+    color-mix(in srgb, var(--wbh-halo) 22%, transparent) 34%,
+    color-mix(in srgb, var(--wbh-halo) 0%, transparent) 66%
+  );
+  opacity: 0.55;
+  transform: scale(0.62);
+}
+
+.wbh-act-core {
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  background: var(--wb-dot-core);
+  box-shadow: var(--wb-dot-glow);
+}
+
+/* ------------------------------------------------------------------ etiketten och svepet */
+
+.wbh-act-track {
+  position: absolute;
+  inset: 0 0 0 16px;
+  overflow: hidden;
+}
+
+/* Svepets bredd och resa mäts i radens bredd (cqw), oavsett etikettens längd. */
+.wbh-panel .wbh-activity-line {
+  container-type: inline-size;
+}
+
+/* Ljuset är en vit kopia av etiketten (::before, inte i DOM-texten) i ett mjukt maskat fönster.
+   Fönstret glider åt höger och kopian lika långt åt vänster: texten står still och bara ljuset vandrar.
+   Båda är transform-animationer (kompositorn). Samma period och kurva som fröytans ljusband (1,9 s). */
+.wbh-act-sweep {
+  --wbh-band: 84px;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--wbh-band);
+  overflow: hidden;
+  pointer-events: none;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, rgb(0 0 0 / 0.85) 50%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, rgb(0 0 0 / 0.85) 50%, transparent 100%);
+  transform: translateX(calc(-1 * var(--wbh-band)));
+  animation: wbh-sweep 1.9s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+
+.wbh-act-sweep::before {
+  content: attr(data-label);
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100cqw;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--wb-hud-text);
+  transform: translateX(var(--wbh-band));
+  animation: wbh-sweep-text 1.9s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+
+@keyframes wbh-sweep {
+  from {
+    transform: translateX(calc(-1 * var(--wbh-band)));
+  }
+  to {
+    transform: translateX(100cqw);
+  }
+}
+
+@keyframes wbh-sweep-text {
+  from {
+    transform: translateX(var(--wbh-band));
+  }
+  to {
+    transform: translateX(-100cqw);
+  }
+}
+
+/* ------------------------------------------------------------------ kantljuset */
+
+/* Medan Claude arbetar andas ett mjukt ljus i panelens innerkant, som ljus som fångats i kanten av glaset.
+   .wbh-rim är kuvertet (tonar in och ut på 160 ms); i det ligger en skarp kant och ett mjukt sken, som andas med
+   olika styrka, så att ljuset blir starkare och mjukare mot toppen och drar sig tillbaka till kanten i dalen.
+   Bara opacitet animeras (panel.ts), aldrig skuggorna. Ljuset ligger i glaset, under text och kapsel, och håller
+   sig inom de yttersta 14 px: texten börjar 18 px in. Finns även i ihopfällningens kopia (fryst, tonar ut). */
+.wbh-panel {
+  isolation: isolate;
+}
+
+.wbh-rim,
+.wbh-rim > i {
+  position: absolute;
+  inset: 0;
+  display: block;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.wbh-rim {
+  --wbh-rim-edge: color-mix(in srgb, var(--wb-hud-text) 78%, var(--wb-accent));
+  --wbh-rim-glow: color-mix(in srgb, var(--wb-hud-text) 52%, var(--wb-accent));
+  z-index: -1;
+  opacity: 0;
+}
+
+.wbh-rim.is-on {
+  opacity: 1;
+}
+
+.wbh-rim-edge {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--wbh-rim-edge) 78%, transparent),
+    inset 0 0 3px 1px color-mix(in srgb, var(--wbh-rim-edge) 42%, transparent);
+  opacity: 0.7;
+}
+
+.wbh-rim-glow {
+  box-shadow:
+    inset 0 0 5px 1px color-mix(in srgb, var(--wbh-rim-glow) 72%, transparent),
+    inset 0 0 12px 1px color-mix(in srgb, var(--wbh-rim-glow) 58%, transparent);
+  opacity: 0.55;
+}
+
+/* Minskad rörelse: pricken andas bara i ljusstyrka (panel.ts) och inget ljus vandrar. Kantljuset andas inte:
+   det står stilla, något ljusare än dalen, och tonar bara in och ut. */
+@media (prefers-reduced-motion: reduce) {
+  .wbh-act-sweep {
+    display: none;
+  }
+
+  .wbh-rim-edge {
+    opacity: 0.8;
+  }
+
+  .wbh-rim-glow {
+    opacity: 0.6;
+  }
+}
+
+/* En HUD som inte är aktiv (§13, §14): inget svep, och kantljuset andas inte utan står stilla och svagt. Pricken
+   står still eftersom panel.ts inte skapar dess andning i en lugn panel. */
+.wbh-panel.is-calm .wbh-act-sweep {
+  display: none;
+}
+
+.wbh-panel.is-calm .wbh-rim-edge {
+  opacity: 0.45;
+}
+
+.wbh-panel.is-calm .wbh-rim-glow {
+  opacity: 0.18;
+}

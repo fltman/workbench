@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Workbench</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <div id="stage">
+      <!-- Lager nerifrån och upp. Ägs av världen utom #hud-layer. -->
+      <canvas id="bg"></canvas>
+      <div id="world"></div>
+      <svg id="ink"></svg>
+      <div id="chrome"></div>
+      <div id="hud-layer"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

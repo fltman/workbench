@@ -1,0 +1,843 @@
+/* base.css — skalets grund och världens utseende (CONTRACT §10.1, §14). Ägs av world-byggaren.
+   Alla färger, mått och rörelser kommer från tokens.css. Inget här har text: kromen är ordlös. */
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  background: var(--wb-canvas);
+  font-family: var(--wb-font);
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ------------------------------------------------------------------ lager (§10.1) */
+
+#stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  /* Reserv utan WebGL: samma ljusfall som shadern, utan prickgrid. */
+  background: radial-gradient(130% 100% at 50% 36%, var(--wb-canvas-center) 0%, var(--wb-canvas) 46%, var(--wb-canvas-edge) 100%);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  /* Pennspetsen: den enda ledtråden på den tomma ytan. */
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Ccircle cx='12' cy='12' r='3.75' fill='%232f6bff' stroke='%23fff' stroke-width='1.5'/%3E%3C/svg%3E") 12 12, crosshair;
+}
+
+#bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+#bg.wb-off {
+  display: none;
+}
+
+#world {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+}
+
+#ink {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+#chrome {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  contain: strict;
+}
+
+#hud-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Drag som skalet äger: iframes får inte stjäla rörelsen (§10.3). */
+html.wb-dragging iframe {
+  pointer-events: none;
+}
+
+/* Ett fönster eller en krom som löses upp tar aldrig emot pekaren, inte ens delar som har auto (K1). */
+.wb-gone,
+.wb-gone * {
+  pointer-events: none !important;
+}
+
+/* ------------------------------------------------------------------ ritstrecket (§14) */
+
+#ink .wb-ink {
+  fill: none;
+  stroke: var(--wb-ink);
+  stroke-width: var(--wb-ink-width);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+#ink .wb-ink-glow {
+  fill: none;
+  stroke: var(--wb-accent-glow);
+  stroke-width: 6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.75;
+}
+
+#ink .wb-ghost {
+  fill: var(--wb-ghost-fill);
+  stroke: var(--wb-ghost-stroke);
+  stroke-width: 1;
+  stroke-dasharray: 5 4;
+  opacity: 0;
+  transition: opacity 0.18s ease-out;
+}
+
+#ink .wb-ghost.wb-on {
+  opacity: 1;
+}
+
+/* ------------------------------------------------------------------ fönster (världsenheter) */
+
+.wb-win {
+  position: absolute;
+}
+
+.wb-shadow {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--wb-win-radius);
+  box-shadow: var(--wb-win-shadow);
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+
+.wb-shadow.wb-lift {
+  box-shadow: var(--wb-win-shadow-lift);
+  opacity: 0;
+}
+
+.wb-win.wb-lifted .wb-shadow.wb-lift {
+  opacity: 1;
+}
+
+.wb-win.wb-lifted .wb-shadow:not(.wb-lift) {
+  opacity: 0;
+}
+
+.wb-prism,
+.wb-rot,
+.wb-face {
+  position: absolute;
+  inset: 0;
+}
+
+/* Minimerad (§10.7): en levande miniatyr i raden i nedre vänstra hörnet. Hela miniatyren är en knapp som tar fram
+   appen; inget i den tar emot pekaren. */
+.wb-win.wb-mini {
+  cursor: pointer;
+}
+
+.wb-win.wb-mini .wb-face,
+.wb-win.wb-mini .wb-frame {
+  pointer-events: none;
+}
+
+.wb-win.wb-mini:hover .wb-shadow:not(.wb-lift) {
+  box-shadow: var(--wb-win-shadow-lift);
+}
+
+/* Behållarna får aldrig ta klicken från sidorna (i en preserve-3d-kontext sorteras de med sidorna). */
+.wb-prism,
+.wb-rot {
+  pointer-events: none;
+}
+
+.wb-face {
+  pointer-events: auto;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.wb-sheet {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--wb-win-radius);
+  overflow: hidden;
+  background: var(--wb-win-bg);
+  transition: background-color 0.26s ease-out;
+}
+
+.wb-frames {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+}
+
+.wb-frame {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border: 0;
+  display: block;
+  background: transparent;
+}
+
+.wb-frame.wb-incoming {
+  pointer-events: none;
+}
+
+/* Sidor som vänder sig bort skuggas lätt medan prisman är i 3D. */
+.wb-shade {
+  position: absolute;
+  inset: 0;
+  background: rgb(14 18 26);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* I 3D: den platta skuggan ersätts av en som följer silhuetten. */
+.wb-win.wb-3d .wb-shadow {
+  opacity: 0;
+}
+
+.wb-win.wb-3d .wb-prism {
+  filter: drop-shadow(0 1px 1.5px rgb(14 18 26 / 0.12)) drop-shadow(0 14px 26px rgb(14 18 26 / 0.22));
+}
+
+.wb-win.wb-3d .wb-sheet {
+  box-shadow: inset 0 0 0 0.5px rgb(14 18 26 / 0.1);
+}
+
+/* ------------------------------------------------------------------ fröytan (§14) */
+
+.wb-win.wb-unbuilt .wb-sheet {
+  background: var(--wb-seed-bg);
+}
+
+.wb-seed {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* Hårlinjer: en skärm-px oavsett zoom och skala (--wb-inv = 1/zoom på #world, --wb-k = fönstrets skala). */
+.wb-seed path {
+  fill: none;
+  stroke: var(--wb-seed-line);
+  stroke-width: calc(1px * var(--wb-inv, 1) / var(--wb-k, 1));
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wb-seed .wb-guides {
+  opacity: 0.55;
+}
+
+.wb-seed .wb-group {
+  display: none;
+}
+
+.wb-seed .wb-group.wb-on {
+  display: inline;
+}
+
+.wb-seed .wb-group path {
+  stroke-dasharray: 1 1;
+  stroke-dashoffset: 0;
+}
+
+/* Ett svagt ljusband som sveper över var 1,9 s medan Claude bygger. */
+.wb-band {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.5s ease;
+}
+
+.wb-win.wb-building .wb-band {
+  opacity: 1;
+}
+
+.wb-band::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 46%;
+  background: linear-gradient(100deg, rgb(255 255 255 / 0) 0%, rgb(255 255 255 / 0.5) 50%, rgb(255 255 255 / 0) 100%);
+  transform: translateX(-110%);
+  animation: wb-band 1.9s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+
+@keyframes wb-band {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(330%);
+  }
+}
+
+/* ------------------------------------------------------------------ krom (skärmfast, §14) */
+
+.wb-cw {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.wb-cw > * {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+/* LED-pricken: kärna, glöd och en halo som andas. */
+.wb-dot {
+  width: 32px;
+  height: 32px;
+  margin: -16px 0 0 -16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+  outline: none;
+  pointer-events: auto;
+  -webkit-tap-highlight-color: transparent;
+  transition: opacity 0.2s ease;
+}
+
+.wb-dot.wb-covered {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.wb-dot-pop,
+.wb-dot-halo-wrap {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+
+.wb-dot-pop {
+  transition: transform 0.45s var(--wb-spring-soft);
+}
+
+.wb-dot.wb-small .wb-dot-pop {
+  transform: scale(0.6);
+}
+
+.wb-dot-halo-wrap {
+  transition: opacity 0.3s ease;
+}
+
+.wb-dot.wb-small .wb-dot-halo-wrap {
+  opacity: 0;
+}
+
+.wb-dot i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  border-radius: 50%;
+  pointer-events: none;
+  display: block;
+}
+
+.wb-dot-halo {
+  width: var(--wb-dot-halo);
+  height: var(--wb-dot-halo);
+  margin: calc(var(--wb-dot-halo) / -2) 0 0 calc(var(--wb-dot-halo) / -2);
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--wb-accent) 72%, transparent) 0%,
+    color-mix(in srgb, var(--wb-accent) 30%, transparent) 34%,
+    color-mix(in srgb, var(--wb-accent) 0%, transparent) 66%
+  );
+}
+
+.wb-dot-core {
+  width: var(--wb-dot-size);
+  height: var(--wb-dot-size);
+  margin: calc(var(--wb-dot-size) / -2) 0 0 calc(var(--wb-dot-size) / -2);
+  background: var(--wb-dot-core);
+  box-shadow: var(--wb-dot-glow);
+  transition: transform 0.45s var(--wb-spring-pop);
+}
+
+.wb-dot:hover .wb-dot-core {
+  transform: scale(1.22);
+}
+
+.wb-dot:active .wb-dot-core {
+  transform: scale(0.86);
+}
+
+.wb-dot:focus-visible .wb-dot-core {
+  box-shadow: var(--wb-dot-glow), 0 0 0 3px rgb(255 255 255 / 0.9);
+}
+
+.wb-dot-flash {
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  box-sizing: border-box;
+  border: 1.5px solid var(--wb-accent);
+  opacity: 0;
+}
+
+/* Fel, eller backenden har kraschat: bärnstensfärgad kärna. */
+.wb-dot.wb-amber .wb-dot-core {
+  background: radial-gradient(circle at 40% 35%, #ffffff 0%, color-mix(in srgb, var(--wb-amber) 35%, white) 28%, var(--wb-amber) 62%, color-mix(in srgb, var(--wb-amber) 80%, black) 100%);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--wb-amber) 85%, transparent), 0 0 14px color-mix(in srgb, var(--wb-amber) 50%, transparent);
+}
+
+.wb-dot.wb-amber .wb-dot-halo {
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--wb-amber) 60%, transparent) 0%,
+    color-mix(in srgb, var(--wb-amber) 24%, transparent) 34%,
+    color-mix(in srgb, var(--wb-amber) 0%, transparent) 66%
+  );
+}
+
+.wb-dot.wb-amber .wb-dot-flash {
+  border-color: var(--wb-amber);
+}
+
+/* Greppet: en pill 10 px under fönstrets nederkant. */
+.wb-grip {
+  width: 72px;
+  height: 24px;
+  margin: -12px 0 0 -36px;
+  display: grid;
+  place-items: center;
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+  transition: opacity 0.2s ease;
+}
+
+.wb-grip i {
+  display: block;
+  width: var(--wb-grip-w);
+  height: var(--wb-grip-h);
+  border-radius: 999px;
+  background: var(--wb-grip);
+  transition: background-color 0.2s ease;
+}
+
+.wb-grip:hover i,
+.wb-grip.wb-active i {
+  background: var(--wb-grip-hover);
+}
+
+.wb-grip.wb-active {
+  cursor: grabbing;
+}
+
+.wb-grip.wb-hidden,
+.wb-facedots.wb-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Ta bort (§10.5): ett kryss till höger om minimeringen, i greppets färg och rött vid hovring. Första klicket gör det
+   till en röd "Ta bort" som växer åt höger; det andra tar bort appen. */
+.wb-delbtn {
+  height: 22px;
+  min-width: 22px;
+  margin: -11px 0 0 -11px;
+  padding: 0;
+  border: 0;
+  border-radius: 11px;
+  background: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  cursor: pointer;
+  outline: none;
+  font: 600 12px/1 var(--wb-font);
+  color: #fff;
+  white-space: nowrap;
+  transition: opacity 0.2s ease, background-color 0.18s ease, padding 0.18s ease;
+}
+
+.wb-delbtn i {
+  position: relative;
+  display: block;
+  width: 10px;
+  height: 10px;
+}
+
+.wb-delbtn i::before,
+.wb-delbtn i::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 11px;
+  height: 1.75px;
+  border-radius: 1px;
+  background: var(--wb-grip);
+  transition: background-color 0.2s ease;
+}
+
+.wb-delbtn i::before {
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.wb-delbtn i::after {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+.wb-delbtn span {
+  display: none;
+}
+
+.wb-delbtn:hover i::before,
+.wb-delbtn:hover i::after,
+.wb-delbtn:focus-visible i::before,
+.wb-delbtn:focus-visible i::after {
+  background: #c4321f;
+}
+
+.wb-delbtn.wb-armed {
+  padding: 0 10px 0 8px;
+  gap: 6px;
+  background: #c4321f;
+  box-shadow: 0 2px 8px -2px rgb(196 50 31 / 0.5);
+}
+
+.wb-delbtn.wb-armed i::before,
+.wb-delbtn.wb-armed i::after {
+  background: #fff;
+  width: 9px;
+}
+
+.wb-delbtn.wb-armed span {
+  display: inline;
+}
+
+.wb-delbtn.wb-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Sidan Förslag (§10.8): skalets egen sida sist på varje byggd app. Inga rubriker: listan är förslagen. */
+.wb-ideas {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  padding: 26px 26px 22px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  font-family: var(--wb-font);
+  color: rgb(18 22 30);
+  background: var(--wb-win-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.wb-ideas-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wb-idea {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 14px;
+  border: 0;
+  border-radius: 12px;
+  background: none;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.35;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.wb-idea:hover,
+.wb-idea:focus-visible {
+  background: rgb(47 107 255 / 0.08);
+  color: var(--wb-accent);
+  outline: none;
+}
+
+.wb-idea-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--wb-accent);
+  box-shadow: 0 0 0 3px rgb(47 107 255 / 0.14);
+  transform: translateY(-1px);
+}
+
+/* Medan Claude tänker: en LED som andas, som i HUD:en. */
+.wb-ideas-wait {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+
+.wb-ideas-led {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--wb-accent);
+  box-shadow: 0 0 12px 2px rgb(47 107 255 / 0.45);
+  animation: wb-ideas-breathe 0.97s ease-in-out infinite;
+}
+
+@keyframes wb-ideas-breathe {
+  0%,
+  100% {
+    transform: scale(0.62);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+}
+
+.wb-ideas-err {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 14px;
+  color: rgb(18 22 30 / 0.62);
+}
+
+.wb-ideas-again {
+  border: 0;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: none;
+  font: inherit;
+  font-size: 14px;
+  color: var(--wb-accent);
+  cursor: pointer;
+}
+
+.wb-ideas-again:hover,
+.wb-ideas-again:focus-visible {
+  background: rgb(47 107 255 / 0.08);
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-ideas-led {
+    animation: none;
+  }
+}
+
+/* Minimera (§10.7): en liten nedåtpil till höger om greppet, i greppets färg. */
+.wb-minbtn {
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  padding: 0;
+  border: 0;
+  background: none;
+  display: grid;
+  place-items: center;
+  pointer-events: auto;
+  cursor: pointer;
+  outline: none;
+  transition: opacity 0.2s ease;
+}
+
+.wb-minbtn i {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-right: 1.75px solid var(--wb-grip);
+  border-bottom: 1.75px solid var(--wb-grip);
+  border-radius: 0 0 1.5px 0;
+  transform: translateY(-2px) rotate(45deg);
+  transition: border-color 0.2s ease, transform 0.3s var(--wb-spring-pop);
+}
+
+.wb-minbtn:hover i {
+  border-color: var(--wb-grip-hover);
+  transform: translateY(0) rotate(45deg);
+}
+
+.wb-minbtn:focus-visible i {
+  border-color: var(--wb-accent);
+}
+
+.wb-minbtn.wb-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Sidprickarna, till vänster om greppet. */
+.wb-facedots {
+  width: 0;
+  height: 0;
+  transition: opacity 0.2s ease;
+}
+
+.wb-facedots-row {
+  position: absolute;
+  right: 0;
+  top: -7px;
+  display: flex;
+  pointer-events: auto;
+}
+
+.wb-facedot {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  background: none;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  outline: none;
+}
+
+.wb-facedot i {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--wb-face-dot);
+  transition: background-color 0.2s ease, transform 0.3s var(--wb-spring-pop);
+}
+
+.wb-facedot.wb-on i {
+  background: var(--wb-face-dot-on);
+}
+
+.wb-facedot:hover i {
+  transform: scale(1.35);
+}
+
+.wb-facedot:focus-visible i {
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 0.9);
+}
+
+/* Osynliga storlekszoner 10 px utanför kanter och hörn. */
+.wb-zone {
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.wb-zone-n,
+.wb-zone-s {
+  cursor: ns-resize;
+}
+
+.wb-zone-e,
+.wb-zone-w {
+  cursor: ew-resize;
+}
+
+.wb-zone-nw,
+.wb-zone-se {
+  cursor: nwse-resize;
+}
+
+.wb-zone-ne,
+.wb-zone-sw {
+  cursor: nesw-resize;
+}
+
+/* Titt-zonen vid en prismas sidokant (24 px utanför). */
+.wb-peek {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+/* Kantmarkörer: 8 px prickar vid vyns kant mot fönster utanför bild. */
+.wb-markers {
+  position: absolute;
+  inset: 0;
+}
+
+.wb-marker {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
+  padding: 0;
+  border: 0;
+  background: none;
+  display: grid;
+  place-items: center;
+  pointer-events: auto;
+  cursor: pointer;
+  outline: none;
+}
+
+.wb-marker i {
+  display: block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--wb-grip);
+  transition: background-color 0.2s ease, transform 0.3s var(--wb-spring-pop);
+}
+
+.wb-marker:hover i,
+.wb-marker:focus-visible i {
+  background: var(--wb-accent);
+  transform: scale(1.25);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-band::after {
+    animation: none;
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ett fönsterhanteringssystem där apparna byggs medan man använder det.",
+  "engines": {
+    "node": ">=25"
+  },
+  "scripts": {
+    "dev": "node --watch-path=server --watch-path=shared server/main.ts",
+    "start": "NODE_ENV=production node server/main.ts",
+    "build": "vite build",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test \"tests/unit/**/*.test.ts\"",
+    "test:e2e": "node --test --test-concurrency=1 \"tests/e2e/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.301",
+    "playwright-core": "1.64.1",
+    "three": "0.186.1",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "@types/three": "0.186.0",
+    "@types/ws": "8.18.2",
+    "typescript": "5.9.3",
+    "vite": "8.3.4"
+  }
+}

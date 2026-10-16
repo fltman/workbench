@@ -1,0 +1,880 @@
+/* hud.css — HUD:ens utseende (CONTRACT §14). Ägs av hud-byggaren. Allt mått och all rörelse kommer från
+   tokens.css.
+
+   KONTRAST (WCAG-formeln i tests/unit/hud-contrast.test.ts och pixelmätning i riktig Chrome, .scratch/w6-glass):
+   glaset släpper igenom bakgrunden, så den ljusaste bakgrunden (en vit app) bestämmer. Den mörkas i filtret
+   (brightness 0,45, som Chrome räknar i gammakodad sRGB) innan den tunna blå tonen läggs på. Vid gradientens
+   ljusa topp över helvitt klarar då all text minst 4,6:1 och ⋯ i vila minst 3:1; över grå yta och mörk app
+   mer. Samma ton utan brightness() fäller testet. */
+
+.wbh-root {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  /* Text på blått som inte är vit: djupblå (primärknappar, valda alternativ), 10:1 mot vitt. */
+  --wbh-ink: rgb(20 48 158);
+  /* Sekundär text på kort (detaljer, beskrivningar): ljusare än --wb-hud-muted eftersom kortet är ljusare. */
+  --wbh-detail: rgb(255 255 255 / 0.88);
+  --wbh-danger: #b42318;
+  /* En HUD som inte är aktiv (§14): en mörk slöja över glaset. Den gör bara bakgrunden mörkare, så kontrasten kan
+     bara bli bättre (tests/unit/hud-contrast.test.ts). */
+  --wbh-calm-veil: rgb(4 12 44 / 0.2);
+  font-family: var(--wb-font);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.wbh {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--wb-hud-w);
+  pointer-events: auto;
+  color: var(--wb-hud-text);
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+
+.wbh[hidden] {
+  display: none;
+}
+
+/* Flera HUD:ar: hanteraren sätter z-index efter den ordning de senast var aktiva, den aktiva överst (hud.ts).
+   Kopiorna som fälls ihop ligger över alla paneler. */
+.wbh {
+  z-index: 1;
+}
+
+.wbh-ghost {
+  z-index: 1000;
+}
+
+/* Linjen mellan appens prick och dess HUD (§14): under alla paneler, så att den aldrig korsar en HUD:s text.
+   Den tonar in när panelen glidit ut och bort när den sjunker in i pricken. I en HUD som inte är aktiv är den svagare. */
+.wbh-tether {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+
+.wbh-tether.is-shown {
+  opacity: 1;
+}
+
+.wbh-tether line {
+  stroke: var(--wb-accent);
+  stroke-width: 1.5px;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 3px rgb(47 107 255 / 0.55));
+  transition: stroke-opacity 240ms ease;
+}
+
+.wbh-tether.is-calm line {
+  stroke-opacity: 0.45;
+}
+
+/* ------------------------------------------------------------------ panelen: djupblått glas */
+
+.wbh-panel,
+.wbh-ghost {
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 5px;
+  border-radius: var(--wb-hud-radius);
+  background: var(--wb-hud-bg);
+  backdrop-filter: var(--wb-hud-blur);
+  -webkit-backdrop-filter: var(--wb-hud-blur);
+  box-shadow: var(--wb-hud-edge), var(--wb-hud-shadow);
+  color: var(--wb-hud-text);
+}
+
+.wbh-ghost {
+  pointer-events: none;
+  will-change: transform;
+}
+
+.wbh-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.wbh-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* Text som scrollats upp tonar ut mot panelens överkant i stället för att klippas. */
+.wbh-scroll.is-scrolled {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, rgb(0 0 0 / 0.35) 12px, #000 38px);
+  mask-image: linear-gradient(to bottom, transparent 0, rgb(0 0 0 / 0.35) 12px, #000 38px);
+}
+
+/* Innehållet är en kolumn där bara synliga delar tar plats: mellanrummen kommer från gap. */
+.wbh-content.has {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  /* 5 + 15 px: texten börjar i samma linje som markören i inmatningen. */
+  padding: 13px 15px 12px;
+}
+
+.wbh-content > :empty,
+.wbh-content > [hidden] {
+  display: none;
+}
+
+/* ------------------------------------------------------------------ meddelanden */
+
+.wbh-msgs {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+/* En ny tur (användarens rad) får mer luft ovanför sig. */
+.wbh-msgs > .wbh-user:not(:first-child) {
+  margin-top: 11px;
+}
+
+/* Köat under turen: samma luft (10 px gap + 10 = 9 + 11), så raden står still när den flyttas upp i listan. */
+.wbh-queued > .wbh-user:first-child {
+  margin-top: 10px;
+}
+
+/* Användarens rader: dämpade, utan bubbla. */
+.wbh-user {
+  font-family: var(--wb-font);
+  font-size: var(--wb-text-ui);
+  line-height: 1.45;
+  letter-spacing: -0.006em;
+  color: var(--wb-hud-user);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Claudes svar: systemets sans (SF Pro) i 16,5 px och vikt 450, tätare spärrning, text-wrap: pretty. Användarens
+   rad (14,5 px, 400, dämpad) står kvar som sekundär. */
+.wbh-reply {
+  font-family: var(--wb-font-reply);
+  font-size: var(--wb-text-reply);
+  font-weight: 450;
+  line-height: 1.4;
+  letter-spacing: -0.013em;
+  color: var(--wb-hud-text);
+  text-wrap: pretty;
+  overflow-wrap: break-word;
+  font-feature-settings: 'kern', 'liga';
+}
+
+/* :where() ger ingen specificitet, så att mellanrummet nedan alltid vinner. */
+.wbh-reply :where(p, ul, ol, pre) {
+  margin: 0;
+}
+
+.wbh-reply > * + * {
+  margin-top: 0.5em;
+}
+
+.wbh-reply ul,
+.wbh-reply ol {
+  padding-left: 1.15em;
+}
+
+.wbh-reply li + li {
+  margin-top: 0.18em;
+}
+
+.wbh-reply li::marker {
+  color: var(--wb-hud-muted);
+}
+
+.wbh-reply strong {
+  font-weight: 650;
+}
+
+.wbh-reply code {
+  font-family: var(--wb-font-mono);
+  font-size: 0.8em;
+  letter-spacing: 0;
+  padding: 0.06em 0.34em 0.1em;
+  border-radius: 5px;
+  background: rgb(255 255 255 / 0.13);
+}
+
+.wbh-reply pre {
+  font-family: var(--wb-font-mono);
+  font-size: var(--wb-text-mono);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+  border-radius: 11px;
+  background: rgb(255 255 255 / 0.1);
+}
+
+.wbh-reply pre code {
+  font-size: inherit;
+  padding: 0;
+  background: none;
+}
+
+.wbh-note {
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--wb-hud-muted);
+}
+
+/* ------------------------------------------------------------------ aktivitetsraden */
+
+.wbh-activity {
+  position: relative;
+  height: 20px;
+  overflow: hidden;
+  font-family: var(--wb-font-mono);
+  font-size: var(--wb-text-mono);
+  line-height: 20px;
+  letter-spacing: -0.01em;
+  color: var(--wb-hud-muted);
+}
+
+.wbh-activity[hidden] {
+  display: none;
+}
+
+.wbh-activity-line {
+  position: absolute;
+  inset: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------------------------------------------------------------------ villkorliga rader */
+
+.wbh-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wbh-line {
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--wb-hud-muted);
+}
+
+.wbh-error {
+  font-size: 13.5px;
+  line-height: 1.4;
+  color: var(--wb-hud-error);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+/* ------------------------------------------------------------------ kort: frågor, tillstånd, hemligheter */
+
+.wbh-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wbh-card {
+  padding: 13px 14px 14px;
+  border-radius: 16px;
+  background: var(--wb-hud-card);
+  box-shadow: inset 0 0 0 0.5px rgb(255 255 255 / 0.16);
+}
+
+.wbh-card-title {
+  font-size: var(--wb-text-ui);
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.008em;
+  color: var(--wb-hud-text);
+  overflow-wrap: anywhere;
+}
+
+.wbh-card-detail {
+  margin-top: 5px;
+  max-height: 7.4em;
+  overflow: auto;
+  font-family: var(--wb-font-mono);
+  font-size: var(--wb-text-mono);
+  line-height: 1.48;
+  color: var(--wbh-detail);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  scrollbar-width: none;
+}
+
+.wbh-q + .wbh-q {
+  margin-top: 14px;
+}
+
+.wbh-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.wbh-btn {
+  height: 32px;
+  padding: 0 15px;
+  border-radius: 16px;
+  border: 1px solid rgb(255 255 255 / 0.55);
+  background: transparent;
+  color: var(--wb-hud-text);
+  font: 600 13.5px/1 var(--wb-font);
+  letter-spacing: -0.005em;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, opacity 0.2s ease;
+}
+
+.wbh-btn:hover {
+  background: rgb(255 255 255 / 0.12);
+  border-color: rgb(255 255 255 / 0.8);
+}
+
+/* Primärknappen: vit med blå text. */
+.wbh-btn.is-primary {
+  background: #fff;
+  border-color: #fff;
+  color: var(--wbh-ink);
+}
+
+.wbh-btn.is-primary:hover {
+  background: rgb(255 255 255 / 0.9);
+}
+
+.wbh-btn.is-danger {
+  background: #fff;
+  border-color: #fff;
+  color: var(--wbh-danger);
+}
+
+.wbh-btn:focus-visible,
+.wbh-opt:focus-visible,
+.wbh-icon:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 0.72);
+  outline-offset: 2px;
+}
+
+.wbh-menu-item:focus-visible {
+  outline: none;
+}
+
+.wbh-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.wbh-card.is-sent {
+  opacity: 0.7;
+  transition: opacity 0.2s ease;
+}
+
+.wbh-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.wbh-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 12px 10px;
+  border-radius: 12px;
+  border: 1px solid rgb(255 255 255 / 0.36);
+  background: transparent;
+  color: var(--wb-hud-text);
+  font: 500 14px/1.3 var(--wb-font);
+  text-align: left;
+  cursor: pointer;
+  /* Valet slår om direkt; bara kanten tonar vid hovring. */
+  transition: border-color 0.15s ease;
+}
+
+.wbh-opt:hover {
+  background: rgb(255 255 255 / 0.1);
+  border-color: rgb(255 255 255 / 0.7);
+}
+
+.wbh-opt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wbh-opt-desc {
+  font-weight: 400;
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--wbh-detail);
+}
+
+.wbh-check {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 0.5px;
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1.25px rgb(255 255 255 / 0.7);
+  fill: none;
+  stroke: transparent;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wbh-opt[role='radio'] .wbh-check {
+  border-radius: 50%;
+}
+
+.wbh-opt[aria-checked='true'],
+.wbh-opt[aria-checked='true']:hover {
+  background: #fff;
+  border-color: #fff;
+  color: var(--wbh-ink);
+}
+
+.wbh-opt[aria-checked='true'] .wbh-opt-desc {
+  color: rgb(20 48 158 / 0.86);
+}
+
+.wbh-opt[aria-checked='true'] .wbh-check {
+  background: var(--wbh-ink);
+  box-shadow: none;
+  stroke: #fff;
+}
+
+.wbh-secret-field {
+  margin-top: 10px;
+}
+
+.wbh-secret {
+  box-sizing: border-box;
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 12px;
+  outline: 0;
+  background: rgb(255 255 255 / 0.14);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.22);
+  color: var(--wb-hud-text);
+  caret-color: #fff;
+  font: 15px/38px var(--wb-font);
+  letter-spacing: 0.08em;
+}
+
+.wbh-secret:focus {
+  box-shadow: inset 0 0 0 1.5px rgb(255 255 255 / 0.75);
+}
+
+/* ------------------------------------------------------------------ inmatningen: kapseln */
+
+.wbh-composer {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 0;
+  min-height: 44px;
+  box-sizing: border-box;
+  padding: 4px 4px 4px 15px;
+  border-radius: 18px;
+  background-color: var(--wb-hud-composer);
+  box-shadow: inset 0 0 0 0.5px rgb(255 255 255 / 0.2);
+  transition: background-color 0.28s ease, box-shadow 0.28s ease;
+}
+
+.wbh-composer:focus-within {
+  box-shadow: inset 0 0 0 0.5px rgb(255 255 255 / 0.34);
+}
+
+/* Utan samtal är hela HUD:en inmatningen: en enda form. Kapseln framträder när samtalet finns (Glas). */
+.wbh-panel.is-empty .wbh-composer {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+.wbh-input {
+  flex: 1 1 auto;
+  align-self: center;
+  min-width: 0;
+  height: 36px;
+  margin: 0;
+  padding: 7px 0;
+  box-sizing: border-box;
+  border: 0;
+  outline: 0;
+  resize: none;
+  background: transparent;
+  color: var(--wb-hud-text);
+  caret-color: #fff;
+  font-family: var(--wb-font);
+  font-size: 15px;
+  line-height: 22px;
+  letter-spacing: -0.01em;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.wbh-input::selection {
+  background: rgb(255 255 255 / 0.32);
+}
+
+.wbh-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgb(255 255 255 / 0.9);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease, opacity 0.2s ease, transform 0.25s var(--wb-spring-pop);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.wbh-icon[hidden] {
+  display: none;
+}
+
+.wbh-icon:hover {
+  background: rgb(255 255 255 / 0.12);
+  color: #fff;
+}
+
+.wbh-icon svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
+.wbh-ico-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wbh-ico-fill {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* ⋯ är diskret: syns svagare, tydligt när pekaren är över HUD:en eller menyn är öppen. I vila minst 3:1 mot
+   kapseln (WCAG för kontroller, tests/unit/hud-contrast.test.ts); 0,42 gav uppmätt 2,65:1. */
+.wbh-more {
+  color: rgb(255 255 255 / 0.7);
+}
+
+@media (hover: hover) {
+  .wbh:not(:hover) .wbh-more:not(:focus-visible):not([aria-expanded='true']) {
+    color: rgb(255 255 255 / 0.6);
+  }
+}
+
+.wbh-stop svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Mikrofonen: vit med blå ikon medan den lyssnar, med en mjuk halo som följer ljudnivån (inom panelens kant). */
+.wbh-mic {
+  position: relative;
+  touch-action: none;
+}
+
+.wbh-mic.is-rec {
+  background: #fff;
+  color: var(--wbh-ink);
+  box-shadow: 0 0 0 calc(1.5px + var(--lvl, 0) * 5px) rgb(255 255 255 / 0.26);
+  transition: background-color 0.12s ease, color 0.12s ease, box-shadow 0.07s linear;
+}
+
+.wbh-mic.is-rec:hover {
+  background: #fff;
+  color: var(--wbh-ink);
+}
+
+/* Medan talet tolkas: en tunn ring som snurrar runt ikonen. */
+.wbh-mic::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  border: 1.5px solid rgb(255 255 255 / 0.22);
+  border-top-color: #fff;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.wbh-mic.is-busy::after {
+  opacity: 1;
+  animation: wbh-spin 0.8s linear infinite;
+}
+
+@keyframes wbh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ------------------------------------------------------------------ menyn */
+
+.wbh-menu {
+  position: absolute;
+  right: 4px;
+  bottom: 54px;
+  z-index: 2;
+  min-width: 224px;
+  box-sizing: border-box;
+  padding: 6px;
+  border-radius: 17px;
+  /* Ljusare och ogenomskinlig, så att menyn skiljer sig från panelen bakom (vit text 5,9:1). */
+  background: linear-gradient(170deg, rgb(50 92 218), rgb(42 80 204));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), inset 0 0 0 0.5px rgb(255 255 255 / 0.2), 0 18px 40px -12px rgb(8 20 70 / 0.6),
+    0 4px 12px rgb(8 20 70 / 0.25);
+  transform-origin: 90% 100%;
+}
+
+.wbh-menu[hidden] {
+  display: none;
+}
+
+.wbh-menu-item {
+  display: block;
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--wb-hud-text);
+  font: 400 14.5px/38px var(--wb-font);
+  letter-spacing: -0.008em;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.wbh-menu-item:hover,
+.wbh-menu-item:focus-visible {
+  background: rgb(255 255 255 / 0.13);
+}
+
+.wbh-menu-confirm {
+  display: flex;
+  gap: 6px;
+  padding: 3px;
+}
+
+.wbh-menu-confirm .wbh-btn {
+  flex: 1;
+  height: 34px;
+}
+
+/* ------------------------------------------------------------------ skärmläsare */
+
+.wbh-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wbh-mic.is-busy::after {
+    animation-duration: 2s;
+  }
+}
+
+/* ------------------------------------------------------------------ en HUD som inte är aktiv (§14) */
+
+/* Lugnare, utan etiketter: en mörk slöja i glaset (under text och kapsel), en plattare skugga, inmatningen utan
+   kapsel och mikrofonen och stoppknappen i ⋯-knappens vilofärg. Textens färger ändras aldrig. Aktivitetsradens
+   svep syns inte och pricken står still (activity.css, panel.ts). Bytet tonar på 240 ms. */
+.wbh-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--wbh-calm-veil);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms ease;
+}
+
+.wbh-panel.is-calm::before {
+  opacity: 1;
+}
+
+.wbh-panel.is-calm {
+  box-shadow: var(--wb-hud-edge), 0 0 0 0.5px rgb(8 20 70 / 0.22), 0 10px 28px -14px rgb(8 20 70 / 0.42);
+}
+
+.wbh-panel.is-calm .wbh-composer {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+.wbh-panel.is-calm .wbh-mic:not(.is-rec),
+.wbh-panel.is-calm .wbh-stop {
+  color: rgb(255 255 255 / 0.6);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wbh-panel::before {
+    transition: none;
+  }
+}
+
+/* ------------------------------------------------------------------ fältet (§10.9) */
+
+/* Skriv på tom yta utan öppen HUD: ett glasfält mitt i vyns övre del, i HUD:ens glas. Ingen platshållare. */
+.wbf {
+  position: absolute;
+  left: 50%;
+  top: 22vh;
+  width: min(560px, calc(100vw - 48px));
+  transform: translateX(-50%);
+  pointer-events: auto;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--wb-hud-text);
+}
+
+.wbf[hidden] {
+  display: none;
+}
+
+.wbf-pill,
+.wbf-card {
+  position: relative;
+  box-sizing: border-box;
+  border-radius: 26px;
+  background: var(--wb-hud-bg);
+  backdrop-filter: var(--wb-hud-blur);
+  -webkit-backdrop-filter: var(--wb-hud-blur);
+  box-shadow: var(--wb-hud-edge), var(--wb-hud-shadow);
+}
+
+.wbf-pill {
+  display: flex;
+  align-items: center;
+  height: 56px;
+  padding: 0 20px 0 22px;
+}
+
+.wbf-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--wb-hud-text);
+  font: 450 19px/1.2 var(--wb-font-reply);
+  letter-spacing: -0.012em;
+  caret-color: #fff;
+}
+
+/* Medan Claude avgör vart det ska: en LED som andas, som i HUD:ens aktivitetsrad. */
+.wbf-led {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  margin-left: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 10px 3px color-mix(in srgb, #fff 55%, var(--wb-accent));
+  animation: wbf-breathe 0.97s ease-in-out infinite;
+}
+
+.wbf-led[hidden] {
+  display: none;
+}
+
+@keyframes wbf-breathe {
+  0%,
+  100% {
+    transform: scale(0.62);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+}
+
+.wbf-card {
+  padding: 16px 18px 16px;
+  border-radius: 22px;
+}
+
+.wbf-card[hidden] {
+  display: none;
+}
+
+.wbf-lead {
+  font: 400 var(--wb-text-ui) / 1.35 var(--wb-font);
+  color: var(--wb-hud-muted);
+}
+
+.wbf-text {
+  margin-top: 6px;
+  font: 450 var(--wb-text-reply) / 1.4 var(--wb-font-reply);
+  letter-spacing: -0.013em;
+  text-wrap: pretty;
+}
+
+.wbf-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wbf-led {
+    animation: none;
+  }
+}
