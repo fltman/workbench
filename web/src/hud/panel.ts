@@ -15,7 +15,7 @@ import * as grants from './grants.ts';
 import { createMenu, type Menu } from './menu.ts';
 import type { VoiceFailure, VoiceState } from './voice.ts';
 import { clamp01, easeOutCubic, lerp, reducedMotion, Spring, spring } from './motion.ts';
-import { tetherSegment } from './tether.ts';
+import { tetherBetween } from './tether.ts';
 import { guardFocus } from './focusguard.ts';
 import './activity.css';
 
@@ -1202,9 +1202,10 @@ export class HudPanel {
     return switching;
   }
 
-  /** Linjen från appens prick till panelens närmaste kant, i samma bildruta som panelen flyttas. */
+  /** Linjen mellan appens fönster och panelen, kant mot kant, i samma bildruta som panelen flyttas. */
   #drawTether(x: number, y: number): void {
-    const s = tetherSegment(this.#dot(this.appId), { x, y, w: this.#width, h: this.#height.x }, this.#radius);
+    const own = this.#rect(this.appId);
+    const s = own ? tetherBetween(own, this.#winRadius(own), { x, y, w: this.#width, h: this.#height.x }, this.#radius) : null;
     const l = this.#tetherLine;
     if (!s) {
       l.style.display = 'none';
@@ -1450,6 +1451,13 @@ export class HudPanel {
       ? [{ opacity: 1 }, { opacity: 0 }]
       : [{ opacity: 1, transform: g.style.transform }, { opacity: 0, transform: `${g.style.transform} scale(0.97)` }];
     g.animate(kf, { duration: still ? 160 : 180, easing: 'ease-in', fill: 'forwards' }).finished.then(() => g.remove(), () => g.remove());
+  }
+
+  /** Fönstrets hörnradie på skärmen: --wb-win-radius är i världsenheter och följer fönstrets skala på skärmen. */
+  #winRadius(own: ScreenRect): number {
+    const win = store.scene.windows.find((w) => w.appId === this.appId);
+    const R = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--wb-win-radius')) || 16;
+    return win ? (R * own.w) / Math.max(1, win.w * win.scale) : R;
   }
 
   #dot(appId: string): { x: number; y: number } | null {

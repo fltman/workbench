@@ -922,7 +922,7 @@ describe('HUD:en i riktig Chrome', { timeout: 180_000 }, () => {
     assert.ok(long.lastVisible, 'senaste svaret syns längst ned');
   });
 
-  test('B9 linjen går från varje apps prick till dess egen HUD, stark i den aktiva, och följer kameran (kalibrerat mot den andra appens prick)', async () => {
+  test('B9 linjen går från varje apps fönster till dess egen HUD, kant mot kant och aldrig över appen, stark i den aktiva, och följer kameran (kalibrerat mot den andra appens fönster)', async () => {
     await clearApps();
     const a = await newApp(-660, -300);
     const b = await newApp(260, -300);
@@ -945,26 +945,38 @@ describe('HUD:en i riktig Chrome', { timeout: 180_000 }, () => {
           const p = document.querySelector(`.wbh[data-app="${id}"] .wbh-panel`)!.getBoundingClientRect();
           if (!l || !svg) return null;
           const n = (k: string) => Number(l.getAttribute(k));
-          const own = (window as any).__wb.world.dotOf(id);
-          const other = (window as any).__wb.world.dotOf(id === x ? y : x);
-          const edge = Math.min(Math.abs(n('x2') - p.left), Math.abs(n('x2') - p.right), Math.abs(n('y2') - p.top), Math.abs(n('y2') - p.bottom));
+          const w = (window as any).__wb.world;
+          const own = w.screenRectOf(id);
+          const other = w.screenRectOf(id === x ? y : x);
+          // Avståndet från en punkt till en rektangels kant (0 på kanten; hörnens rundning ger några px).
+          const edgeOf = (px: number, py: number, r: { x: number; y: number; w: number; h: number }) => {
+            const dx = Math.max(r.x - px, 0, px - (r.x + r.w));
+            const dy = Math.max(r.y - py, 0, py - (r.y + r.h));
+            const outside = Math.hypot(dx, dy);
+            const inside = Math.min(px - r.x, r.x + r.w - px, py - r.y, r.y + r.h - py);
+            return outside > 0 ? outside : inside;
+          };
+          const mid = { x: (n('x1') + n('x2')) / 2, y: (n('y1') + n('y2')) / 2 };
+          const insideOwn = mid.x > own.x + 2 && mid.x < own.x + own.w - 2 && mid.y > own.y + 2 && mid.y < own.y + own.h - 2;
           return {
             shown: getComputedStyle(svg).opacity === '1' && getComputedStyle(l).display !== 'none',
             opacity: Number(getComputedStyle(l).strokeOpacity),
-            own: Math.hypot(n('x1') - own.x, n('y1') - own.y),
-            other: Math.hypot(n('x1') - other.x, n('y1') - other.y),
-            edge,
+            own: edgeOf(n('x1'), n('y1'), own),
+            other: edgeOf(n('x1'), n('y1'), other),
+            edge: edgeOf(n('x2'), n('y2'), { x: p.left, y: p.top, w: p.width, h: p.height }),
+            insideOwn,
           };
         };
         return { a: one(x), b: one(y) };
       }, [a, b] as const);
     let m = await line();
     assert.ok(m.a && m.b, 'en linje per HUD');
-    assert.ok(m.a.other > 40, `kalibrering: A:s linje mäts inte mot B:s prick (${m.a.other})`);
+    assert.ok(m.a.other > 40, `kalibrering: A:s linje mäts inte mot B:s fönster (${m.a.other})`);
     for (const [k, v] of [['A', m.a], ['B', m.b]] as const) {
       assert.ok(v.shown, `${k}: linjen syns`);
-      assert.ok(Math.abs(v.own - 8) < 1, `${k}: börjar vid den egna pricken (${v.own})`);
-      assert.ok(v.edge < 8, `${k}: slutar på den egna panelens kant (${v.edge})`);
+      assert.ok(v.own < 6, `${k}: börjar på det egna fönstrets kant (${v.own})`);
+      assert.ok(v.edge < 6, `${k}: slutar på den egna panelens kant (${v.edge})`);
+      assert.equal(v.insideOwn, false, `${k}: går inte över appen`);
     }
     assert.equal(m.b.opacity, 1, 'stark i den aktiva');
     assert.ok(Math.abs(m.a.opacity - 0.45) < 0.01, `svagare i den lugna (${m.a.opacity})`);
@@ -975,7 +987,7 @@ describe('HUD:en i riktig Chrome', { timeout: 180_000 }, () => {
     });
     await frames(2);
     m = await line();
-    assert.ok(Math.abs(m.a!.own - 8) < 1 && Math.abs(m.b!.own - 8) < 1, 'följer kameran i samma bildruta');
+    assert.ok(m.a!.own < 6 && m.b!.own < 6, 'följer kameran i samma bildruta');
     await page.evaluate((x) => (window as any).__wb.bus.emit('hud:close', { appId: x }), b);
     await waitClosed(b);
     await sleep(300);

@@ -7,6 +7,7 @@ import type { ScreenRect } from '../types.ts';
 import type { Tokens } from './tokens.ts';
 import { reducedMotion } from './tokens.ts';
 import { pushEscape } from '../escape.ts';
+import { coveredPoint, coveredRect, freeStrip } from './layout.ts';
 
 export const EDGES = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'] as const;
 export type Edge = (typeof EDGES)[number];
@@ -45,6 +46,8 @@ export interface ChromeLayout {
   bottom?: number;
   /** Under en animation (vridning, flygning) ska zonerna inte ta emot pekaren. */
   interactive: boolean;
+  /** Fönstren (och miniatyrerna) ovanför det här: där tar zonerna och knapparna inte emot pekaren. */
+  covers?: readonly ScreenRect[];
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, parent?: Element): HTMLElementTagNameMap[K] {
@@ -292,16 +295,18 @@ export class ChromeView {
 
     // Greppet: 10 px under nederkanten, mitt under fönstret. Sidprickarna till vänster om det.
     const tiny = r.w < 90 || r.h < 40;
+    const covers = L.covers ?? [];
     const gx = r.x + r.w / 2;
     const gy = Math.max(r.y + r.h, L.bottom ?? -Infinity) + 10 + 2.5;
     at(this.grip, gx, gy);
     this.grip.classList.toggle('wb-hidden', tiny || L.gripHidden);
     at(this.faceDots, gx - 22 - 10, gy);
-    this.faceDots.classList.toggle('wb-hidden', tiny || L.gripHidden || this.#n <= 1);
+    const dotsW = 14 * this.#n;
+    this.faceDots.classList.toggle('wb-hidden', tiny || L.gripHidden || this.#n <= 1 || coveredRect({ x: gx - 32 - dotsW, y: gy - 7, w: dotsW, h: 14 }, covers));
     at(this.minBtn, gx + 22 + 16, gy);
-    this.minBtn.classList.toggle('wb-hidden', tiny || L.gripHidden || !L.interactive);
+    this.minBtn.classList.toggle('wb-hidden', tiny || L.gripHidden || !L.interactive || coveredPoint(gx + 38, gy, covers));
     at(this.delBtn, gx + 22 + 16 + 24, gy);
-    const delHidden = tiny || L.gripHidden || !L.interactive;
+    const delHidden = tiny || L.gripHidden || !L.interactive || coveredPoint(gx + 62, gy, covers);
     if (delHidden) this.#disarm();
     this.delBtn.classList.toggle('wb-hidden', delHidden);
 
@@ -309,15 +314,18 @@ export class ChromeView {
     const show = L.interactive && !tiny;
     const Z = ZONE;
     const C = ZONE + 4;
+    // Där ett fönster ovanför täcker en zon tas den bort (kanter: den största fria delen står kvar; hörn: hela).
     const place = (edge: Edge, x: number, y: number, w: number, h: number): void => {
       const z = this.zones.get(edge) as HTMLDivElement;
-      if (!show) {
+      const rect = { x, y, w, h };
+      const free = !show ? null : edge.length === 2 ? (coveredRect(rect, covers) ? null : rect) : freeStrip(rect, covers, edge === 'n' || edge === 's' ? 'x' : 'y');
+      if (!free) {
         z.style.display = 'none';
         return;
       }
       z.style.display = '';
-      this.#size(z, w, h);
-      at(z, x, y);
+      this.#size(z, free.w, free.h);
+      at(z, free.x, free.y);
     };
     place('n', r.x, r.y - Z, r.w, Z);
     place('s', r.x, r.y + r.h, r.w, Z);
@@ -331,13 +339,14 @@ export class ChromeView {
     // Titt-zonerna: 24 px utanför sidokanterna, mittre 76 % av höjden.
     const peekOn = show && L.prism;
     for (const [z, x] of [[this.peekL, r.x - PEEK_ZONE], [this.peekR, r.x + r.w]] as const) {
-      if (!peekOn) {
+      const free = peekOn ? freeStrip({ x, y: r.y + r.h * 0.12, w: PEEK_ZONE, h: r.h * 0.76 }, covers, 'y', 20) : null;
+      if (!free) {
         z.style.display = 'none';
         continue;
       }
       z.style.display = '';
-      this.#size(z, PEEK_ZONE, r.h * 0.76);
-      at(z, x, r.y + r.h * 0.12);
+      this.#size(z, free.w, free.h);
+      at(z, free.x, free.y);
     }
   }
 

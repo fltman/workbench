@@ -62,7 +62,7 @@ Varje byggd app har en sista sida, Förslag, där Claude föreslår förbättrin
 
 ## HUD:arna
 
-Flera appar kan ha sin HUD öppen samtidigt. Den du skriver i är aktiv och ligger överst; de andra dämpas. En blå linje går från appens prick till dess HUD.
+Flera appar kan ha sin HUD öppen samtidigt. Den du skriver i är aktiv och ligger överst; de andra dämpas. En blå linje går mellan appens fönster och dess HUD.
 
 | Gest | Gör |
 |---|---|

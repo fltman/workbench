@@ -243,6 +243,9 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
     const all = [...views.values()];
     if (creating && views.get(creating.view.id) !== creating.view) all.push(creating.view); // ännu inte bunden
     const marks = new Map<string, { x: number; y: number } | null>();
+    // Det som ligger ovanför fönstren: andra fönster med högre z, och miniatyrerna i raden (över alla).
+    const placed = placedViews().map((u) => ({ z: u.win.z, rect: screenRectOfWin(u.win, cam, vw, vh) }));
+    const tiles = liveViews().flatMap((u) => (u.win.minimized && minis.get(u)?.last ? [minis.get(u)!.last!] : []));
     for (const v of all) {
       const c = chromes.get(v);
       if (!c || v.dissolving) continue;
@@ -266,6 +269,7 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
         prism: v.appFaces > 1,
         bottom,
         interactive: v.appId !== '',
+        covers: [...placed.filter((p) => p.z > v.win.z).map((p) => p.rect), ...tiles],
       });
       c.setFaces(v.n, v.front, chromeHandlers(v), v.faces.map((f) => f.def.label ?? ''));
       if (v.appId) marks.set(v.appId, edgeMarker(rect, vw, vh));

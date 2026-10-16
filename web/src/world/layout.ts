@@ -151,3 +151,45 @@ export function scaleAround(
   const f = scale / win.scale;
   return { x: px - (px - win.x) * f, y: py - (py - win.y) * f, scale };
 }
+
+/* ------------------------------ kromens zoner under andra fönster (§10.5) ------------------------------ */
+
+const hits = (a: ScreenRect, b: ScreenRect): boolean => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+/** Täcks rektangeln (helt eller delvis) av något av fönstren ovanför? */
+export function coveredRect(z: ScreenRect, covers: readonly ScreenRect[]): boolean {
+  return covers.some((c) => hits(z, c));
+}
+
+/** Ligger punkten under något av fönstren ovanför? */
+export function coveredPoint(x: number, y: number, covers: readonly ScreenRect[]): boolean {
+  return covers.some((c) => x > c.x && x < c.x + c.w && y > c.y && y < c.y + c.h);
+}
+
+/**
+ * Den största delen av en zon (en smal remsa längs en kant) som inget fönster ovanför täcker. Kromen ligger över alla
+ * fönster, så en zon som ett annat fönster täcker skulle annars ta pekaren från det fönstret (Anders 16 oktober: "när
+ * jag drar muspekaren över en app så triggas även appar som ligger bakom den"). axis 'x': remsan går vågrätt, 'y':
+ * lodrätt. Ett fönster som täcker remsan på tvären tar hela sin bredd av den. null när mindre än min px är fri.
+ */
+export function freeStrip(z: ScreenRect, covers: readonly ScreenRect[], axis: 'x' | 'y', min = 8): ScreenRect | null {
+  const a0 = axis === 'x' ? z.x : z.y;
+  const a1 = a0 + (axis === 'x' ? z.w : z.h);
+  const blocks: Array<[number, number]> = [];
+  for (const c of covers) {
+    if (!hits(z, c)) continue;
+    const b0 = axis === 'x' ? c.x : c.y;
+    const b1 = b0 + (axis === 'x' ? c.w : c.h);
+    blocks.push([Math.max(a0, b0), Math.min(a1, b1)]);
+  }
+  blocks.sort((p, q) => p[0] - q[0]);
+  let best: [number, number] | null = null;
+  let cur = a0;
+  for (const [b0, b1] of blocks) {
+    if (b0 > cur && (!best || b0 - cur > best[1] - best[0])) best = [cur, b0];
+    cur = Math.max(cur, b1);
+  }
+  if (a1 > cur && (!best || a1 - cur > best[1] - best[0])) best = [cur, a1];
+  if (!best || best[1] - best[0] < min) return null;
+  return axis === 'x' ? { x: best[0], y: z.y, w: best[1] - best[0], h: z.h } : { x: z.x, y: best[0], w: z.w, h: best[1] - best[0] };
+}

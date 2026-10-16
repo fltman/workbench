@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DRAW_INSET, LIMITS, MIN_DRAW_H, MIN_DRAW_W, clampToView, dotPointLocal, edgeMarker, requestFromDrawn, resizeFrom, scaleAround, scaleFrom, screenRectOfWin, topmostAt,
+  DRAW_INSET, LIMITS, MIN_DRAW_H, MIN_DRAW_W, clampToView, dotPointLocal, edgeMarker, requestFromDrawn, resizeFrom, scaleAround, scaleFrom, screenRectOfWin, topmostAt, coveredPoint, coveredRect, freeStrip
 } from '../../web/src/world/layout.ts';
 import { worldToScreen } from '../../web/src/world/camera.ts';
 import type { Camera } from '../../shared/protocol.ts';
@@ -149,4 +149,21 @@ test('FE-10: en fyrkant som dras förbi vyns kant kläms till vyn minus DRAW_INS
   const out = clampToView({ x: VW + 10, y: 10, w: 300, h: 300 }, VW, VH);
   assert.equal(out.w, 0);
   assert.equal(requestFromDrawn(out, { cx: 0, cy: 0, zoom: 1 }, VW, VH), null);
+});
+
+test('kromens zoner under ett fönster ovanför (§10.5): den största fria delen av en kant, hörn och knappar döljs', () => {
+  const strip = { x: 100, y: 90, w: 400, h: 10 }; // övre kanten på ett fönster
+  assert.deepEqual(freeStrip(strip, [], 'x'), strip, 'inget ovanför: hela kanten');
+  // Ett fönster ovanför täcker kantens mitt: den största delen, till höger, står kvar.
+  assert.deepEqual(freeStrip(strip, [{ x: 150, y: 0, w: 100, h: 300 }], 'x'), { x: 250, y: 90, w: 250, h: 10 });
+  // Två fönster täcker allt utom 6 px: mindre än 8 px ger ingen zon.
+  assert.equal(freeStrip(strip, [{ x: 80, y: 50, w: 200, h: 100 }, { x: 286, y: 50, w: 300, h: 100 }], 'x'), null);
+  // Ett fönster som inte når remsan på tvären påverkar den inte.
+  assert.deepEqual(freeStrip(strip, [{ x: 150, y: 101, w: 100, h: 50 }], 'x'), strip);
+  // Lodrätt: titt-zonen vid högerkanten, delvis under ett fönster nedtill.
+  assert.deepEqual(freeStrip({ x: 500, y: 100, w: 24, h: 300 }, [{ x: 480, y: 320, w: 300, h: 200 }], 'y', 20), { x: 500, y: 100, w: 24, h: 220 });
+  assert.equal(coveredRect({ x: 0, y: 0, w: 14, h: 14 }, [{ x: 10, y: 10, w: 50, h: 50 }]), true);
+  assert.equal(coveredRect({ x: 0, y: 0, w: 10, h: 10 }, [{ x: 10, y: 10, w: 50, h: 50 }]), false, 'kanter som bara möts täcker inte');
+  assert.equal(coveredPoint(20, 20, [{ x: 10, y: 10, w: 50, h: 50 }]), true);
+  assert.equal(coveredPoint(5, 20, [{ x: 10, y: 10, w: 50, h: 50 }]), false);
 });

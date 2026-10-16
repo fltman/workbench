@@ -1,95 +1,89 @@
-// hud-tether.test.ts — linjen mellan appens prick och dess HUD (CONTRACT §14).
+// hud-tether.test.ts — linjen mellan appens fönster och dess HUD (CONTRACT §13, §14): kant mot kant, aldrig över appen.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TETHER_FROM_DOT, TETHER_MIN, tetherSegment, type Segment } from '../../web/src/hud/tether.ts';
+import { TETHER_MIN, tetherBetween, type Segment } from '../../web/src/hud/tether.ts';
 
-const R = 22;
+type R = { x: number; y: number; w: number; h: number };
 
-/** Närmaste punkt på den rundade rektangelns kant, prövad punkt för punkt längs kanten (oberoende av koden). */
-function bruteNearest(d: { x: number; y: number }, r: { x: number; y: number; w: number; h: number }, rad: number) {
-  const pts: { x: number; y: number }[] = [];
-  const N = 2000;
-  for (let i = 0; i <= N; i++) {
-    const t = i / N;
+/** Punkter längs en rundad rektangels kant (oberoende av koden). */
+function perimeter(r: R, rad: number, n = 600): Array<{ x: number; y: number }> {
+  const pts: Array<{ x: number; y: number }> = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
     pts.push({ x: r.x + rad + t * (r.w - 2 * rad), y: r.y }, { x: r.x + rad + t * (r.w - 2 * rad), y: r.y + r.h });
     pts.push({ x: r.x, y: r.y + rad + t * (r.h - 2 * rad) }, { x: r.x + r.w, y: r.y + rad + t * (r.h - 2 * rad) });
     const a = (t * Math.PI) / 2;
     for (const [cx, cy, sx, sy] of [
-      [r.x + rad, r.y + rad, -1, -1],
-      [r.x + r.w - rad, r.y + rad, 1, -1],
-      [r.x + rad, r.y + r.h - rad, -1, 1],
-      [r.x + r.w - rad, r.y + r.h - rad, 1, 1],
+      [r.x + rad, r.y + rad, -1, -1], [r.x + r.w - rad, r.y + rad, 1, -1], [r.x + rad, r.y + r.h - rad, -1, 1], [r.x + r.w - rad, r.y + r.h - rad, 1, 1],
     ]) pts.push({ x: cx + sx * rad * Math.cos(a), y: cy + sy * rad * Math.sin(a) });
   }
-  let best = pts[0];
-  let bd = Infinity;
-  for (const p of pts) {
-    const dd = Math.hypot(p.x - d.x, p.y - d.y);
-    if (dd < bd) {
-      bd = dd;
-      best = p;
-    }
+  return pts;
+}
+const minDist = (a: R, ra: number, b: R, rb: number): number => {
+  const pa = perimeter(a, ra, 300);
+  const pb = perimeter(b, rb, 300);
+  let m = Infinity;
+  for (const p of pa) for (const q of pb) m = Math.min(m, Math.hypot(p.x - q.x, p.y - q.y));
+  return m;
+};
+const len = (s: Segment): number => Math.hypot(s.x2 - s.x1, s.y2 - s.y1);
+/** Går linjen in i den rundade rektangeln (mer än 0,5 px innanför kanten)? Hörnen räknas rundade, som de ritas. */
+const enters = (s: Segment, r: R, rad: number): boolean => {
+  for (let k = 0.02; k < 0.98; k += 0.02) {
+    const x = s.x1 + (s.x2 - s.x1) * k;
+    const y = s.y1 + (s.y2 - s.y1) * k;
+    // Avståndet till den inre rektangeln (krympt med radien) mindre än radien: innanför den rundade kanten.
+    const ix = Math.max(r.x + rad, Math.min(r.x + r.w - rad, x));
+    const iy = Math.max(r.y + rad, Math.min(r.y + r.h - rad, y));
+    if (Math.hypot(x - ix, y - iy) < rad - 0.5) return true;
   }
-  return { p: best, dist: bd };
-}
+  return false;
+};
 
-/** Linjens slutpunkt är kantens närmaste punkt, och början ligger TETHER_FROM_DOT från pricken mot den. */
-function assertSegment(s: Segment | null, d: { x: number; y: number }, r: { x: number; y: number; w: number; h: number }, msg: string) {
-  assert.ok(s, `${msg}: en linje`);
-  const b = bruteNearest(d, r, R);
-  assert.ok(Math.hypot(s.x2 - b.p.x, s.y2 - b.p.y) < 0.6, `${msg}: slutar på kantens närmaste punkt (${s.x2.toFixed(1)},${s.y2.toFixed(1)} mot ${b.p.x.toFixed(1)},${b.p.y.toFixed(1)})`);
-  assert.ok(Math.abs(Math.hypot(s.x1 - d.x, s.y1 - d.y) - TETHER_FROM_DOT) < 1e-6, `${msg}: börjar utanför pricken`);
-  const len = Math.hypot(s.x2 - s.x1, s.y2 - s.y1);
-  assert.ok(Math.abs(len - (b.dist - TETHER_FROM_DOT)) < 0.6, `${msg}: linjen går rakt mot kanten`);
-}
-
-test('HUD till vänster om fönstret: linjen går från pricken i övre högra hörnet till panelens högra kant', () => {
-  const dot = { x: 1100, y: 540 };
-  const hud = { x: 502, y: 536, w: 360, h: 300 };
-  const s = tetherSegment(dot, hud, R);
-  assertSegment(s, dot, hud, 'vänster');
-  assert.ok(s!.x2 > 855 && s!.x2 <= 862, 'på högra kanten');
+test('HUD till höger, i linje med överkanten: en kort vågrät linje över mellanrummet, nära överkanten', () => {
+  const win = { x: 100, y: 100, w: 400, h: 300 };
+  const hud = { x: 514, y: 100, w: 360, h: 200 };
+  assert.deepEqual(tetherBetween(win, 16, hud, 22), { x1: 500, y1: 158, x2: 514, y2: 158 });
 });
 
-test('HUD under fönstret och HUD till höger: närmaste punkten, också på ett rundat hörn', () => {
-  const dot = { x: 700, y: 120 };
-  assertSegment(tetherSegment(dot, { x: 300, y: 450, w: 360, h: 200 }, R), dot, { x: 300, y: 450, w: 360, h: 200 }, 'under, hörnet');
-  assertSegment(tetherSegment(dot, { x: 340, y: 450, w: 360, h: 200 }, R), dot, { x: 340, y: 450, w: 360, h: 200 }, 'under, överkanten');
-  const near = { x: 1000, y: 103 };
-  assertSegment(tetherSegment(near, { x: 1018, y: 100, w: 360, h: 200 }, R), near, { x: 1018, y: 100, w: 360, h: 200 }, 'höger');
+test('HUD under fönstret: lodrät över mellanrummet, aldrig diagonalt över appen (kalibrerat: linjen från pricken gick in i fönstret)', () => {
+  const win = { x: 100, y: 100, w: 720, h: 300 };
+  const hud = { x: 100, y: 428, w: 360, h: 200 };
+  const s = tetherBetween(win, 16, hud, 22)!;
+  assert.deepEqual(s, { x1: 158, y1: 400, x2: 158, y2: 428 });
+  assert.equal(enters(s, win, 16), false);
+  // Kalibrering: den gamla linjen, från pricken i fönstrets övre högra hörn till panelens närmaste punkt, korsar appen.
+  const old = { x1: 812, y1: 108, x2: 452, y2: 432 };
+  assert.equal(enters(old, win, 16), true, 'kalibrering: detektorn ser en linje som går över appen');
 });
 
-test('prövat mot kanten punkt för punkt på 200 lägen runt panelen (kalibrerat: en rak rektangel utan radie missar hörnen)', () => {
-  const hud = { x: 500, y: 300, w: 360, h: 260 };
-  let seed = 7;
+test('på 300 lägen: linjen är det kortaste avståndet mellan kanterna och går aldrig in i fönstret eller panelen', () => {
+  let seed = 11;
   const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
-  let cornerMiss = 0;
-  for (let i = 0; i < 200; i++) {
-    const d = { x: 200 + rnd() * 1000, y: 50 + rnd() * 800 };
-    const s = tetherSegment(d, hud, R);
-    const b = bruteNearest(d, hud, R);
-    const inside = d.x > hud.x && d.x < hud.x + hud.w && d.y > hud.y && d.y < hud.y + hud.h;
-    if (inside || b.dist < TETHER_FROM_DOT + TETHER_MIN) {
-      // I panelen, eller så nära kanten att ingen linje behövs (gränsen prövas inte på bråkdelen av en pixel).
-      if (b.dist < TETHER_FROM_DOT + TETHER_MIN - 0.6 || inside) assert.equal(s, null, `ingen linje vid ${d.x.toFixed(0)},${d.y.toFixed(0)}`);
+  const win = { x: 400, y: 300, w: 420, h: 280 };
+  let drawn = 0;
+  for (let i = 0; i < 300; i++) {
+    const hud = { x: rnd() * 1300 - 100, y: rnd() * 900 - 100, w: 360, h: 120 + rnd() * 200 };
+    const s = tetherBetween(win, 16, hud, 22);
+    const m = minDist(win, 16, hud, 22);
+    const overlap = hud.x < win.x + win.w && hud.x + hud.w > win.x && hud.y < win.y + win.h && hud.y + hud.h > win.y;
+    if (overlap || m < TETHER_MIN + 0.5) {
+      if (overlap) assert.equal(s, null, `överlapp ger ingen linje (${i})`);
       continue;
     }
-    assertSegment(s, d, hud, `läge ${i}`);
-    // Planterat fel: slutpunkten klämd till den raka rektangeln. Den hamnar utanför den rundade kanten i hörnen.
-    const px = Math.max(hud.x, Math.min(hud.x + hud.w, d.x));
-    const py = Math.max(hud.y, Math.min(hud.y + hud.h, d.y));
-    if (Math.hypot(px - b.p.x, py - b.p.y) >= 0.6) cornerMiss++;
+    assert.ok(s, `en linje (${i})`);
+    drawn++;
+    assert.ok(Math.abs(len(s) - m) < 1, `kortast (${i}): ${len(s).toFixed(2)} mot ${m.toFixed(2)}`);
+    assert.equal(enters(s, win, 16), false, `går in i fönstret (${i})`);
+    assert.equal(enters(s, hud, 22), false, `går in i panelen (${i})`);
   }
-  assert.ok(cornerMiss > 10, `den planterade raka rektangeln ska missa i hörnen (${cornerMiss})`);
+  assert.ok(drawn > 150, `för få lägen med linje: ${drawn}`);
 });
 
-test('ingen linje när pricken saknas, ligger i panelen eller precis vid den; utanför vyn går linjen ut ur bild', () => {
-  const hud = { x: 500, y: 300, w: 360, h: 260 };
-  assert.equal(tetherSegment(null, hud, R), null);
-  assert.equal(tetherSegment({ x: NaN, y: 400 }, hud, R), null);
-  const off = { x: 1900, y: 120 };
-  assertSegment(tetherSegment(off, hud, R), off, hud, 'pricken utanför vyn');
-  assert.equal(tetherSegment({ x: 700, y: 400 }, hud, R), null);
-  assert.equal(tetherSegment({ x: 700, y: 300 - (TETHER_FROM_DOT + TETHER_MIN) + 1 }, hud, R), null);
-  assert.ok(tetherSegment({ x: 700, y: 300 - (TETHER_FROM_DOT + TETHER_MIN) - 1 }, hud, R));
+test('ingen linje när de överlappar, nuddar eller ligger närmare än TETHER_MIN; trasiga tal ger ingen', () => {
+  const win = { x: 100, y: 100, w: 400, h: 300 };
+  assert.equal(tetherBetween(win, 16, { x: 300, y: 200, w: 360, h: 200 }, 22), null);
+  assert.equal(tetherBetween(win, 16, { x: 500 + TETHER_MIN - 1, y: 100, w: 360, h: 200 }, 22), null);
+  assert.ok(tetherBetween(win, 16, { x: 500 + TETHER_MIN + 1, y: 100, w: 360, h: 200 }, 22));
+  assert.equal(tetherBetween({ ...win, x: Number.NaN }, 16, { x: 600, y: 100, w: 360, h: 200 }, 22), null);
 });
