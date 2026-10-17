@@ -23,8 +23,9 @@ let front: Awaited<ReturnType<typeof frontServer>>;
 let wss: WebSocketServer;
 
 function freePort(): Promise<number> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const s = net.createServer();
+    s.once('error', reject);
     s.listen(0, '127.0.0.1', () => {
       const p = (s.address() as AddressInfo).port;
       s.close(() => resolve(p));
@@ -54,20 +55,23 @@ before(async () => {
       ws.on('close', (code) => closes.push(code));
     });
   });
-  await new Promise<void>((r) => backend.listen(0, '127.0.0.1', r));
+  await new Promise<void>((resolve, reject) => {
+    backend.once('error', reject);
+    backend.listen(0, '127.0.0.1', resolve);
+  });
   backendPort = (backend.address() as AddressInfo).port;
   front = await frontServer(
     (req, res) => proxyHttp(req, res, req.headers['x-test-port'] ? Number(req.headers['x-test-port']) : backendPort),
     (req, socket, head) => proxyUpgrade(req, socket, head, req.headers['x-test-port'] ? Number(req.headers['x-test-port']) : backendPort),
   );
-});
+}, { timeout: 30_000 });
 
 after(async () => {
-  await front.close();
+  await front?.close();
   wss.close();
   backend.closeAllConnections();
   await new Promise((r) => backend.close(r));
-});
+}, { timeout: 30_000 });
 
 const closes: number[] = [];
 
@@ -225,7 +229,10 @@ describe('felvägar', { timeout: 60_000 }, () => {
       s.on('error', () => {});
       s.end('det här är inte HTTP\r\n\r\n');
     });
-    await new Promise<void>((r) => junk.listen(0, '127.0.0.1', r));
+    await new Promise<void>((resolve, reject) => {
+      junk.once('error', reject);
+      junk.listen(0, '127.0.0.1', resolve);
+    });
     try {
       const r = await request(front.port, { path: '/api/x', headers: { 'x-test-port': String((junk.address() as AddressInfo).port) } });
       assert.equal(r.status, 502);
@@ -416,7 +423,7 @@ process.exit(0);
 `;
 
 describe('kalibrering av "kraschar aldrig"', { timeout: 60_000 }, () => {
-  const dir = path.join(SCRATCH, 'proxy-crash');
+  const dir = path.join(SCRATCH, `proxy-crash-${process.pid}`);
   before(() => {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });

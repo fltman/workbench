@@ -184,6 +184,11 @@ test('ångra (git reset --hard) laddar inte om via bevakaren; ångra-flödet gö
   await sleep(QUIET_MS);
   assert.deepEqual(reg.calls, [], 'git:s egen omskrivning är ingen manuell ändring');
 
+  assert.equal(await git.redo(ID), true); // lägger tillbaka index.html och ny.js
+  assert.equal(fs.readFileSync(path.join(dir, 'ny.js'), 'utf8'), 'x');
+  await sleep(QUIET_MS);
+  assert.deepEqual(reg.calls, [], 'inte heller gör om');
+
   fs.writeFileSync(path.join(dir, 'index.html'), 'för hand'); // efter fönstret laddar en manuell ändring om igen
   assert.ok(await waitFor(() => reg.calls.length >= 2), 'bevakaren lever efter ångra');
   assert.deepEqual(reg.calls, PAIR);

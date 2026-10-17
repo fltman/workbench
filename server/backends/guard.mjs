@@ -6,6 +6,8 @@
 //    (listen(PORT) utan värd binder annars :: och nås från nätverket).
 // 2. HTTP-förfrågningar och uppgraderingar vars Host inte är 127.0.0.1:<PORT> eller
 //    localhost:<PORT> får 421 (skydd mot DNS-rebinding). Proxyn skriver alltid om Host.
+//    Serverns egen port räknas också: ett barn ärver vakten (NODE_OPTIONS) och backendens PORT,
+//    och dess egen server ska svara på sin port (en sida som rebindar nämner aldrig loopback).
 // 3. Backenden avslutas om workbenchen försvinner, så att inga föräldralösa processer
 //    blir kvar och håller portar.
 import http from 'node:http';
@@ -57,7 +59,12 @@ const BODY = '{"error":"host"}';
 
 function hostAllowed(req) {
   const host = req?.headers?.host;
-  return typeof host === 'string' && ALLOWED_HOSTS.has(host.toLowerCase());
+  if (typeof host !== 'string') return false;
+  const name = host.toLowerCase();
+  if (ALLOWED_HOSTS.has(name)) return true;
+  // listen() binder alltid 127.0.0.1, så localPort är serverns egen port.
+  const own = req.socket?.localPort;
+  return Number.isInteger(own) && own > 0 && (name === `127.0.0.1:${own}` || name === `localhost:${own}`);
 }
 
 function refuseResponse(res) {

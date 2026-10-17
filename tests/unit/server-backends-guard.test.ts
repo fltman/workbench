@@ -9,12 +9,13 @@ import net from 'node:net';
 import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { testPort } from '../ports.ts';
 import { ROOT, SCRATCH, isAlive, sleep, waitFor } from './server-backends-harness.test.ts';
 
 const GUARD = pathToFileURL(path.join(ROOT, 'server', 'backends', 'guard.mjs')).href;
-const DIR = path.join(SCRATCH, 'guard');
-const GUARDED_PORT = 18380;
-const PLAIN_PORT = 18381;
+const DIR = path.join(SCRATCH, `guard-${process.pid}`);
+const GUARDED_PORT = await testPort();
+const PLAIN_PORT = await testPort();
 
 function script(name: string, source: string): string {
   const file = path.join(DIR, name);
@@ -133,10 +134,10 @@ server.listen(Number(process.env.PORT), () => console.log('REDO ' + server.addre
     const file = script('http.mjs', HTTP_SCRIPT);
     guarded = await startServer(file, true, GUARDED_PORT);
     plain = await startServer(file, false, PLAIN_PORT);
-  });
+  }, { timeout: 30_000 });
   after(() => {
-    guarded.kill('SIGKILL');
-    plain.kill('SIGKILL');
+    guarded?.kill('SIGKILL');
+    plain?.kill('SIGKILL');
   });
 
   test('förfrågningar: bara 127.0.0.1:<PORT> och localhost:<PORT> släpps in', async () => {
@@ -173,6 +174,40 @@ server.listen(Number(process.env.PORT), () => console.log('REDO ' + server.addre
     assert.deepEqual((await raw(p, expect(`localhost:${p}`), 'hi')).map((l) => l.slice(0, 12)), ['HTTP/1.1 100', 'HTTP/1.1 200']);
     assert.match((await raw(p, connect('evil.example:443')))[0], /^HTTP\/1\.1 421 /);
     assert.match((await raw(p, connect(`127.0.0.1:${p}`)))[0], /^HTTP\/1\.1 200 /);
+  });
+
+  test('en server på en annan port än PORT (ett barn som ärvt vakten via NODE_OPTIONS) svarar på sin egen port', async () => {
+    const file = script(
+      'egen-port.mjs',
+      `import http from 'node:http';
+const server = http.createServer((req, res) => res.end('ok'));
+server.listen(0, () => console.log('REDO ' + server.address().port));`,
+    );
+    // PORT är backendens, som barnet ärver; barnets egen server lyssnar på en annan.
+    const child = spawn(process.execPath, [`--import=${GUARD}`, file], { cwd: DIR, env: { ...process.env, PORT: String(GUARDED_PORT) }, stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      const own = await new Promise<number>((resolve, reject) => {
+        child.stdout.on('data', (d: Buffer) => {
+          const m = /REDO (\d+)/.exec(String(d));
+          if (m) resolve(Number(m[1]));
+        });
+        child.on('exit', (code) => reject(new Error(`servern avslutades med kod ${code}`)));
+      });
+      assert.notEqual(own, GUARDED_PORT);
+      const cases: [string, string][] = [
+        [`127.0.0.1:${own}`, '200'],
+        [`localhost:${own}`, '200'],
+        [`evil.example:${own}`, '421'],
+        [`127.0.0.1:${own === 9999 ? 9998 : 9999}`, '421'],
+        [`aabc123.localhost:${own}`, '421'],
+      ];
+      for (const [host, status] of cases) {
+        const lines = await raw(own, get(host));
+        assert.match(lines[0] ?? '', new RegExp(`^HTTP/1\\.1 ${status} `), `Host ${host}`);
+      }
+    } finally {
+      child.kill('SIGKILL');
+    }
   });
 
   test('kalibrering: utan vakten släpps samma främmande Host in', async () => {

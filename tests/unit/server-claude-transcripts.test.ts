@@ -1,16 +1,16 @@
 // forget raderar appens Claude-transkript (CONTRACT §8.1) med SDK:ns riktiga listSessions och deleteSession.
-// SDK:n läser CLAUDE_CONFIG_DIR, så testet pekar den på en egen katalog under .scratch: användarens
+// SDK:n läser CLAUDE_CONFIG_DIR, så testet pekar den på en egen katalog under TMPDIR: användarens
 // ~/.claude rörs aldrig. Påståendet "andra transkript raderas inte" fälls först av en planterad, naiv rensning.
+// TMPDIR och inte repots .scratch: apparnas sökvägar ska vara korta hur djupt repot än ligger (en färsk klon
+// på en lång sökväg gav annars projektkataloger över 200 tecken); långa sökvägar provas för sig nedan.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { after, before, beforeEach, describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { deleteSession, listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { deleteTranscripts, projectDirName, removeEmptyProjectDirs } from '../../server/claude/engine.ts';
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Samma namn som Claude Code ger projektkatalogen för en cwd (korta sökvägar). */
 function projectName(cwd: string): string {
@@ -58,7 +58,7 @@ describe('transkripten raderas bara för appens egen mapp', () => {
   }
 
   before(() => {
-    scratch = fs.realpathSync(fs.mkdtempSync(path.join(ROOT, '.scratch', 'transcripts-')));
+    scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-transcripts-')));
     config = path.join(scratch, 'claude-config');
     projects = path.join(config, 'projects');
     appA = path.join(scratch, 'home', 'apps', 'aklocka');

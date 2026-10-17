@@ -1,7 +1,8 @@
 // chrome.ts — skärmfast fönsterkrom i #chrome (CONTRACT §10.5, §14): LED-pricken, greppet, sidprickarna, minimeringen,
 // borttagningen,
 // de osynliga storlekszonerna, titt-zonerna vid prismors kanter och kantmarkörerna för fönster utanför bild.
-// Kromen ritas utanför iframen, så den fungerar även när en app hänger. Ingen text.
+// Kromen ritas utanför iframen, så den fungerar även när en app hänger. Ingen text utom appens märke (wb.badge), som
+// sätts med textContent.
 import type { AppStatus, BackendState } from '../../../shared/protocol.ts';
 import type { ScreenRect } from '../types.ts';
 import type { Tokens } from './tokens.ts';
@@ -16,6 +17,12 @@ export type Edge = (typeof EDGES)[number];
 export const ZONE = 10;
 /** Titt-zonen vid en prismas sidokant. */
 export const PEEK_ZONE = 24;
+
+/**
+ * Så långt utanför fönstrets rektangel kromen kan synas (skärm-px): zonerna, titten, halon och knapparna inom 48 px,
+ * sidprickarna för n sidor till vänster om greppet inom 14·n px. Längre bort göms den (§10.5).
+ */
+export const chromeReach = (n: number): number => Math.max(48, 14 * n);
 
 export interface ChromeHandlers {
   dot(): void;
@@ -48,6 +55,8 @@ export interface ChromeLayout {
   interactive: boolean;
   /** Fönstren (och miniatyrerna) ovanför det här: där tar zonerna och knapparna inte emot pekaren. */
   covers?: readonly ScreenRect[];
+  /** Miniatyren i raden (§10.7): märket är en fylld prick utan text. */
+  mini?: boolean;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, parent?: Element): HTMLElementTagNameMap[K] {
@@ -69,6 +78,8 @@ export class ChromeView {
   readonly halo: HTMLElement;
   readonly core: HTMLElement;
   readonly flash: HTMLElement;
+  /** Appens märke (wb.badge, §10.5) bredvid kärnan. */
+  readonly badge: HTMLSpanElement;
   readonly grip: HTMLDivElement;
   readonly pill: HTMLElement;
   readonly faceDots: HTMLDivElement;
@@ -84,7 +95,16 @@ export class ChromeView {
   #blink: Animation | null = null;
   #n = 1;
   #status: AppStatus = 'idle';
+  #badgeText: string | null = null;
+  /** Märkets bredd (0 = mät igen) och prickens plats och fönstren ovanför vid senaste layout, för täckningen. */
+  #badgeW = 0;
+  #badgeAt: { x: number; y: number; covers: readonly ScreenRect[] } | null = null;
+  #mini = false;
   #small = false;
+  /** Pricken ligger under ett annat fönster. */
+  #covered = false;
+  /** Gömd av hide() tills nästa layout(). */
+  #hidden = false;
   #tokens: Tokens;
   #gone = false;
   /** Senast skrivna storlek per zon: vid en ren panorering skrivs bara transformer. */
@@ -154,6 +174,7 @@ export class ChromeView {
     this.minBtn = el('button', 'wb-minbtn', this.root);
     this.minBtn.type = 'button';
     this.minBtn.setAttribute('aria-label', 'Minimera');
+    this.minBtn.title = 'Minimera';
     el('i', '', this.minBtn);
     this.minBtn.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
@@ -171,6 +192,7 @@ export class ChromeView {
     this.delBtn = el('button', 'wb-delbtn', this.root);
     this.delBtn.type = 'button';
     this.delBtn.setAttribute('aria-label', 'Ta bort appen');
+    this.delBtn.title = 'Ta bort appen';
     el('i', '', this.delBtn);
     el('span', '', this.delBtn).textContent = 'Ta bort';
     this.delBtn.addEventListener('pointerdown', (e) => {
@@ -195,6 +217,9 @@ export class ChromeView {
     this.halo = el('i', 'wb-dot-halo', this.haloWrap);
     this.flash = el('i', 'wb-dot-flash', this.pop);
     this.core = el('i', 'wb-dot-core', this.pop);
+    // Utanför pop: märket krymper inte med pricken i översikten och sväljer inte HUD:en.
+    this.badge = el('span', 'wb-dot-badge', this.dot);
+    this.badge.hidden = true;
     this.dot.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       e.stopPropagation();
@@ -223,10 +248,11 @@ export class ChromeView {
     this.setFaces(1, 0, h);
   }
 
-  /** Status → pricken (§10.5): idle andas, building andas 3,3× fortare, waiting blinkar, error/crashed bärnsten. */
-  setStatus(status: AppStatus, backend: BackendState): void {
+  /** Status → pricken (§10.5): idle andas, building andas 3,3× fortare, waiting blinkar, error/crashed/trouble bärnsten. */
+  setStatus(status: AppStatus, backend: BackendState, trouble = false): void {
     this.#status = status;
-    const amber = status === 'error' || backend === 'crashed';
+    this.#paintBadge();
+    const amber = status === 'error' || backend === 'crashed' || trouble;
     this.dot.classList.toggle('wb-amber', amber);
     this.dot.dataset.status = amber ? 'error' : status;
     this.#breath.updatePlaybackRate(status === 'building' ? 3.3 : 1);
@@ -246,10 +272,43 @@ export class ChromeView {
       this.#blink.cancel();
       this.#blink = null;
     }
+    this.#sync();
+  }
+
+  /** Andningen och blinkningen går bara där de syns (§10.5): halon inte när den är dold, inget under ett annat fönster eller utanför vyn. */
+  #sync(): void {
+    const seen = !this.#hidden && !this.#covered;
+    for (const [a, on] of [[this.#breath, seen && !this.#small], [this.#blink, seen]] as const) {
+      if (!a) continue;
+      if (on && a.playState === 'paused') a.play();
+      else if (!on && a.playState === 'running') a.pause();
+    }
   }
 
   get status(): AppStatus {
     return this.#status;
+  }
+
+  /** Appens märke (§10.5), redan tvättat av bryggan; null tar bort det. */
+  setBadge(text: string | null): void {
+    if (text === this.#badgeText) return;
+    this.#badgeText = text;
+    this.badge.textContent = text ?? '';
+    this.#badgeW = 0;
+    this.#paintBadge();
+  }
+
+  /**
+   * Claudes lägen går före: under building och waiting syns inget märke. Märket sticker ut till höger om fönstret, så
+   * ett fönster ovanför som täcker någon del av det döljer det (som zonerna), och det tar aldrig det fönstrets klick.
+   */
+  #paintBadge(): void {
+    const hide = !this.#badgeText || this.#status === 'building' || this.#status === 'waiting';
+    if (this.badge.hidden !== hide) this.badge.hidden = hide; // layout() kör varje bildruta
+    const a = this.#badgeAt;
+    if (hide || !a) return;
+    if (!this.#badgeW) this.#badgeW = this.badge.offsetWidth; // en gång per text: dold med visibility har det kvar sin bredd
+    this.badge.classList.toggle('wb-badge-covered', coveredRect({ x: a.x + 8, y: a.y - 8, w: this.#badgeW, h: 16 }, a.covers));
   }
 
   /** Spelhastigheten för andningen (för tester och mätningar). */
@@ -267,6 +326,7 @@ export class ChromeView {
           const b = el('button', 'wb-facedot', this.faceRow);
           b.type = 'button';
           b.setAttribute('aria-label', labels[i] || `Sida ${i + 1}`);
+          b.title = labels[i] || `Sida ${i + 1}`;
           el('i', '', b);
           b.addEventListener('pointerdown', (e) => e.stopPropagation());
           b.addEventListener('click', (e) => {
@@ -279,19 +339,35 @@ export class ChromeView {
     }
     this.#faceBtns.forEach((b, i) => {
       b.classList.toggle('wb-on', i === current);
-      if (labels[i]) b.setAttribute('aria-label', labels[i]);
+      // Anropas varje bildruta: skriv bara när namnet ändrats. Verktygstipset är samma namn.
+      if (labels[i] && b.title !== labels[i]) {
+        b.setAttribute('aria-label', labels[i]);
+        b.title = labels[i];
+      }
     });
   }
 
   layout(L: ChromeLayout): void {
     if (this.#gone) return;
     const r = L.rect;
+    // Tillbaka i vyn efter hide(): kromen visas och läggs ut i samma bildruta.
+    let sync = this.#hidden;
+    if (this.#hidden) {
+      this.#hidden = false;
+      this.root.style.display = '';
+    }
     at(this.dot, L.dot.x, L.dot.y);
     if (L.small !== this.#small) {
       this.#small = L.small;
       this.dot.classList.toggle('wb-small', L.small);
+      sync = true;
+    }
+    if (L.dotHidden !== this.#covered) {
+      this.#covered = L.dotHidden;
+      sync = true;
     }
     this.dot.classList.toggle('wb-covered', L.dotHidden);
+    if (sync) this.#sync();
 
     // Greppet: 10 px under nederkanten, mitt under fönstret. Sidprickarna till vänster om det.
     const tiny = r.w < 90 || r.h < 40;
@@ -348,6 +424,27 @@ export class ChromeView {
       this.#size(z, free.w, free.h);
       at(z, free.x, free.y);
     }
+
+    // Märket på miniatyren är en fylld prick (§10.7): tre tecken går inte att läsa där.
+    if (!!L.mini !== this.#mini) {
+      this.#mini = !!L.mini;
+      this.dot.classList.toggle('wb-dot-mini', this.#mini);
+      this.#badgeW = 0;
+    }
+    this.#badgeAt = { x: L.dot.x, y: L.dot.y, covers };
+    this.#paintBadge();
+  }
+
+  /**
+   * Fönstret ligger långt utanför vyn (§10.5): kromen göms helt tills nästa layout(), en armerad Ta bort avbryts (Esc
+   * ska aldrig gå till en knapp som inte syns) och pricken står still. Gör ingenting om den redan är gömd.
+   */
+  hide(): void {
+    if (this.#hidden || this.#gone) return;
+    this.#hidden = true;
+    this.#disarm();
+    this.root.style.display = 'none';
+    this.#sync();
   }
 
   #size(z: HTMLElement, w: number, h: number): void {
@@ -440,7 +537,10 @@ export class ChromeView {
   }
 }
 
-/** Kantmarkörer: en 8 px prick vid vyns kant för varje fönster helt utanför bild. Klick flyger dit. */
+/**
+ * Kantmarkörer: en 8 px prick vid vyns kant för varje fönster helt utanför bild. Klick flyger dit. En markör vars
+ * träffyta (24 px) når in i ett fönster eller dess krom döljs och tar ingen pekare (§10.5).
+ */
 export class Markers {
   readonly root: HTMLDivElement;
   #items = new Map<string, HTMLButtonElement>();
@@ -451,8 +551,8 @@ export class Markers {
     this.#onClick = onClick;
   }
 
-  /** points: appId → skärmpunkt, eller null när fönstret syns. */
-  update(points: Map<string, { x: number; y: number } | null>): void {
+  /** points: appId → skärmpunkt, eller null när fönstret syns. covers: fönstren i vyn med sin krom (withChrome). */
+  update(points: Map<string, { x: number; y: number } | null>, covers: readonly ScreenRect[] = []): void {
     for (const [appId, b] of this.#items) {
       if (!points.get(appId)) {
         b.remove();
@@ -476,6 +576,7 @@ export class Markers {
         this.#items.set(appId, b);
       }
       at(b, p.x, p.y);
+      b.classList.toggle('wb-hidden', coveredRect({ x: p.x - 12, y: p.y - 12, w: 24, h: 24 }, covers));
     }
   }
 }

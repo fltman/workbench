@@ -4,8 +4,8 @@ import { describe, test } from 'node:test';
 import { interpretResult, LIMIT_THRESHOLD, LimitsTracker, queuedAfter } from '../../server/claude/events.ts';
 import type { RateLimitInfoExt } from '../../server/claude/events.ts';
 
-// Inspelad rate_limit_event (Agent SDK 0.3.301, CLI 2.1.301), ordagrant ur spikens
-// scratchpad/spikes/sdk-extend/evidence/q1-main.jsonl rad 2. Märk: ingen utilization på toppnivå.
+// Inspelad rate_limit_event (Agent SDK 0.3.301, CLI 2.1.301), ordagrant ur en sond mot SDK:n.
+// Märk: ingen utilization på toppnivå.
 const RECORDED = JSON.parse(
   '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1792113000,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.03,"resetsAt":1792113000},"seven_day":{"utilization":0.22,"resetsAt":1792346400}}},"uuid":"d5296086-b32f-43b7-905d-b0f5fda763fb","session_id":"2f08a613-94cc-4d3b-9cd7-e49ac4665bf6"}',
 ) as { rate_limit_info: RateLimitInfoExt };

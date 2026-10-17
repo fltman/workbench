@@ -174,7 +174,7 @@ test('från A rakt in i ett överlappande B (snabbt drag över storlekszonerna):
   assert.equal(g.allows('wheel', Bo.appId, false, Bo.rect), true);
   const w3 = new Wave3Gate();
   w3.pointer(A.rect.x - 30, A.rect.y + 100, [A, Bo]);
-  assert.equal(w3.allows('wheel', Bo.appId, false, Bo.rect), false, 'kalibrering: våg 3 släppte inte igenom (uppmätt i r4-sec.mjs)');
+  assert.equal(w3.allows('wheel', Bo.appId, false, Bo.rect), false, 'kalibrering: våg 3 släppte inte igenom (uppmätt)');
   // Fokus och tangenter kräver mer: ett klick i B ger B tangentbordsfokus.
   assert.equal(g.allows('focus', Bo.appId, false, Bo.rect), false);
   assert.equal(g.allows('key', Bo.appId, false, Bo.rect), false);
@@ -224,7 +224,7 @@ test('pekaren lämnar sidan och kommer tillbaka utifrån rakt ned i appen: hjule
   const w3: BridgeGate = new Wave3Gate();
   w3.pointer(5, 120, [A, B]);
   w3.lost();
-  assert.equal(w3.allows('wheel', B.appId, false, B.rect, yes), false, 'kalibrering: våg 3 släppte inte igenom (uppmätt i r4-sec.mjs)');
+  assert.equal(w3.allows('wheel', B.appId, false, B.rect, yes), false, 'kalibrering: våg 3 släppte inte igenom (uppmätt)');
   // Pekaren syns i skalet igen, i ett tomt hörn: kapningen stängd.
   g.pointer(5, 895, [A, B]);
   assert.equal(g.allows('wheel', B.appId, false, B.rect, yes), false);

@@ -15,6 +15,12 @@ const MAX_DELTA_PX = 5000;
 const MAX_COORD = 100_000;
 const MAX_SIZE = 10_000;
 const FACE_RE = /^[a-z0-9-]{1,32}$/;
+/**
+ * Märket (§10.5): högst så många kodpunkter. Kontroll- och formattecken (Unicode Cc och Cf: riktningstecknen, också
+ * U+061C, och tecken med noll bredd) tas bort, så att en text av bara osynliga tecken blir null och ingen tom kapsel.
+ */
+const BADGE_MAX = 3;
+const BADGE_STRIP = /[\p{Cc}\p{Cf}]/gu;
 const KEY_CODES = ['KeyK', 'Digit0', 'ArrowLeft', 'ArrowRight', 'Escape'] as const;
 type KeyCode = (typeof KEY_CODES)[number];
 
@@ -32,6 +38,12 @@ function num(v: unknown, lo: number, hi: number): number | null {
 
 function isKeyCode(v: unknown): v is KeyCode {
   return typeof v === 'string' && (KEY_CODES as readonly string[]).includes(v);
+}
+
+/** Märkets text: utan kontroll- och formattecken, blanktecken ihopslagna och trimmade, högst tre kodpunkter. Tom blir null. */
+function badgeText(v: string): string | null {
+  const t = v.replace(BADGE_STRIP, '').replace(/\s+/gu, ' ').trim();
+  return Array.from(t).slice(0, BADGE_MAX).join('').trim() || null;
 }
 
 /**
@@ -80,6 +92,9 @@ export function parseFromApp(data: unknown): BridgeFromApp | null {
       return { wb: 1, type: 'focus' };
     case 'face':
       return typeof d.show === 'string' && FACE_RE.test(d.show) ? { wb: 1, type: 'face', show: d.show } : null;
+    case 'badge':
+      if (d.text === null) return { wb: 1, type: 'badge', text: null };
+      return typeof d.text === 'string' ? { wb: 1, type: 'badge', text: badgeText(d.text) } : null;
     default:
       return null;
   }
@@ -111,6 +126,9 @@ function dispatch(opts: ParentBridgeOptions, w: BridgeWindow, m: BridgeFromApp):
       break;
     case 'face':
       opts.onFaceRequest?.(w, m.show);
+      break;
+    case 'badge':
+      opts.onBadge?.(w, m.text);
       break;
   }
 }

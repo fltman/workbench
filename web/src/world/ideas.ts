@@ -1,6 +1,8 @@
 // ideas.ts — sidan Förslag (CONTRACT §10.8). Varje byggd app får en sista sida som skalet ritar själv, utan iframe:
 // förslag på förbättringar av appen från Claude (§8.12). Ett klick på ett förslag vrider fram appen, öppnar dess HUD
 // och skickar förslaget (världen gör det via 'hud:send'). Appen själv kan aldrig starta ett bygge härifrån.
+// Har appen fått ett fel efter turen (AppInfo.trouble) står "Rätta felet: <raden>" först, utan fråga till Claude. Raden
+// är appens egen text, så ett klick skickar den citerad som appens feltext.
 // Alla förslag sätts med textContent.
 import { store } from '../store.ts';
 
@@ -24,6 +26,8 @@ export class IdeasView {
   #rev = -1;
   #items: string[] = [];
   #gen = 0;
+  /** Felsignalen från servern (§10.8): ett lokalt förslag först i alla lägen. */
+  #trouble: string | null = null;
 
   constructor(parent: HTMLElement, appId: string, pick: (text: string) => void) {
     this.#appId = appId;
@@ -31,6 +35,13 @@ export class IdeasView {
     this.el = el('div', 'wb-ideas', parent);
     this.el.setAttribute('role', 'group');
     this.el.setAttribute('aria-label', IDEAS_LABEL);
+    this.#render();
+  }
+
+  /** Ett fel efter turen (AppInfo.trouble), eller null när det inte finns något. */
+  setTrouble(line: string | null): void {
+    if (line === this.#trouble) return;
+    this.#trouble = line;
     this.#render();
   }
 
@@ -63,10 +74,17 @@ export class IdeasView {
   #render(): void {
     const e = this.el;
     e.dataset.state = this.#state;
+    // Felet efter turen står först i alla lägen, även medan förslagen hämtas eller när de inte gick att ta fram.
+    const list = el('ul', 'wb-ideas-list');
+    if (this.#trouble) {
+      this.#item(list, `Rätta felet: ${this.#trouble}`, `Rätta felet som appen fick efter bygget: ”${this.#trouble}”`).classList.add('wb-idea-fix');
+    }
+    const top = this.#trouble ? [list] : [];
     if (this.#state === 'loading' || this.#state === 'idle') {
       const wait = el('div', 'wb-ideas-wait');
-      el('i', 'wb-ideas-led', wait);
-      e.replaceChildren(wait);
+      // Innan förslagen hämtas är sidan tom: en LED som andas på en dold sida kostar en animation per app i vila.
+      if (this.#state === 'loading') el('i', 'wb-ideas-led', wait);
+      e.replaceChildren(...top, wait);
       return;
     }
     if (this.#state === 'error') {
@@ -76,18 +94,20 @@ export class IdeasView {
       again.type = 'button';
       again.textContent = 'Försök igen';
       again.addEventListener('click', () => this.#load(this.#rev));
-      e.replaceChildren(box);
+      e.replaceChildren(...top, box);
       return;
     }
-    const list = el('ul', 'wb-ideas-list');
-    for (const text of this.#items) {
-      const li = el('li', '', list);
-      const b = el('button', 'wb-idea', li);
-      b.type = 'button';
-      el('i', 'wb-idea-dot', b);
-      el('span', '', b).textContent = text;
-      b.addEventListener('click', () => this.#pick(text));
-    }
+    for (const text of this.#items) this.#item(list, text);
     e.replaceChildren(list);
+  }
+
+  #item(list: HTMLUListElement, text: string, send = text): HTMLButtonElement {
+    const li = el('li', '', list);
+    const b = el('button', 'wb-idea', li);
+    b.type = 'button';
+    el('i', 'wb-idea-dot', b);
+    el('span', '', b).textContent = text;
+    b.addEventListener('click', () => this.#pick(send));
+    return b;
   }
 }

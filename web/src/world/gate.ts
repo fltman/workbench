@@ -2,7 +2,7 @@
 // hos just den appen. Bryggan (bridge.ts) kontrollerar avsändare, origin och vokabulär; grinden avgör om
 // appen får använda dem just nu. Ren logik, enhetstestad.
 //
-// Uppmätt i Chrome (headless, DSF 2, .scratch/fix-world/m-gate.mjs): en pekare inne i en app-iframe syns inte
+// Uppmätt i Chrome (headless, DSF 2): en pekare inne i en app-iframe syns inte
 // alls för skalet. Iframen får aldrig :hover i skalet och skalet får varken pointerover, pointerout eller
 // pointermove när pekaren går in i den. Däremot är document.activeElement iframen så fort fokus ligger i appen.
 // Därför:
@@ -14,17 +14,17 @@
 //    Står pekaren still medan kameran flyttar ett fönster in under den (panorering över tom yta) gäller
 //    platsen där skalet senast såg den, mot fönstrets plats nu. Tangentbordsfokus räcker också.
 //  - Från ett fönster kan pekaren gå rakt in i ett annat som överlappar eller ligger nära, utan att skalet ser
-//    den: ett snabbt drag (ungefär 25 px per händelse) hoppar över storlekszonerna mellan dem (uppmätt,
-//    r4-sec.mjs). Hjul godtas därför också från en app vars fönster ligger inom NEAR_PX från ett fönster som
+//    den: ett snabbt drag (ungefär 25 px per händelse) hoppar över storlekszonerna mellan dem
+//    (uppmätt). Hjul godtas därför också från en app vars fönster ligger inom NEAR_PX från ett fönster som
 //    pekaren kan vara i (kedjan av fönster den kan gå mellan). Fokus och tangenter kräver mer: ett klick i
 //    appen ger den tangentbordsfokus, och då godtas både fokus och tangenter.
 //  - Innan skalet sett pekaren alls (sidan laddades om medan pekaren vilade över en app), och sedan pekaren
 //    lämnat sidan (den kan komma tillbaka utifrån rakt ned i ett fönster vid vyns kant), vet skalet inte var
 //    den är. Då godtas hjul, men inte fokus eller tangenter, från en app vars fönster syns och, när hjulet har
-//    en punkt, är överst där. Uppmätt (.scratch/fix-world/r4-sec.mjs): annars gick det varken att nypa eller
+//    en punkt, är överst där. Uppmätt: annars gick det varken att nypa eller
 //    panorera över appen förrän pekaren korsat skalet eller användaren klickat i appen. Att pekaren lämnar
 //    sidan syns som pointerleave på <html> utan relatedTarget; att den går in i en iframe gör det inte
-//    (uppmätt, r4-leave.mjs).
+//    (uppmätt).
 import type { ScreenRect } from '../types.ts';
 
 /** Så nära ett fönster (skärm-px) skalet senast måste ha sett pekaren för att appens hjul ska godtas. */

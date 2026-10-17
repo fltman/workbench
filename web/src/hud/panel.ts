@@ -280,12 +280,15 @@ export class HudPanel {
 
     this.menu = createMenu(this.more, this.el, {
       canUndo: () => !this.#disposed && !M.isActive(this.#status()),
+      canRedo: () => !this.#disposed && !M.isActive(this.#status()) && store.canRedo(this.appId),
       canOpenTab: () => !this.#disposed && !!store.apps.get(this.appId)?.built,
       undo: () => void this.#undo(),
+      redo: () => void this.#redo(),
       openTab: () => this.#openTab(),
       minimized: () => (this.#disposed || !this.#world.screenRectOf(this.appId) ? null : this.#world.isMinimized(this.appId)),
       toggleMinimize: () => (this.#world.isMinimized(this.appId) ? this.#world.restore(this.appId) : this.#world.minimize(this.appId)),
       remove: () => this.#remove(),
+      openLog: () => this.#openLog(),
       closed: (restore) => {
         // Fokus går tillbaka bara till den aktiva HUD:en, aldrig till en som inte är aktiv.
         if (restore && host.isActive(this.appId)) this.focusInput();
@@ -514,6 +517,8 @@ export class HudPanel {
         this.#rendered.set(m.key, n);
         fresh.push({ node: n, kind: m.kind, text: m.text });
       }
+      // Noten som säger att meddelandet aldrig kördes kommer efter raden, så en rad som redan syns dämpas nu (§13).
+      if (m.kind === 'user') n.classList.toggle('is-dropped', m.dropped);
       nodes.push(n);
     }
     // Det som köats under turen står under den levande texten; när turen fått sin text flyttas det upp i listan,
@@ -532,7 +537,7 @@ export class HudPanel {
         const same = this.#lastLive && f.text.trim().startsWith(this.#lastLive.trim().slice(0, 40));
         if (same || !motion) continue;
         // En annan text på samma plats: den nya tonar upp från halvt synlig, så att platsen aldrig står tom
-        // (från 0 gav uppmätt ≈70 ms utan läsbar text, .scratch/rev-frontend/p7-stream.mjs).
+        // (från 0 gav uppmätt ≈70 ms utan läsbar text).
         if (replaced) f.node.animate([{ opacity: 0.5 }, { opacity: 1 }], { duration: 240, easing: 'ease-out' });
         else f.node.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 420, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
       } else if (motion) {
@@ -1052,10 +1057,32 @@ export class HudPanel {
     }
   }
 
+  /** Lyckas det kommer serverns note ("Gjorde om ändringen.") och den nya versionen, som efter ångra. */
+  async #redo(): Promise<void> {
+    const appId = this.appId;
+    if (this.#disposed) return;
+    try {
+      const ok = await store.redo(appId);
+      // 409: en tur har hunnit börja, eller historien har gått isär sedan ångrandet.
+      if (!ok && !this.#disposed) this.flash(M.isActive(this.#status()) ? 'Claude arbetar just nu' : 'Det finns inget att göra om');
+    } catch {
+      if (!this.#disposed) this.flash(store.connected ? 'Kunde inte göra om' : 'Ingen kontakt med servern');
+    }
+  }
+
   #openTab(): void {
     if (this.#disposed) return;
     const port = location.port ? `:${location.port}` : '';
     window.open(`${location.protocol}//${this.appId}.localhost${port}/`, '_blank', 'noopener,noreferrer');
+  }
+
+  /**
+   * Visa loggen (§13): appens senaste loggrader som text i en egen flik (GET /api/apps/:id/logs, §7.1), som Öppna i
+   * egen flik öppnar appen. Detaljer på begäran utan nya element i panelen; fliken ger sökning och kopiering.
+   */
+  #openLog(): void {
+    if (this.#disposed) return;
+    window.open(`/api/apps/${encodeURIComponent(this.appId)}/logs`, '_blank', 'noopener,noreferrer');
   }
 
   #remove(): void {

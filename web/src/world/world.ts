@@ -11,15 +11,15 @@ import type { Surface } from './bg.ts';
 import { createSurface } from './bg.ts';
 import { boundsOf, fitRect, lerpCamera, panBy, sanitizeCamera, screenToWorld, xform, zoomAround, ZOOM_MAX } from './camera.ts';
 import type { ChromeHandlers, Edge } from './chrome.ts';
-import { ChromeView, Markers } from './chrome.ts';
+import { ChromeView, Markers, chromeReach } from './chrome.ts';
 import type { KeyAction } from './gestures.ts';
-import { classifyKey, normDelta, zoomFactor } from './gestures.ts';
+import { classifyKey, normDelta, smartAction, zoomFactor } from './gestures.ts';
 import type { GateKind } from './gate.ts';
-import { BridgeGate, inView } from './gate.ts';
+import { BridgeGate, distToRect, inView, NEAR_PX } from './gate.ts';
 import type { Pt } from './geom.ts';
 import { InkStroke } from './ink.ts';
 import { attachKeys, attachWheel } from './input.ts';
-import { dotPointLocal, edgeMarker, OVERVIEW_DOT_W, requestFromDrawn, resizeFrom, scaleAround, scaleFrom, screenRectOfWin, topmostAt } from './layout.ts';
+import { dotPointLocal, edgeMarker, FIELD_MIN, fieldRect, grow, OVERVIEW_DOT_W, requestFromDrawn, resizeFrom, scaleAround, scaleFrom, screenRectOfWin, topmostAt, withChrome } from './layout.ts';
 import { clamp, easeOutCubic, project, smoothstep } from './math.ts';
 import { DOT_SLIDE_FROM, DOT_SLIDE_TO, cameraMatrix } from './prism.ts';
 import { toolsInLastTurn } from './seed.ts';
@@ -42,6 +42,8 @@ export interface WorldDebug {
   huds(): { open: string[]; active: string | null };
   breathRate(appId: string): number | null;
   toScreen(appId: string, face: number, x: number, y: number): { x: number; y: number } | null;
+  /** Dolda iframes och gömd krom för fönster utanför vyn av eller på (för mätningar med och utan på samma sida). */
+  cull(on: boolean): void;
 }
 
 interface FrameRec {
@@ -91,6 +93,8 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
   const frames = new Map<MessageEventSource, FrameRec>();
   const recByIframe = new Map<HTMLIFrameElement, FrameRec>();
   const recByBw = new WeakMap<BridgeWindow, FrameRec>();
+  /** Sidan vars märke syns (§10.5): märket hör till den, och går den bort (ny version) går märket med den. */
+  const badgeFrom = new Map<WindowView, FrameRec>();
   const gate = new BridgeGate();
   let focused: string | null = null;
   /** Kopia av HUD:arnas läge (senaste hud:state): öppna appar och den aktiva. HUD:en ensam avgör det. */
@@ -228,16 +232,14 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
     return y;
   }
 
-  function covered(v: WindowView, x: number, y: number): boolean {
-    for (const u of views.values()) {
-      if (u === v || u.dissolving || u.win.z <= v.win.z || away(u)) continue;
-      const r = screenRectOfWin(u.win, cam, vw, vh);
-      if (x > r.x + 2 && x < r.x + r.w - 2 && y > r.y + 2 && y < r.y + r.h - 2) return true;
-    }
-    return false;
+  /** Ligger punkten under något av fönstren ovanför (deras skärmrektanglar i den här bildrutan)? */
+  function covered(above: readonly ScreenRect[], x: number, y: number): boolean {
+    return above.some((r) => x > r.x + 2 && x < r.x + r.w - 2 && y > r.y + 2 && y < r.y + r.h - 2);
   }
 
   const markers = new Markers(chromeEl, (appId) => flyToApp(appId, true));
+  /** Det som sparar på fönster utanför vyn (§10.5); av bara för mätningar (debug.cull). */
+  let cull = true;
 
   function layoutChrome(): void {
     const all = [...views.values()];
@@ -246,35 +248,52 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
     // Det som ligger ovanför fönstren: andra fönster med högre z, och miniatyrerna i raden (över alla).
     const placed = placedViews().map((u) => ({ z: u.win.z, rect: screenRectOfWin(u.win, cam, vw, vh) }));
     const tiles = liveViews().flatMap((u) => (u.win.minimized && minis.get(u)?.last ? [minis.get(u)!.last!] : []));
+    // En iframe med tangentbordsfokus döljs aldrig: att dölja den tar fokus från appen.
+    const typing = document.activeElement instanceof HTMLIFrameElement ? document.activeElement.closest('.wb-win') : null;
     for (const v of all) {
       const c = chromes.get(v);
       if (!c || v.dissolving) continue;
       if (away(v)) {
+        v.el.classList.remove('wb-offscreen');
         // I raden: bara pricken, liten och utan halo, i miniatyrens övre högra hörn. Under flykten ingenting.
         const m = minis.get(v);
         const box = m?.last;
         if (!box) continue;
-        c.layout({ rect: box, dot: tileDot(v, box), small: true, dotHidden: !!m?.anim, gripHidden: true, prism: false, interactive: false });
+        c.layout({ rect: box, dot: tileDot(v, box), small: true, dotHidden: !!m?.anim, gripHidden: true, prism: false, interactive: false, mini: true });
         continue;
       }
       const rect = screenRectOfWin(v.win, cam, vw, vh);
+      // Längre från vyn än sin egen storlek, och minst en halv vy: iframen tas ur kompositeringen (§10.5). Marginalen ger
+      // appen tid att rita innan den panoreras in, även ett litet fönster i översikten som panoreras snabbt. Kommer den
+      // in medan zoomen ändras hinner den inte (§10.5).
+      const near = Math.max(rect.w, rect.h, vw / 2, vh / 2);
+      v.el.classList.toggle('wb-offscreen', cull && v.el !== typing && !inView(grow(rect, near), vw, vh));
+      if (v.appId) marks.set(v.appId, edgeMarker(rect, vw, vh));
+      // Kromen långt utanför vyn göms och läggs inte ut. I 3D når silhuetten (och pricken) utanför rektangeln, och
+      // under ett drag håller greppet eller zonen pekaren.
+      if (cull && !v.is3d && v !== dragView && !inView(grow(rect, chromeReach(v.n)), vw, vh)) {
+        c.hide();
+        continue;
+      }
       const dot = dotScreen(v);
       const bottom = v.is3d ? silhouetteBottom(v) : undefined;
+      const above = placed.filter((p) => p.z > v.win.z).map((p) => p.rect);
+      // Sidorna först: layout() räknar med antalet (sidprickarna), även första bildrutan tillbaka i vyn.
+      c.setFaces(v.n, v.front, chromeHandlers(v), v.faces.map((f) => f.def.label ?? ''));
       c.layout({
         rect,
         dot,
         small: rect.w < OVERVIEW_DOT_W,
-        dotHidden: covered(v, dot.x, dot.y),
-        gripHidden: covered(v, rect.x + rect.w / 2, Math.max(rect.y + rect.h, bottom ?? -Infinity) + 12),
+        dotHidden: covered(above, dot.x, dot.y),
+        gripHidden: covered(above, rect.x + rect.w / 2, Math.max(rect.y + rect.h, bottom ?? -Infinity) + 12),
         prism: v.appFaces > 1,
         bottom,
         interactive: v.appId !== '',
-        covers: [...placed.filter((p) => p.z > v.win.z).map((p) => p.rect), ...tiles],
+        covers: [...above, ...tiles],
       });
-      c.setFaces(v.n, v.front, chromeHandlers(v), v.faces.map((f) => f.def.label ?? ''));
-      if (v.appId) marks.set(v.appId, edgeMarker(rect, vw, vh));
     }
-    markers.update(marks);
+    // En markör ovanpå ett fönster eller dess krom ritas inte: den tog appens klick och såg ut som lös krom (QA 17 oktober).
+    markers.update(marks, [...placed.map((p) => withChrome(p.rect)), ...tiles]);
   }
 
   function frame(now: number): void {
@@ -387,9 +406,12 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
   }
 
   function fitAll(): void {
-    const b = boundsOf(placedViews().map(winRect));
+    const placed = placedViews();
+    const b = boundsOf(placed.map(winRect));
     if (!b) return; // utan fönster står kameran still
-    pushBack();
+    // Tillbaka bara till en vy där något fönster syns: en tom vy är den man var vilse i, inget att flyga tillbaka till
+    // (QA 17 oktober: ett andra dubbelklick efter visa allt flög tillbaka ut i tomheten).
+    if (placed.some((v) => inView(screenRectOfWin(v.win, cam, vw, vh), vw, vh))) pushBack();
     startFly(fitRect(b, vw, vh, 72, 1));
     flownTo = null;
   }
@@ -399,10 +421,12 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
     return topmostAt(items, sx, sy)?.v ?? null;
   }
 
-  function smartZoom(sx: number, sy: number): void {
-    const v = viewAt(sx, sy);
-    if (v && flownTo !== v.appId) flyToApp(v.appId, true);
-    else flyBack();
+  /** hit: fönstret under pekaren (dubbelklicket på tom yta anger null). */
+  function smartZoom(sx: number, sy: number, hit = viewAt(sx, sy)): void {
+    const a = smartAction(hit?.appId ?? null, flownTo, backStack.length > 0);
+    if (a === 'fly-to' && hit) flyToApp(hit.appId, true);
+    else if (a === 'back') flyBack();
+    else if (a === 'fit') fitAll();
   }
 
   /* ------------------------------ fönster ------------------------------ */
@@ -462,6 +486,10 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
       recByIframe.delete(iframe);
       for (const [k, r] of frames) if (r === rec) frames.delete(k);
       for (const w of rec.waiters) w();
+      if (badgeFrom.get(rec.view) === rec) {
+        badgeFrom.delete(rec.view);
+        chromes.get(rec.view)?.setBadge(null);
+      }
     },
     helloOf(iframe) {
       const rec = recByIframe.get(iframe);
@@ -552,7 +580,7 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
 
   function applyApp(v: WindowView, app: AppInfo): void {
     v.setApp(app);
-    chromes.get(v)?.setStatus(app.status, app.backend);
+    chromes.get(v)?.setStatus(app.status, app.backend, !!app.trouble);
     if (v.seed) v.setTools(toolsInLastTurn(store.chats.get(app.id) ?? []));
     changed();
   }
@@ -680,11 +708,25 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
     return true;
   }
 
-  /** En ny app mitt i vyn åt fältet (§10.9): som en ritad fyrkant, utan strecket. */
+  /** En ny app åt fältet (§10.9): som en ritad fyrkant, utan strecket, där det finns plats i vyn (fieldRect). */
   async function createFromField(): Promise<string | null> {
-    const w = Math.max(320, Math.min(720, vw - 200));
-    const h = Math.max(220, Math.min(460, vh - 260));
-    const req = requestFromDrawn({ x: (vw - w) / 2, y: (vh - h) / 2 + 30, w, h }, cam, vw, vh);
+    const size = { w: Math.max(FIELD_MIN.w, Math.min(720, vw - 200)), h: Math.max(FIELD_MIN.h, Math.min(460, vh - 260)) };
+    const on = (v: WindowView): ScreenRect => screenRectOfWin(v.win, cam, vw, vh);
+    const fv = focused ? viewOf(focused) : undefined;
+    const own = fv && !away(fv) && inView(on(fv), vw, vh) ? on(fv) : null;
+    const others = placedViews().filter((v) => v !== fv).map(on).filter((r) => inView(r, vw, vh));
+    // Att undvika: öppna HUD:ar, ungefär som flyToApp räknar dem (till höger om fönstret, 360 + 28 px breda och högst
+    // min(40vh, 320 px) höga, §13), och miniatyrerna i raden.
+    const obstacles = [
+      ...[...huds.open].flatMap((id) => {
+        const v = viewOf(id);
+        if (!v || away(v)) return [];
+        const r = on(v);
+        return [{ x: r.x + r.w, y: r.y, w: 360 + 28, h: Math.min(320, 0.4 * vh) }];
+      }),
+      ...liveViews().flatMap((v) => (v.win.minimized && minis.get(v)?.last ? [minis.get(v)!.last!] : [])),
+    ];
+    const req = requestFromDrawn(fieldRect(size, { w: vw, h: vh }, own, others, obstacles), cam, vw, vh);
     if (!req || creating) return null;
     let res: Awaited<ReturnType<typeof store.createApp>>;
     try {
@@ -931,11 +973,21 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
   /* ------------------------------ rita en ny app (§10.4) ------------------------------ */
 
   const isEmpty = (t: EventTarget | null): boolean => t === stage || t === bgCanvas || t === worldEl;
+  /** Klickräkningen för trycket på tom yta (mousedown.detail, före släppet); 0 utan mushändelser (ett finger). */
+  let clicks = 0;
+  /** Släpptes det senaste trycket i skalet på tom yta utan drag (och utan Esc)? Bara då hör ett dubbelklick dit. */
+  let tapped = false;
+  // Varje tryck nollställer det, även ett som kromen stoppar (därför i fångstfasen). Ett tryck på tom yta sätter det när
+  // det släpps (pointerup), och det kommer före click och dblclick.
+  stage.addEventListener('pointerdown', () => {
+    tapped = false;
+  }, true);
 
   stage.addEventListener('pointerdown', (e) => {
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
     if (!isEmpty(e.target)) return;
     fly = null;
+    clicks = 0;
     const p0: Pt = { x: e.clientX, y: e.clientY };
     let stroke: InkStroke | null = null;
     startDrag(e, stage, {
@@ -949,9 +1001,11 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
       },
       end: (moved, cancelled) => {
         const s = stroke as InkStroke | null;
+        tapped = !moved && !cancelled;
         // Ett tryck (släpp utan att pekaren rört sig 4 px) stänger den aktiva HUD:en. Ett drag ritar och stänger ingen.
+        // Det andra trycket i ett dubbelklick hör till dubbelklicket (nedan) och stänger ingen till.
         if (!moved) {
-          if (!cancelled && huds.active) bus.emit('hud:close', { appId: huds.active });
+          if (!cancelled && huds.active && clicks < 2) bus.emit('hud:close', { appId: huds.active });
           return;
         }
         if (!s) return;
@@ -959,6 +1013,18 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
         else materialize(s);
       },
     });
+  });
+  // Bara det senaste tryckets räkning används: trycket på tom yta nollställer den först.
+  stage.addEventListener('mousedown', (e) => {
+    clicks = e.detail;
+  });
+
+  // Dubbelklick på tom yta gör som smart zoom där (§10.3): flyger tillbaka, eller visar allt när det inte finns något
+  // att flyga tillbaka till. Greppet har ett eget dubbelklick, och ett dubbelklick i en app ser skalet aldrig. Blev det
+  // andra trycket ett drag har det ritat, och Chrome skickar ändå dblclick vid släppet: då är det inget dubbelklick.
+  stage.addEventListener('dblclick', (e) => {
+    if (!tapped || e.button !== 0 || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || !isEmpty(e.target)) return;
+    smartZoom(e.clientX, e.clientY, null);
   });
 
   function materialize(stroke: InkStroke): void {
@@ -1089,11 +1155,11 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
   // också, eftersom en panorering över tom yta kan föra ett fönster in under en pekare som står still.
   const notePointer = (e: PointerEvent | WheelEvent): void => {
     if (!e.isTrusted) return;
-    gate.pointer(
-      e.clientX,
-      e.clientY,
-      placedViews().map((v) => ({ appId: v.appId, rect: screenRectOfWin(v.win, cam, vw, vh) })),
-    );
+    const placed = placedViews().map((v) => ({ v, appId: v.appId, rect: screenRectOfWin(v.win, cam, vw, vh) }));
+    gate.pointer(e.clientX, e.clientY, placed);
+    // Kromen nära pekaren (§14): greppet, knapparna och sidprickarna mörknar inom NEAR_PX från fönstret.
+    const near = new Set(placed.filter((p) => distToRect(p.rect, e.clientX, e.clientY) <= NEAR_PX).map((p) => p.v));
+    for (const [v, c] of chromes) c.root.classList.toggle('wb-near', near.has(v));
   };
   window.addEventListener('pointermove', notePointer, { capture: true, passive: true });
   window.addEventListener('pointerdown', notePointer, { capture: true, passive: true });
@@ -1104,6 +1170,7 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
     if (!e.isTrusted || e.relatedTarget) return;
     if (e.clientX > 0 && e.clientY > 0 && e.clientX < vw - 1 && e.clientY < vh - 1) return;
     gate.lost();
+    for (const c of chromes.values()) c.root.classList.remove('wb-near');
   });
 
   /** Får appen bakom w använda den här delen av bryggan just nu (SEC-1)? at: hjulets punkt på skärmen. */
@@ -1208,6 +1275,14 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
       const i = v.faces.findIndex((f) => f.def.id === faceId);
       if (i >= 0) v.rotateTo(i, 0);
     },
+    // Appens röst (§10.5): ingen grind, eftersom märket bara visar något och aldrig styr skalet.
+    onBadge: (w, text) => {
+      const rec = recByBw.get(w);
+      if (!rec || rec.view.dissolving) return;
+      if (text === null) badgeFrom.delete(rec.view);
+      else badgeFrom.set(rec.view, rec);
+      chromes.get(rec.view)?.setBadge(text);
+    },
   });
 
   /* ------------------------------ butiken och bussen ------------------------------ */
@@ -1285,6 +1360,10 @@ export function createWorld(stage: HTMLElement): World & { debug: WorldDebug } {
       const v = viewOf(appId);
       const id = v?.faces[face]?.def.id;
       return v && id ? frameToScreen(v, id, x, y) : null;
+    },
+    cull: (on) => {
+      cull = on;
+      changed();
     },
   };
 

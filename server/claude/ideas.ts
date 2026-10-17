@@ -8,9 +8,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import type { ChatEvent } from '../../shared/protocol.ts';
 import type { AppRegistry, Config, Paths } from '../types.ts';
-import { claudeEnv } from './options.ts';
+import { oneShotOptions } from './options.ts';
 
 export interface Ideas {
   rev: number;
@@ -20,7 +21,7 @@ export interface Ideas {
 export interface IdeasDeps {
   config: Config;
   paths: Pick<Paths, 'appsDir' | 'appDir' | 'appDataDir'>;
-  registry: Pick<AppRegistry, 'get'>;
+  registry: Pick<AppRegistry, 'get' | 'troubles'>;
   /** Appens chatt (för vad användaren redan bett om). */
   history(appId: string, limit?: number): ChatEvent[];
   /** Bara tester: ersätter frågan till Claude. */
@@ -99,8 +100,11 @@ function fileList(dir: string): string[] {
   return out;
 }
 
-/** Prompten: appens namn, sidor, filer, anteckningar, sidornas källkod (avkortad) och användarens senaste önskemål. */
-export function ideasPrompt(dir: string, name: string, faces: Array<{ id: string; page: string; label?: string }>, asked: string[]): string {
+/**
+ * Prompten: appens namn, sidor, filer, anteckningar, sidornas källkod (avkortad), användarens senaste önskemål och
+ * felen sedan senaste turslut (registry.troubles, §7.2).
+ */
+export function ideasPrompt(dir: string, name: string, faces: Array<{ id: string; page: string; label?: string }>, asked: string[], errors: string[] = []): string {
   const parts: string[] = [`App name: ${name || '(none)'}`];
   parts.push(`Faces (sides of the window): ${faces.map((f) => `${f.id}${f.label ? ` "${f.label}"` : ''} → ${f.page}`).join('; ')}`);
   parts.push(`Files:\n${fileList(dir).join('\n')}`);
@@ -113,11 +117,22 @@ export function ideasPrompt(dir: string, name: string, faces: Array<{ id: string
   const server = readSome(path.join(dir, 'server.mjs'), 2500);
   if (server) parts.push(`server.mjs:\n${server}`);
   if (asked.length) parts.push(`What the user has asked for so far, oldest first:\n${asked.map((t) => `- ${t}`).join('\n')}`);
+  // Användaren ser redan "Rätta felet" först på sidan (§10.8): förslagen ska hantera eller förebygga felen, inte upprepa dem.
+  if (errors.length) {
+    parts.push(
+      `Errors the app logged since its last build (the user already has a separate item to fix them, so suggest what would handle or prevent them instead of repeating them):\n${errors.map((t) => `- ${t}`).join('\n')}`,
+    );
+  }
   return `<app>\n${parts.join('\n\n')}\n</app>\n\nSuggest the improvements now.`;
 }
 
 /** Låtsas-Claude (§8.9): samma svar varje gång, utan kvot. */
 export const FAKE_IDEAS = ['Lägg till ett mörkt läge', 'Visa en kort hjälptext första gången', 'Spara inställningarna mellan gångerna', 'Gör knapparna större', 'Lägg till kortkommandon'];
+
+/** Frågans options: en engångsfråga i appens mapp, med deny-reglerna för appens hemligheter (oneShotOptions). */
+export function ideasQueryOptions(appReal: string, appsDir: string, system: string): Options {
+  return { ...oneShotOptions({ cwd: appReal, appsDir, appReal }), systemPrompt: system, outputFormat: { type: 'json_schema', schema: SCHEMA }, model: IDEAS_MODEL };
+}
 
 export function createIdeas(deps: IdeasDeps): (appId: string) => Promise<Ideas> {
   const inFlight = new Map<string, Promise<Ideas>>();
@@ -128,28 +143,7 @@ export function createIdeas(deps: IdeasDeps): (appId: string) => Promise<Ideas> 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
     try {
-      const q = query({
-        prompt,
-        options: {
-          cwd: appReal,
-          env: claudeEnv(appReal, deps.paths.appsDir),
-          settingSources: [],
-          strictMcpConfig: true,
-          mcpServers: {},
-          settings: { crossSessionInbound: 'refuse', disableAllHooks: true },
-          tools: [],
-          allowedTools: [],
-          canUseTool: async () => ({ behavior: 'deny', message: 'Inga verktyg här.' }),
-          permissionMode: 'default',
-          persistSession: false,
-          systemPrompt: system,
-          outputFormat: { type: 'json_schema', schema: SCHEMA },
-          model: IDEAS_MODEL,
-          maxTurns: 3,
-          abortController: ac,
-          stderr: () => {},
-        },
-      });
+      const q = query({ prompt, options: { ...ideasQueryOptions(appReal, deps.paths.appsDir, system), abortController: ac } });
       let out: unknown = null;
       for await (const m of q) {
         if (m.type === 'result') {
@@ -189,7 +183,7 @@ export function createIdeas(deps: IdeasDeps): (appId: string) => Promise<Ideas> 
         .map((e) => e.text.replace(/\s+/g, ' ').trim().slice(0, 200))
         .filter(Boolean)
         .slice(-12);
-      const prompt = ideasPrompt(deps.paths.appDir(appId), app.name, app.faces, asked);
+      const prompt = ideasPrompt(deps.paths.appDir(appId), app.name, app.faces, asked, deps.registry.troubles(appId));
       items = cleanIdeas(await ask(SYSTEM, prompt, appId));
       if (!items.length) throw new Error('inga förslag');
     }

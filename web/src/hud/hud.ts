@@ -2,7 +2,7 @@
 // mellan dem: vilken som är aktiv och Esc-ordningen (stack.ts), den enda Esc-hanteraren, rösten, utkasten,
 // lagringen över en omladdning (persist.ts) och kopplingen till butiken och bussen: hud:open/hud:close/
 // view:changed in, hud:state ut, automatiken som öppnar appens HUD när den väntar på svar, uppläsningen efter
-// röstmeddelanden och "skriv var som helst".
+// röstmeddelanden och "skriv var som helst", och att tala in i fältet när ingen HUD är öppen.
 import './hud.css';
 import type { AppStatus, ChatEvent } from '../../../shared/protocol.ts';
 import type { ScreenRect, World } from '../types.ts';
@@ -25,6 +25,8 @@ const SLIDE_AFTER_RELEASE = 220;
 const SPEAK_FRESH_MS = 20_000;
 /** Så länge efter senaste view:changed räknas kameran som i rörelse (placement.follow prövar då inte äldre HUD:ar). */
 const VIEW_SETTLE_MS = 150;
+/** Ägaren när fältet spelar in (håll mellanslag utan öppen HUD, §10.9): aldrig ett app-id. */
+const FIELD = Symbol('fältet');
 
 export function createHud(layer: HTMLElement, world: World): void {
   const root = el('div', 'wbh-root');
@@ -48,8 +50,15 @@ export function createHud(layer: HTMLElement, world: World): void {
   let popEsc: (() => void) | null = null;
   /** Appen i fokus enligt världen (bus 'app:focus'). */
   let focusedApp: string | null = null;
-  /** Appen vars HUD spelar in (en inspelning åt gången, §12). */
-  let owner: string | null = null;
+  /** Appen vars HUD spelar in, eller fältet (en inspelning åt gången, §12). */
+  let owner: string | typeof FIELD | null = null;
+  /** Mellanslaget är nere (capture på dokumentet), så att en inspelning som startas av det känns igen. */
+  let spaceDown = false;
+  /**
+   * Mellanslaget som startade en inspelning, och för vem, hålls fortfarande (till keyup, eller ett nytt tryck om det
+   * tappats). Dess upprepningar skriver och trycker ingenting var fokus än hamnat, och släppet stoppar inspelningen (§12).
+   */
+  let spaceHeld: string | typeof FIELD | null = null;
 
   const activeId = (): string | null => S.activeOf(stack);
   const activePanel = (): HudPanel | undefined => {
@@ -57,12 +66,14 @@ export function createHud(layer: HTMLElement, world: World): void {
     return a ? panels.get(a) : undefined;
   };
 
+  /** Den som får röstens tillstånd, nivå och text: panelen vars HUD spelar in, eller fältet. */
+  const sink = () => (owner === FIELD ? field : owner ? panels.get(owner) : undefined);
   const voice = createVoice({
-    onState: (s) => (owner ? panels.get(owner)?.voiceState(s) : undefined),
-    onLevel: (l) => (owner ? panels.get(owner)?.voiceLevel(l) : undefined),
+    onState: (s) => sink()?.voiceState(s),
+    onLevel: (l) => sink()?.voiceLevel(l),
     // Texten går till appen vars HUD spelade in, även om en annan HUD blivit aktiv under tiden.
-    onText: (text) => (owner ? panels.get(owner)?.voiceText(text) : undefined),
-    onFail: (k) => (owner ? panels.get(owner)?.voiceFail(k) : undefined),
+    onText: (text) => sink()?.voiceText(text),
+    onFail: (k) => sink()?.voiceFail(k),
     transcribe: (blob) => store.transcribe(blob),
   });
 
@@ -94,6 +105,9 @@ export function createHud(layer: HTMLElement, world: World): void {
     moved,
     cameraMoving: () => performance.now() - lastView < VIEW_SETTLE_MS,
     voiceStart: (id) => {
+      // Mellanslag i en tom inmatning, på skalet eller på mikrofonknappen: ett frågekort som tar fokus medan det hålls
+      // godkänns aldrig av det.
+      if (spaceDown) spaceHeld = id;
       // Bara en inspelning åt gången: medan en kontrolleras eller tolkas börjar ingen ny.
       if (voice.state !== 'idle' && owner !== id) return;
       if (!panels.has(id)) return;
@@ -237,6 +251,8 @@ export function createHud(layer: HTMLElement, world: World): void {
       existing.place();
       return;
     }
+    // En HUD som öppnas, även av automatiken, avbryter en inspelning i fältet: fältet stängs och inget skickas (§10.9).
+    if (owner === FIELD && voice.state !== 'idle') field.close();
     ghosts.get(appId)?.();
     const p = new HudPanel(host, appId, reason, false);
     panels.set(appId, p);
@@ -451,25 +467,93 @@ export function createHud(layer: HTMLElement, world: World): void {
 
   function turnEnded(appId: string, upTo: ChatEvent[], e: Extract<ChatEvent, { k: 'turn' }>): void {
     if (via.get(appId) !== 'voice') return;
+    // Svaret läses när röstmeddelandets egen tur slutar (§12). Ett meddelande som skickades under §8.6 eller efter
+    // Stopp har inget svar när turen före det slutar ('wait'), och en tur som svarade på ett skrivet meddelande (till
+    // exempel medan röstmeddelandet ännu var på väg till servern) läses inte upp och förbrukar inte rösten.
+    const r = M.spokenReply(upTo);
+    if (r === 'wait' || r.via !== 'voice') return;
     via.delete(appId);
-    if (!e.ok || Date.now() - e.at > SPEAK_FRESH_MS) return;
+    if (!r.text || !e.ok || Date.now() - e.at > SPEAK_FRESH_MS) return;
     // Spelar en annan HUD in just nu skulle mikrofonen höra uppläsningen.
     if (voice.state !== 'idle') return;
-    const text = M.closingText(upTo);
-    if (!text) return;
-    const sentence = M.firstSentence(plainText(parseMarkdown(text)));
+    const sentence = M.firstSentence(plainText(parseMarkdown(r.text)));
     if (sentence) void speak(sentence);
   }
 
   /* ------------------------------ skriv var som helst (§13) ------------------------------ */
 
-  // Fältet (§10.9): när ingen HUD är öppen öppnar det första tecknet på tom yta fältet.
-  const field = createField(root, world, () => focusedApp);
+  // Fältet (§10.9): när ingen HUD är öppen öppnar det första tecknet på tom yta fältet, och ett mellanslag som hålls
+  // talar in i det.
+  const field = createField(root, world, () => focusedApp, {
+    // Mellanslag i det öppna fältet (den tomma inmatningen eller kortet) talar in igen.
+    talk: () => fieldListen(),
+    closed: () => {
+      // Esc, ett tryck utanför, en HUD som öppnas: inspelningen avbryts och ingenting skickas.
+      if (owner !== FIELD) return;
+      voice.cancel();
+      owner = null;
+      if (!panels.size) voice.release();
+    },
+    speak: (text) => {
+      // Spelar en HUD in just nu skulle mikrofonen höra uppläsningen.
+      if (voice.state !== 'idle') return;
+      const sentence = M.firstSentence(text);
+      if (sentence) void speak(sentence);
+    },
+  });
 
-  // Den enda tangentlyssnaren HUD:arna har utanför sina egna inmatningar (bubbelfasen, efter världens).
+  function fieldListen(): void {
+    spaceHeld = FIELD; // upprepningarna skriver ingenting, även när ingen inspelning börjar
+    if (voice.state !== 'idle') return; // en inspelning åt gången
+    owner = FIELD;
+    field.listen();
+    voice.start();
+  }
+
+  /** Släppet, eller att fönstret tappar fokus: fältets inspelning slutar och tolkas. Ett tappat keyup lämnar aldrig mikrofonen på. */
+  function fieldRelease(): void {
+    if (owner === FIELD) voice.stop();
+  }
+
+  document.addEventListener(
+    'keydown',
+    (e) => {
+      if (e.key === ' ' && !e.repeat) spaceDown = true;
+    },
+    true,
+  );
+  document.addEventListener(
+    'keyup',
+    (e) => {
+      if (e.key !== ' ') return;
+      spaceDown = false;
+      const held = spaceHeld;
+      spaceHeld = null;
+      // Fältet spelar bara in med mellanslaget. En HUD:s inspelning stoppas här när mellanslaget startade den, även om
+      // fokus flyttats från inmatningen eller mikrofonknappen under tiden (ett frågekort tog det).
+      if (typeof held === 'string' && owner === held) voice.stop();
+      else fieldRelease();
+    },
+    true,
+  );
+  addEventListener('blur', fieldRelease);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) fieldRelease();
+  });
+
+  // Den enda tangentlyssnaren HUD:arna har utanför sina egna inmatningar, utöver mellanslagets ovan (bubbelfasen, efter världens).
   document.addEventListener('keydown', (e) => {
     const p = activePanel();
     if (e.defaultPrevented || e.isComposing) return;
+    // Mellanslaget som startade en inspelning skriver och trycker aldrig något medan det hålls, inte heller i ett kort
+    // eller en HUD som fått fokus under tiden.
+    if (e.key === ' ' && spaceHeld !== null) {
+      if (e.repeat) {
+        e.preventDefault();
+        return;
+      }
+      spaceHeld = null; // ett nytt tryck: släppet nådde aldrig skalet
+    }
     // Under ett drag (rita, flytta) hör tecknen till appen som ritas (världen samlar dem, §10.4), aldrig till en öppen HUD.
     if (document.documentElement.classList.contains('wb-dragging')) return;
     if (e.metaKey || e.ctrlKey || e.altKey || e.key.length !== 1) return;
@@ -481,9 +565,13 @@ export function createHud(layer: HTMLElement, world: World): void {
     const isButton = a instanceof HTMLButtonElement || (a instanceof HTMLElement && /^(button|menuitem|checkbox|radio)$/.test(a.getAttribute('role') ?? ''));
     if (e.key === ' ' && isButton) return; // knappar behåller mellanslaget
     if (!p) {
-      // Ingen HUD öppen: fältet, med tecknet (mellanslag öppnar det inte).
-      if (e.key === ' ' || field.open) return;
+      // Ingen HUD öppen: fältet, med tecknet. Ett mellanslag som hålls talar in i fältet.
+      if (field.open) return;
       e.preventDefault();
+      if (e.key === ' ') {
+        if (!e.repeat) fieldListen();
+        return;
+      }
       field.start(e.key);
       return;
     }

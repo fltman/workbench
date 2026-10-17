@@ -59,15 +59,15 @@ describe('REST', () => {
         return stt.result;
       },
     });
-  });
+  }, { timeout: 30_000 });
   afterEach(() => {
     s.calls.length = 0;
     s.sessions.busySet.clear();
   });
   after(async () => {
-    await s.close();
+    await s?.close();
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   test('POST /api/apps/:id/ideas (§8.12): förslagen för en byggd app; GET 405, obyggd 409, fel 503, okänd 404', async () => {
     s.registry.add('aidea123', { name: 'Kalender', index: '<p>hej</p>' });
@@ -168,7 +168,7 @@ describe('REST', () => {
     s.registry.add('aundo456', { backend: true });
     s.git.undoResult = true;
     const r = await post('/api/apps/aundo456/undo');
-    assert.deepEqual(JSON.parse(r.text), { ok: true });
+    assert.deepEqual(JSON.parse(r.text), { ok: true, canRedo: true });
     assert.deepEqual(s.calls, [
       'git.undo aundo456', 'registry.refresh aundo456', 'backends.restart aundo456', 'registry.bumpRev aundo456', 'sessions.noteUndo aundo456',
     ]);
@@ -181,10 +181,92 @@ describe('REST', () => {
     assert.deepEqual(s.calls, ['git.undo aundo789', 'registry.refresh aundo789', 'backends.restart aundo789', 'registry.bumpRev aundo789', 'sessions.noteUndo aundo789']);
     s.calls.length = 0;
     s.git.undoResult = false;
+    s.git.canRedoResult = false;
     const r = await post('/api/apps/aundo789/undo');
-    assert.deepEqual(JSON.parse(r.text), { ok: false });
+    assert.deepEqual(JSON.parse(r.text), { ok: false, canRedo: false });
     assert.deepEqual(s.calls, ['git.undo aundo789']);
     s.git.undoResult = true;
+    s.git.canRedoResult = true;
+  });
+
+  test('ångra: canRedo i svaret kommer från git.canRedo, även när inget ångrades (§7.4)', async () => {
+    s.registry.add('aundocr1');
+    s.git.undoResult = false; // redan vid första commiten, men ett ångrat steg finns kvar att göra om
+    s.git.canRedoResult = true;
+    assert.deepEqual(JSON.parse((await post('/api/apps/aundocr1/undo')).text), { ok: false, canRedo: true });
+    s.git.canRedoResult = false;
+    assert.deepEqual(JSON.parse((await post('/api/apps/aundocr1/undo')).text), { ok: false, canRedo: false });
+    s.git.undoResult = true;
+    s.git.canRedoResult = true;
+  });
+
+  test('gör om: 409 medan Claude arbetar, inget git-anrop', async () => {
+    s.registry.add('aredo123');
+    s.sessions.busySet.add('aredo123');
+    const r = await post('/api/apps/aredo123/redo');
+    assert.equal(r.status, 409);
+    assert.deepEqual(s.calls, []);
+  });
+
+  test('gör om: redo → refresh → restart → bumpRev → noteRedo, svaret { ok: true, canRedo } (§7.4)', async () => {
+    s.registry.add('aredo456', { backend: true });
+    s.git.redoResult = true;
+    s.git.canRedoResult = true;
+    const r = await post('/api/apps/aredo456/redo');
+    assert.equal(r.status, 200);
+    assert.deepEqual(JSON.parse(r.text), { ok: true, canRedo: true });
+    assert.deepEqual(s.calls, [
+      'git.redo aredo456', 'registry.refresh aredo456', 'backends.restart aredo456', 'registry.bumpRev aredo456', 'sessions.noteRedo aredo456',
+    ]);
+    // Det sista steget: den senast ångrade commiten är tillbaka, och det finns inget mer att göra om.
+    s.calls.length = 0;
+    s.git.canRedoResult = false;
+    const last = await post('/api/apps/aredo456/redo');
+    assert.deepEqual(JSON.parse(last.text), { ok: true, canRedo: false });
+    assert.equal(s.calls.filter((c) => c === 'registry.bumpRev aredo456').length, 1, 'rev bumpas vid varje gör om');
+    s.git.canRedoResult = true;
+  });
+
+  test('gör om utan något att göra om: 409 och inget mer (ingen omladdning, ingen note)', async () => {
+    s.registry.add('aredo789');
+    s.git.redoResult = false;
+    const r = await post('/api/apps/aredo789/redo');
+    assert.equal(r.status, 409);
+    assert.deepEqual(s.calls, ['git.redo aredo789']);
+    s.git.redoResult = true;
+  });
+
+  test('gör om: ogiltiga och okända id ger 404 utan anrop, och bara POST', async () => {
+    for (const id of ['..%2F..%2Fx', 'A..', '%2e%2e', 'aokand99', 'a%00bc', '%zz']) {
+      const r = await post(`/api/apps/${id}/redo`);
+      assert.equal(r.status, 404, id);
+    }
+    s.registry.add('aredoget');
+    const g = await request(s.port, { path: '/api/apps/aredoget/redo', headers: sameOrigin() });
+    assert.equal(g.status, 405);
+    assert.equal(g.headers.allow, 'POST');
+    assert.deepEqual(s.calls, []);
+  });
+
+  test('ångra och gör om för samma app körs efter varandra, aldrig samtidigt', async () => {
+    s.registry.add('aredoxx1');
+    let inside = 0;
+    let maxInside = 0;
+    const slow = <T>(fn: (id: string) => Promise<T>) => async (id: string): Promise<T> => {
+      inside++;
+      maxInside = Math.max(maxInside, inside);
+      await new Promise((r) => setTimeout(r, 20));
+      inside--;
+      return fn(id);
+    };
+    const { undo, redo } = s.git;
+    s.git.undo = slow(undo);
+    s.git.redo = slow(redo);
+    const all = await Promise.all([post('/api/apps/aredoxx1/undo'), post('/api/apps/aredoxx1/redo'), post('/api/apps/aredoxx1/undo'), post('/api/apps/aredoxx1/redo')]);
+    s.git.undo = undo;
+    s.git.redo = redo;
+    assert.deepEqual(all.map((r) => r.status), [200, 200, 200, 200]);
+    assert.equal(maxInside, 1);
   });
 
   test('ångra som tar bort backenden ur manifestet: restart (som stoppar den gamla processen) före bumpRev', async () => {
@@ -220,6 +302,54 @@ describe('REST', () => {
     const r = await request(s.port, { path: '/api/apps/achat123/chat', headers: sameOrigin() });
     assert.deepEqual(JSON.parse(r.text), { events: [{ k: 'user', id: 'u1', text: 'Hej', via: 'text', at: 1 }] });
     assert.deepEqual(s.calls, ['sessions.history achat123 300']);
+  });
+
+  test('GET /api/apps/:id/logs (§7.1): text/plain, n kläms till 1–2000, okänd app 404, bara GET och HEAD, och vakten gäller', async () => {
+    s.registry.add('alogs123');
+    const asked: number[] = [];
+    const lines = ['12:00:00 [backend] Lyssnar på 18300', '12:00:01 [console] <img src=x onerror=alert(1)>', '12:00:02 [workbench] Backenden avslutades med kod 1.'];
+    const tail = s.logs.tail;
+    s.logs.tail = (_id: string, n = 80) => {
+      asked.push(n);
+      return lines.slice(-n);
+    };
+    try {
+      const r = await request(s.port, { path: '/api/apps/alogs123/logs', headers: sameOrigin() });
+      assert.equal(r.status, 200);
+      assert.equal(r.headers['content-type'], 'text/plain; charset=utf-8');
+      assert.equal(r.headers['x-content-type-options'], 'nosniff', 'en loggrad med HTML blir aldrig en sida');
+      assert.equal(r.headers['cache-control'], 'no-store');
+      assert.equal(r.text, lines.join('\n') + '\n');
+      asked.length = 0;
+      for (const q of ['', '?n=5', '?n=0', '?n=-3', '?n=99999', '?n=abc', '?n=12.7', '?n=2000', '?x=1&n=7']) {
+        assert.equal((await request(s.port, { path: `/api/apps/alogs123/logs${q}`, headers: sameOrigin() })).status, 200, q);
+      }
+      assert.deepEqual(asked, [400, 5, 1, 1, 2000, 400, 12, 2000, 7]);
+      const head = await request(s.port, { method: 'HEAD', path: '/api/apps/alogs123/logs', headers: sameOrigin() });
+      assert.equal(head.status, 200);
+      assert.equal(head.text, '');
+      for (const method of ['POST', 'DELETE', 'PUT']) {
+        assert.equal((await request(s.port, { method, path: '/api/apps/alogs123/logs', headers: sameOrigin(origin()) })).status, 405, method);
+      }
+      assert.equal((await request(s.port, { path: '/api/apps/aokand99/logs', headers: sameOrigin() })).status, 404);
+      assert.equal((await request(s.port, { path: '/api/apps/..%2Fx/logs', headers: sameOrigin() })).status, 404);
+      // Vakten (§4.1): en annan webbplats och en app får inte läsa loggen; kalibrerat mot skalets egen förfrågan ovan.
+      const cross = await request(s.port, { path: '/api/apps/alogs123/logs', headers: { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' } });
+      assert.equal(cross.status, 403);
+      const app = await request(s.port, { path: '/api/apps/alogs123/logs', headers: { origin: `http://alogs123.localhost:${s.port}`, 'sec-fetch-site': 'same-site', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' } });
+      assert.equal(app.status, 403);
+      // Det skalet öppnar i en egen flik: en navigering till ett dokument.
+      const tab = await request(s.port, { path: '/api/apps/alogs123/logs', headers: { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' } });
+      assert.equal(tab.status, 200);
+      // En app som inte loggat något: en kort rad i stället för en tom vit flik (QA 17 oktober).
+      lines.length = 0;
+      const empty = await request(s.port, { path: '/api/apps/alogs123/logs', headers: sameOrigin() });
+      assert.equal(empty.status, 200);
+      assert.equal(empty.text, 'Inga loggrader ännu.\n');
+      assert.ok(!s.calls.some((c) => c.startsWith('sessions.') || c.startsWith('backends.')), 'loggen startar ingenting');
+    } finally {
+      s.logs.tail = tail;
+    }
   });
 
   test('POST /api/stt: mediatypen före ";", appnamnen som ledtrådar', async () => {

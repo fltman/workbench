@@ -27,7 +27,7 @@ import { toolLabel } from './labels.ts';
 import { buildOptions, sandboxAvailable } from './options.ts';
 import { checkPolicy, permissionCard, permissionResult } from './policy.ts';
 import { commitLine, composeMessage, loadAppRules, readNotes, workbenchBlock } from './prompt.ts';
-import { makeWorkbenchTools } from './tools.ts';
+import { makeWorkbenchTools, reloadMemory } from './tools.ts';
 import type { ReloadMemory } from './tools.ts';
 
 /** Högst så många levande Claude-processer. */
@@ -36,6 +36,8 @@ export const MAX_LIVE = 4;
 export const CLOSE_GRACE_MS = 5_000;
 const STDERR_LINES = 40;
 const SELFTEST_TIMEOUT_MS = 20_000;
+/** Så många händelser läser HUD:en in (GET /api/apps/:id/chat, §7.1). */
+const HISTORY_EVENTS = 300;
 export const MCP_TOOL_NAMES = ['reload_app', 'screenshot_app', 'get_app_logs', 'call_backend', 'request_secret', 'try_app'].map((t) => `mcp__workbench__${t}`);
 
 export interface SessionDeps {
@@ -90,6 +92,12 @@ interface Proc {
   error?: unknown;
 }
 
+/** Ett meddelande som väntar: texten och id:t för dess user-händelse, som en not kan peka ut (§8.1, §13). */
+interface Queued {
+  id: string;
+  text: string;
+}
+
 interface Chain {
   firstLine: string;
   /** Stopp gäller hela kedjan (FE-4): köade turer avbryts när de börjar. */
@@ -99,8 +107,13 @@ interface Chain {
   proc: Proc | null;
   /** Antal meddelanden som lagts i kön under kedjan. */
   delivered: number;
-  /** Meddelanden efter det första, i ordning: köade bakom turen som pågår. */
-  late: string[];
+  /** Meddelanden efter det första, i ordning: köade bakom turen som pågår, och vars tur inte börjat. */
+  late: Queued[];
+  /**
+   * Text som strömmat in sedan turens senaste text: blir en sista text om kedjan avbryts (§8.3). null efter ett
+   * stopp mellan två turer, så att början på en köad tur som avbryts direkt aldrig visas.
+   */
+  partial: string | null;
 }
 
 interface Session {
@@ -109,7 +122,11 @@ interface Session {
   closings: Set<Promise<void>>;
   chain: Chain | null;
   finishing: boolean;
-  held: string[];
+  /** Kedjan har slutat (result), men turslutet väntar på §8.6 steg 1–3; closeAll sänder det om servern stängs då. */
+  ending: TurnOutcome | null;
+  held: Queued[];
+  /** Noter från andra moduler (sessions.note) som kom under §8.6: sänds efter turslutet. */
+  notes: string[];
   implicitPending: boolean;
   implicitOutcome: TurnOutcome | null;
   lastLine: string;
@@ -118,6 +135,8 @@ interface Session {
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastActive: number;
   undone: boolean;
+  /** Ångra minus gör om sedan förra meddelandet till Claude (§8.4). */
+  steps: number;
   lastAt: number;
   forgotten: boolean;
   emittedTools: Set<string>;
@@ -210,6 +229,8 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
   const sessions = new Map<string, Session>();
   const limits = new LimitsTracker();
   let shuttingDown = false;
+  /** Tömningen vid avslut (§7): ingen ny tur startar. */
+  let draining = false;
 
   /* ------------------------------ start: §8.10 ------------------------------ */
 
@@ -237,6 +258,12 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
     }
   }
 
+  /** Ett fel som användaren märker (§8.2): raden i loggen som förut, och en not i HUD:en om vad det betyder. */
+  function notify(s: Session, line: string, text: string): void {
+    warn(s.appId, line);
+    emit(s, { k: 'note', id: newId('n'), text, at: nextAt(s) });
+  }
+
   function sess(appId: string, create = true): Session | undefined {
     let s = sessions.get(appId);
     if (s || !create) return s;
@@ -247,7 +274,9 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       closings: new Set(),
       chain: null,
       finishing: false,
+      ending: null,
       held: [],
+      notes: [],
       implicitPending: false,
       implicitOutcome: null,
       lastLine: 'Ändring',
@@ -256,10 +285,11 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       idleTimer: null,
       lastActive: Date.now(),
       undone: false,
+      steps: 0,
       lastAt: 0,
       forgotten: false,
       emittedTools: new Set(),
-      reload: { prev: [] },
+      reload: reloadMemory(deps.logs, appId),
       warnedSandbox: false,
     };
     sessions.set(appId, s);
@@ -395,7 +425,7 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
   /* ------------------------------ turer ------------------------------ */
 
   function openChain(s: Session, firstLine: string): Chain {
-    const c: Chain = { firstLine, stopRequested: false, interruptSent: false, proc: null, delivered: 0, late: [] };
+    const c: Chain = { firstLine, stopRequested: false, interruptSent: false, proc: null, delivered: 0, late: [], partial: '' };
     s.chain = c;
     s.emittedTools.clear();
     clearIdle(s);
@@ -404,23 +434,40 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
     return c;
   }
 
+  /** Det delvisa svaret (§8.3): text som strömmat in sedan turens senaste text sänds som en sista text. */
+  function flushPartial(s: Session, c: Chain): void {
+    const text = c.partial;
+    if (c.partial !== null) c.partial = '';
+    if (text?.trim()) emit(s, { k: 'text', id: newId('t'), text, at: nextAt(s) });
+  }
+
   function endChain(s: Session, o: TurnOutcome): void {
     const c = s.chain;
     if (!c) return;
     s.chain = null;
     cancelAsks(s, false);
-    emit(s, { k: 'turn', phase: 'end', ok: o.ok, interrupted: o.interrupted, ...(o.error ? { error: o.error } : {}), at: nextAt(s) });
+    if (o.interrupted) flushPartial(s, c);
     s.finishing = true;
+    s.ending = o;
     void finishTurn(s, c, o);
   }
 
-  /** §8.6 i ordning. Under tiden hålls nya meddelanden i s.held. */
+  /** Turslutet (§8.3); i §8.6 efter steg 3, eller direkt när servern stängs under stegen (closeAll). */
+  function emitEnd(s: Session, o: TurnOutcome): void {
+    s.ending = null;
+    emit(s, { k: 'turn', phase: 'end', ok: o.ok, interrupted: o.interrupted, ...(o.error ? { error: o.error } : {}), at: nextAt(s) });
+  }
+
+  /** §8.6 i ordning, med turslutet efter steg 3. Under tiden hålls nya meddelanden i s.held. */
   async function finishTurn(s: Session, c: Chain, o: TurnOutcome): Promise<void> {
     const id = s.appId;
     try {
+      let committed = false;
+      let commitFailed = false;
       try {
-        await git.commitAll(id, c.firstLine);
+        committed = await git.commitAll(id, c.firstLine);
       } catch (err) {
+        commitFailed = true;
         warn(id, `varning: commit misslyckades: ${errText(err)}`);
       }
       if (s.forgotten || shuttingDown) return;
@@ -436,6 +483,18 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
         warn(id, `varning: backenden kunde inte startas om: ${errText(err)}`);
       }
       if (s.forgotten || shuttingDown) return;
+      // Turslutet först nu (§8.6): förut kom det före commiten, och en GET mot backenden direkt efter det gav 503.
+      emitEnd(s, o);
+      // Noterna direkt efter turslutet: HUD:en ställer dem under turen, ovanför ett meddelande som hållits under §8.6
+      // eller efter Stopp (model.ts, §13), vars rad redan kommit. "Avbröts" passar både Stopp och
+      // en serveromstart mitt i turen (chatlog.ts), och commitens boolean säger om något halvgjort finns att ångra.
+      // Misslyckades commiten tar nästa commit med båda turerna, och Ångra (reset --hard HEAD~1) tar dem tillsammans (§8.2).
+      const notes = [
+        ...(o.interrupted ? [committed ? 'Avbröts – ändringarna finns kvar' : 'Avbröts'] : []),
+        ...(commitFailed ? ['Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.'] : []),
+        ...s.notes.splice(0),
+      ];
+      for (const text of notes) emit(s, { k: 'note', id: newId('n'), text, at: nextAt(s) });
       try {
         registry.bumpRev(id);
       } catch (err) {
@@ -444,14 +503,20 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       setStatus(s, o.ok || o.interrupted ? 'idle' : 'error');
     } finally {
       s.finishing = false;
+      s.ending = null;
+      s.notes.length = 0;
     }
     if (s.forgotten || shuttingDown) return;
+    if (s.held.length > 0 && draining) {
+      // Under tömningen vid avslut (§7) startar ingen ny tur.
+      noteDropped(s, s.held.splice(0), 'skickades inte', 'Servern startar om');
+    }
     if (s.held.length > 0) {
       const held = s.held.splice(0);
       s.implicitPending = false;
       s.implicitOutcome = null;
-      openChain(s, commitLine(held[0]));
-      for (const t of held) deliver(s, t);
+      openChain(s, commitLine(held[0].text));
+      for (const m of held) deliver(s, m);
     } else if (s.implicitPending) {
       // Claude Code började en tur som vi inte öppnat (meddelandet kom fram precis när förra turen tog slut).
       s.implicitPending = false;
@@ -467,18 +532,22 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
     enforceCap(null);
   }
 
-  /** En not per meddelande som stoppet hindrade (FE-4), så att användarens rad i HUD:en inte vilseleder. */
-  function noteDropped(s: Session, texts: string[], verb: string): void {
-    for (const t of texts) {
-      const one = t.replace(/\s+/g, ' ').trim();
+  /**
+   * En not per meddelande som aldrig kördes (FE-4, och under tömningen vid avslut, §7), så att användarens rad i HUD:en
+   * inte vilseleder. dropped pekar ut raden, som HUD:en dämpar (§13).
+   */
+  function noteDropped(s: Session, msgs: Queued[], verb: string, why = 'Stoppad'): void {
+    for (const m of msgs) {
+      const one = m.text.replace(/\s+/g, ' ').trim();
       const cps = Array.from(one);
       const shown = cps.length > 60 ? cps.slice(0, 59).join('') + '…' : one;
-      emit(s, { k: 'note', id: newId('n'), text: `Stoppad – ”${shown}” ${verb}`, at: nextAt(s) });
+      emit(s, { k: 'note', id: newId('n'), text: `${why} – ”${shown}” ${verb}`, dropped: m.id, at: nextAt(s) });
     }
   }
 
   /** Lägger ett meddelande (med <workbench>-blocket) i processens kö; startar processen vid behov. */
-  function deliver(s: Session, text: string): void {
+  function deliver(s: Session, m: Queued): void {
+    const text = m.text;
     const p = ensureProc(s);
     let backend: ReturnType<Backends['state']> = 'none';
     let port: number | null = null;
@@ -494,15 +563,17 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       backend,
       backendPort: port,
       undone: s.undone,
+      steps: s.steps,
       notes: p.notesSent ? null : readNotes(paths.appDir(s.appId)),
     });
     s.undone = false;
+    s.steps = 0;
     p.notesSent = true;
     s.lastLine = commitLine(text);
     p.input.push(composeMessage(block, text));
     if (s.chain) {
       s.chain.proc = p;
-      if (s.chain.delivered++ > 0) s.chain.late.push(text);
+      if (s.chain.delivered++ > 0) s.chain.late.push(m);
     }
     s.lastActive = Date.now();
   }
@@ -625,7 +696,7 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       warm = await start(resume);
     } catch (err) {
       if (!resume || p.closingStarted || s.forgotten || shuttingDown) throw err;
-      warn(s.appId, `varning: sessionen kunde inte återupptas (${errText(err)}); en ny startas.`);
+      notify(s, `varning: sessionen kunde inte återupptas (${errText(err)}); en ny startas.`, 'Claude kunde inte fortsätta det tidigare samtalet och börjar om utan minne av det.');
       logStderr(s, p);
       p.stderr.length = 0;
       warm = await start(undefined);
@@ -751,20 +822,30 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
     return closing;
   }
 
-  /** §8.2 självtest, loggat. Avvikelser blir varningar med källan workbench. */
+  /**
+   * §8.2 självtest, loggat. Avvikelser blir varningar med källan workbench. Minnesfiler och andra MCP-servrar än
+   * workbench är användarens egen konfiguration som når appens Claude, så de blir också noter i HUD:en.
+   */
   async function selfTest(s: Session, p: Proc, q: EngineQuery): Promise<void> {
     const problems: string[] = [];
+    const leaks: string[] = [];
     try {
       const st = await withTimeout(q.mcpServerStatus(), SELFTEST_TIMEOUT_MS);
       const names = st.map((x) => x.name);
+      const foreign = names.filter((n) => n !== 'workbench');
       if (names.length !== 1 || names[0] !== 'workbench') problems.push(`MCP-servrar: ${names.join(', ') || 'inga'} (bara workbench väntades)`);
       else if (st[0].status !== 'connected') problems.push(`MCP-servern workbench har status ${st[0].status}`);
+      if (foreign.length) leaks.push(`Claude fick tillgång till MCP-servrar utanför appen: ${foreign.join(', ')}. Det de når kan hamna i appen.`);
     } catch (err) {
       problems.push(`mcpServerStatus misslyckades: ${errText(err)}`);
     }
     try {
       const cu = await withTimeout(q.getContextUsage({ detail: 'summary' }), SELFTEST_TIMEOUT_MS);
-      if (cu.memoryFiles.length > 0) problems.push(`minnesfiler lästes in: ${cu.memoryFiles.map((f) => f.path).join(', ')}`);
+      if (cu.memoryFiles.length > 0) {
+        const files = cu.memoryFiles.map((f) => f.path).join(', ');
+        problems.push(`minnesfiler lästes in: ${files}`);
+        leaks.push(`Claude läste in minnesfiler utanför appen: ${files}. Det som står där kan hamna i appen.`);
+      }
     } catch (err) {
       problems.push(`getContextUsage misslyckades: ${errText(err)}`);
     }
@@ -774,6 +855,17 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       return;
     }
     for (const pr of problems) warn(s.appId, `varning: självtest: ${pr}`);
+    // Självtestet körs i varje ny process. Står samma not redan bland händelserna som HUD:en läser in (§7.1) säger den
+    // inget nytt och upprepas inte, inte heller efter en omstart; en annan läcka är ny.
+    let seen: ChatEvent[] = [];
+    try {
+      seen = readHistory(paths.appDataDir(s.appId), HISTORY_EVENTS);
+    } catch {
+      /* ingen historik */
+    }
+    for (const text of leaks) {
+      if (!seen.some((e) => e.k === 'note' && e.text === text)) emit(s, { k: 'note', id: newId('n'), text, at: nextAt(s) });
+    }
   }
 
   /* ------------------------------ SDK-meddelanden ------------------------------ */
@@ -823,7 +915,10 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
         if (msg.parent_tool_use_id) return;
         activity(s, p);
         const ev = msg.event;
-        if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta' && ev.delta.text) emit(s, { k: 'delta', text: ev.delta.text });
+        if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta' && ev.delta.text) {
+          if (s.chain && s.chain.partial !== null) s.chain.partial += ev.delta.text;
+          emit(s, { k: 'delta', text: ev.delta.text });
+        }
         return;
       }
       case 'assistant': {
@@ -831,6 +926,7 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
         activity(s, p);
         for (const b of msg.message.content) {
           if (b.type === 'text') {
+            if (s.chain && s.chain.partial !== null) s.chain.partial = '';
             if (b.text.trim()) emit(s, { k: 'text', id: newId('t'), text: b.text, at: nextAt(s) });
           } else if (b.type === 'tool_use') {
             if (b.name === 'TodoWrite') continue;
@@ -863,6 +959,12 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
         if (queued > 0) {
           // Fler köade turer följer: samma kedja, en commit. Efter stopp avbryts nästa tur direkt (FE-4);
           // syns den ändå arbeta avbryts den igen i activity().
+          // Det äldsta köade meddelandet börjar nu sin tur (Claude Code tar dem i ordning): det har körts, även om
+          // ett stopp senare avbryter det, så det får ingen not om att det aldrig kördes.
+          s.chain.late.shift();
+          // Den avbrutna turens delvisa svar hör till den, ovanför det köade meddelandet (§8.3).
+          if (outcome.interrupted) flushPartial(s, s.chain);
+          s.chain.partial = s.chain.stopRequested ? null : '';
           if (s.chain.stopRequested) {
             s.chain.interruptSent = false;
             if (p.q && !p.ended) void p.q.interrupt().catch(() => {});
@@ -891,7 +993,8 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       s.hudOpen = true;
       s.lastActive = Date.now();
       clearIdle(s);
-      ensureProc(s);
+      // Under tömningen vid avslut (§7) startar ingen ny process.
+      if (!draining) ensureProc(s);
     },
 
     close(appId) {
@@ -906,7 +1009,8 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       if (!s || s.forgotten || shuttingDown) return;
       if (typeof text !== 'string' || !text.trim()) return;
       s.lastActive = Date.now();
-      emit(s, { k: 'user', id: newId('u'), text, via: via === 'voice' ? 'voice' : 'text', at: nextAt(s) });
+      const m: Queued = { id: newId('u'), text };
+      emit(s, { k: 'user', id: m.id, text, via: via === 'voice' ? 'voice' : 'text', at: nextAt(s) });
       // Ett obesvarat kort besvaras med texten (ROB-4), som i Claude Code: tillstånd blir nej med användarens
       // ord, en fråga får texten som fritt svar ("Annat"). Texten skickas då inte som ett eget meddelande.
       // En hemlighet får aldrig skriven text: kortet avböjs och texten går fram som vanligt.
@@ -922,14 +1026,19 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
         return;
       }
       for (const a of [...s.asks.values()]) if (a.kind === 'secret') a.finish('deny');
+      // Under tömningen vid avslut (§7) startar ingen ny tur och inget läggs i en pågående turs kö.
+      if (draining) {
+        noteDropped(s, [m], 'skickades inte', 'Servern startar om');
+        return;
+      }
       // En stoppad kedja avbryter varje tur som kommer in i den (FE-4), så ett nytt meddelande väntar som
       // under §8.6 och blir en egen kedja när den stoppade har slutat.
       if (s.finishing || s.chain?.stopRequested) {
-        s.held.push(text);
+        s.held.push(m);
         return;
       }
       if (!s.chain) openChain(s, commitLine(text));
-      deliver(s, text);
+      deliver(s, m);
     },
 
     async stop(appId) {
@@ -998,7 +1107,16 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
       const s = sess(appId);
       if (!s || s.forgotten) return;
       s.undone = true;
+      s.steps++;
       emit(s, { k: 'note', id: newId('n'), text: 'Ångrade senaste ändringen.', at: nextAt(s) });
+    },
+
+    noteRedo(appId) {
+      const s = sess(appId);
+      if (!s || s.forgotten) return;
+      s.undone = true;
+      s.steps--;
+      emit(s, { k: 'note', id: newId('n'), text: 'Gjorde om ändringen.', at: nextAt(s) });
     },
 
     busy(appId) {
@@ -1007,7 +1125,9 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
     },
 
     async forget(appId) {
-      const s = sessions.get(appId);
+      // En gravsten (§8.1): sessionen står kvar som glömd, även för en app som aldrig öppnats, så att ett chat.open
+      // mellan forget och registry.remove aldrig startar en process. Id:n återanvänds aldrig (§6).
+      const s = sess(appId);
       if (s) {
         s.forgotten = true;
         clearIdle(s);
@@ -1020,7 +1140,6 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
           void closeProc(s, p, true);
         }
         await Promise.allSettled([...s.closings]);
-        sessions.delete(appId);
       }
       if (typeof appId !== 'string' || !APP_ID_RE.test(appId)) return;
       deleteSessionFile(paths.appDataDir(appId));
@@ -1036,6 +1155,14 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
     },
 
     async closeAll() {
+      // En kedja som har slutat men vars turslut väntar på §8.6 steg 1–3 får det nu, annars lagas en färdig tur som
+      // avbruten vid nästa start (§8.10). Commitens resultat är okänt, så en avbruten tur får bara "Avbröts".
+      for (const s of sessions.values()) {
+        const o = s.ending;
+        if (!o) continue;
+        emitEnd(s, o);
+        if (o.interrupted) emit(s, { k: 'note', id: newId('n'), text: 'Avbröts', at: nextAt(s) });
+      }
       shuttingDown = true;
       const all = [...sessions.values()];
       for (const s of all) {
@@ -1052,6 +1179,23 @@ export function createSessionsWith(deps: SessionDeps, engine: Engine, opts: Sess
           await Promise.allSettled([...s.closings]);
         }),
       );
+    },
+
+    note(appId, text) {
+      const s = sess(appId);
+      if (!s || s.forgotten || typeof text !== 'string' || !text.trim()) return;
+      // Under en tur ser Claude felet själv i verktygssvaren, och §8.6 startar om backenden när turen är klar.
+      if (s.chain) return;
+      // Under §8.6 (backendens omstart i steg 3) väntar noten på turslutet.
+      if (s.finishing) {
+        s.notes.push(text);
+        return;
+      }
+      emit(s, { k: 'note', id: newId('n'), text, at: nextAt(s) });
+    },
+
+    drain() {
+      draining = true;
     },
   };
 }

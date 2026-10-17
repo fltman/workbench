@@ -9,10 +9,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import type { FaceDef } from '../../shared/protocol.ts';
+import { testPort } from '../ports.ts';
 import { BRIDGE_LEAKS, WB_LEAKS, applyLeak } from './leaks.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
+/** Testapparnas sidor (spårade i git, CONTRACT §15). Saknas de fallerar riggen redan när den laddas, på en rad. */
+const APPS = path.join(HERE, 'apps');
+if (!fs.existsSync(APPS)) throw new Error(`testriggens appar saknas: ${APPS} finns inte (katalogen ska följa med repot)`);
 
 export interface HarnessApp {
   id: string;
@@ -85,30 +89,11 @@ function inject(html: string, tag: string): string {
   return tag + html;
 }
 
-/** Ledig port på både 127.0.0.1 och ::1 (testerna får inte krocka när flera körningar pågår samtidigt). */
-async function freePort(): Promise<number> {
-  for (let i = 0; i < 20; i++) {
-    const a = http.createServer();
-    const p = await new Promise<number>((resolve, reject) => {
-      a.once('error', reject);
-      a.listen(0, '127.0.0.1', () => resolve((a.address() as { port: number }).port));
-    });
-    const b = http.createServer();
-    const ok = await new Promise<boolean>((resolve) => {
-      b.once('error', () => resolve(false));
-      b.listen(p, '::1', () => resolve(true));
-    });
-    await Promise.all([a, b].map((s) => new Promise<void>((r) => (s.listening ? s.close(() => r()) : r()))));
-    if (ok) return p;
-  }
-  throw new Error('hittade ingen ledig port');
-}
-
 /**
- * Startar riggen på port (standard 8242). Är porten upptagen och fallback satt, används en ledig port
- * som systemet väljer, så att två testkörningar samtidigt inte fäller varandra.
+ * Startar riggen på port. Är porten upptagen och fallback satt, används en annan ledig port (tests/ports.ts),
+ * så att två testkörningar samtidigt inte fäller varandra.
  */
-export async function startHarness(wanted = 8242, fallback = false): Promise<Harness> {
+export async function startHarness(wanted: number, fallback = false): Promise<Harness> {
   try {
     return await listenHarness(wanted);
   } catch (err) {
@@ -116,7 +101,7 @@ export async function startHarness(wanted = 8242, fallback = false): Promise<Har
   }
   for (let i = 0; ; i++) {
     try {
-      return await listenHarness(await freePort());
+      return await listenHarness(await testPort());
     } catch (err) {
       if (i >= 4 || (err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
     }
@@ -218,7 +203,7 @@ async function listenHarness(port: number): Promise<Harness> {
 
   function handleAppPage(app: HarnessApp, res: http.ServerResponse, url: URL): void {
     const rel = url.pathname === '/' ? app.faces[0].page : decodeURIComponent(url.pathname.slice(1));
-    const dir = path.join(HERE, 'apps', app.id);
+    const dir = path.join(APPS, app.id);
     const file = path.resolve(dir, rel);
     if (!file.startsWith(dir + path.sep) || !fs.existsSync(file)) return send(res, 404, '', 'text/html; charset=utf-8');
     const ext = path.extname(file);
@@ -323,9 +308,9 @@ async function listenHarness(port: number): Promise<Harness> {
   };
 }
 
-// Manuell körning: node tests/bridge-harness/server.ts [port]
+// Manuell körning: node tests/bridge-harness/server.ts [port] (utan port en ledig)
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const port = Number(process.argv[2] ?? 8242);
+  const port = Number(process.argv[2]) || (await testPort());
   const h = await startHarness(port);
   console.log(`bryggans testrigg: ${h.shell}/  (appar: ${HARNESS_APPS.map((a) => h.appOrigin(a.id)).join(', ')})`);
 }

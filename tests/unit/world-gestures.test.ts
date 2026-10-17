@@ -1,7 +1,7 @@
 // world-gestures.test.ts — hjulroutern och tangenterna (CONTRACT §10.3).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyKey, classifyWheel, matchKey, normDelta, zoomFactor } from '../../web/src/world/gestures.ts';
+import { classifyKey, classifyWheel, matchKey, normDelta, smartAction, zoomFactor } from '../../web/src/world/gestures.ts';
 import type { KeyLike, WheelLike } from '../../web/src/world/gestures.ts';
 
 const wheel = (o: Partial<WheelLike>): WheelLike => ({ ctrlKey: false, metaKey: false, altKey: false, deltaX: 0, deltaY: 0, deltaMode: 0, wheelDeltaY: -120, ...o });
@@ -35,6 +35,16 @@ test('ctrl+wheel zoomar; ctrl med nollor och wheelDeltaY 0 är smart zoom; vilan
   assert.deepEqual(classifyWheel(wheel({ ctrlKey: true, wheelDeltaY: 0 }), false), { kind: 'smart' });
   const resting = classifyWheel(wheel({ ctrlKey: true, wheelDeltaY: 120 }), false);
   assert.deepEqual(resting, { kind: 'zoom', factor: 1 });
+});
+
+test('smart zoom: fönstret under pekaren, samma igen tillbaka; på tom yta tillbaka, eller visa allt när det inte finns något att flyga tillbaka till', () => {
+  assert.equal(smartAction('a1', null, false), 'fly-to');
+  assert.equal(smartAction('a1', 'a2', true), 'fly-to');
+  assert.equal(smartAction('a1', 'a1', true), 'back');
+  assert.equal(smartAction(null, 'a1', true), 'back');
+  assert.equal(smartAction(null, null, true), 'back');
+  // Tom yta och tom tillbaka-stack: som ⌘0 (förut hände ingenting).
+  assert.equal(smartAction(null, null, false), 'fit');
 });
 
 test('⌘+wheel och vanligt hjul panorerar (innehållet följer fingrarna); ⌥ är fönsteroperationer', () => {

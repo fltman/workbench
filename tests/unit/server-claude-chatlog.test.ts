@@ -16,19 +16,22 @@ afterEach(() => rmrf(path.resolve(dir, '..', '..', '..')));
 const user = (at: number): ChatEvent => ({ k: 'user', id: `u${at}`, text: 'hej', via: 'text', at });
 
 describe('lagning vid start', () => {
-  test('obesvarad ask får ask-done cancelled och öppen tur får turn slut med interrupted', () => {
+  test('obesvarad ask får ask-done cancelled och öppen tur får turn slut med interrupted och noten Avbröts', () => {
     appendEvents(dir, [
       user(1),
       { k: 'turn', phase: 'start', at: 2 },
       { k: 'ask', id: 'q-1', ask: { kind: 'permission', tool: 'WebFetch', title: 'Hämta från nätet?', detail: 'https://example.com', canRemember: true, defaultNo: false }, at: 3 },
     ]);
     const fixes = repairChat(dir, 100);
+    const noteId = fixes[2]?.k === 'note' ? fixes[2].id : '';
+    assert.match(noteId, /^n-[0-9a-f]{12}$/);
     assert.deepEqual(fixes, [
       { k: 'ask-done', id: 'q-1', decision: 'cancelled' },
       { k: 'turn', phase: 'end', ok: false, interrupted: true, at: 100 },
+      { k: 'note', id: noteId, text: 'Avbröts', at: 101 },
     ]);
     const all = readEvents(dir);
-    assert.deepEqual(all.slice(-2), fixes, 'lagningen sparas i filen');
+    assert.deepEqual(all.slice(-3), fixes, 'lagningen sparas i filen');
     assert.deepEqual(repairChat(dir, 200), [], 'en andra lagning gör ingenting');
   });
 
@@ -53,7 +56,7 @@ describe('lagning vid start', () => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(chatFile(dir), `${JSON.stringify(user(1))}\n{trasig\n\n${JSON.stringify({ k: 'turn', phase: 'start', at: 2 })}\n`);
     assert.equal(readEvents(dir).length, 2);
-    assert.equal(repairChat(dir, 9).length, 1);
+    assert.deepEqual(repairChat(dir, 9).map((e) => e.k), ['turn', 'note']);
   });
 
   test('ingen fil: ingenting', () => {

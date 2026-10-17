@@ -1,17 +1,21 @@
 // server/backends/supervisor.ts — en nodeprocess per app med backend, bakom proxyn på /api/* (CONTRACT §9).
 //
 // Start:   [sandbox-exec -f <profil>] node --import=<guard.mjs> -- <entry>, med argv och utan skal.
-//          cwd = appens mapp, env = childEnv({ PORT, HOST, DATA_DIR, APP_ID, NODE_ENV }).
-// Redo:    porten svarar på TCP inom 8 s. Sedan lsof: lyssnar något i processgruppen på annat än
-//          loopback stoppas backenden.
-// Krasch:  omstart efter 1, 2 och 4 s, högst 3 gånger per 60 s; därefter 'crashed' till restart().
+//          cwd = appens mapp, env = childEnv({ PORT, HOST, DATA_DIR, APP_ID, NODE_ENV, TMPDIR, NODE_OPTIONS }).
+// Redo:    porten svarar på TCP inom 8 s. Sedan lsof, och igen var 30:e sekund medan den kör: lyssnar något
+//          i processgruppen på annat än loopback stoppas backenden.
+// Krasch:  omstart efter 1, 2 och 4 s, högst 3 gånger per 60 s; därefter 'crashed' till restart() eller tills koden ändras.
 // Stopp:   SIGTERM till processgruppen, SIGKILL efter 2 s.
+// Tomgång: ingen förfrågan på idleMs (standard 10 min) ger ett vanligt stopp, och nästa förfrågan startar backenden
+//          igen. Pågående förfrågningar och uppgraderade socketar räknas (hold), så WebSocket och SSE håller den vid liv.
+// Färskhet: har ingångsfilen, appens package.json eller entry i manifestet ändrats sedan start startar ensure() om
+//          backenden innan porten lämnas ut, så att ingen provar gammal kod.
 //
 // Varje backend startas som ledare för en egen processgrupp (detached), så att stopp och lsof
 // också når processer som backenden själv startat. Livscykeln per app körs i en kö, så att
 // start, stopp och omstart aldrig går om varandra; stopp och omstart avbryter ändå en pågående
 // start direkt i stället för att vänta ut den.
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -22,6 +26,7 @@ import { pathToFileURL } from 'node:url';
 import type { BackendState } from '../../shared/protocol.ts';
 import { childEnv } from '../config.ts';
 import type { AppLogs, AppRegistry, Backends, Config, Paths } from '../types.ts';
+import { troubleLine } from '../store/registry.ts';
 import { buildProfile, closedRoots, isWithin, nodeReadDir } from './sandbox.ts';
 
 /** Inställningar som tester kan ändra. Standardvärdena är kontraktets. */
@@ -36,12 +41,21 @@ export interface BackendOptions {
   restartDelaysMs: number[];
   /** Standard 60 000. */
   restartWindowMs: number;
+  /**
+   * Supervisorn har gett upp (§9): orsaken och backendens sista rader, en gång per uppgivande. main.ts gör det till
+   * en not i HUD:en (sessions.note). Standard: ingenting.
+   */
+  onCrashed: (appId: string, text: string) => void;
   /** Tid mellan SIGTERM och SIGKILL. Standard 2000. */
   killGraceMs: number;
   sandboxExec: string;
   lsof: string;
   /** Node att köra backenden med. Standard process.execPath. */
   nodePath: string;
+  /** lsof-kontrollen körs om med det här mellanrummet medan backenden kör; 0 = bara efter redo. Standard 30 000. */
+  listenCheckMs: number;
+  /** Så länge utan förfrågningar innan en backend stoppas; 0 = aldrig. Standard 600 000 (WORKBENCH_BACKEND_IDLE_MS). */
+  idleMs: number;
   /** Högst så många rader per sekund och app till loggen; resten räknas och nämns. Standard 200. */
   logLinesPerSecond: number;
   /**
@@ -58,17 +72,41 @@ export const DEFAULT_OPTIONS: BackendOptions = {
   readyTimeoutMs: 8000,
   restartDelaysMs: [1000, 2000, 4000],
   restartWindowMs: 60_000,
+  onCrashed: () => {},
   killGraceMs: 2000,
   sandboxExec: '/usr/bin/sandbox-exec',
   lsof: '/usr/sbin/lsof',
   nodePath: process.execPath,
+  listenCheckMs: 30_000,
+  idleMs: 600_000,
   logLinesPerSecond: 200,
   backpressure: true,
 };
 
+/** Det längsta setTimeout klarar; ett längre värde blir 1 ms i Node (TimeoutOverflowWarning). */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** WORKBENCH_BACKEND_IDLE_MS (§3) som idleMs: ett heltal ≥ 0 (0 = aldrig, högst MAX_TIMEOUT_MS), annars standardvärdet. */
+export function backendIdleMs(value: string | undefined): number {
+  const n = value === undefined || value.trim() === '' ? Number.NaN : Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.min(Math.floor(n), MAX_TIMEOUT_MS) : DEFAULT_OPTIONS.idleMs;
+}
+
+/** Backends med räkningen som tomgångsstoppet behöver (§9); server-http anropar hold kring varje proxad förfrågan. */
+export interface BackendsEx extends Backends {
+  /** En förfrågan eller uppgraderad socket mot appens backend börjar; anropa det som returneras när den stängs. */
+  hold(appId: string): () => void;
+}
+
 const MAX_LINE = 8000;
 /** Så många gånger sekundens tak får släppas innan strömmen pausas resten av sekunden (ROB-5). */
 const FLOOD_FACTOR = 10;
+/** onCrashed (§9): så många rader sparas per start, så många skickas med, högst så långa. */
+const RECENT_LINES = 40;
+const CRASH_LINES = 3;
+const CRASH_LINE_MAX = 200;
+/** Så länge väntar onCrashed på att den kraschade processens stdout och stderr stängs. */
+const DRAIN_WAIT_MS = 1000;
 const noop = (): void => {};
 
 type KillReason = 'stop' | 'timeout' | 'exposed' | 'foreign';
@@ -82,6 +120,14 @@ interface Proc {
   markExited: () => void;
   reason: KillReason | null;
   killTimer: NodeJS.Timeout | null;
+  /** Nästa lsof-kontroll medan processen kör. */
+  listenTimer: NodeJS.Timeout | null;
+  /** Koden processen startades med: ingångsfilen och package.json (codeStamp). */
+  appReal: string;
+  entryReal: string;
+  stamp: string;
+  /** Sista stderr-raden som börjar med ett felnamn: lämnas till registret om processen kraschar (felsignalen, §7.2). */
+  lastError: string | null;
 }
 
 interface Entry {
@@ -98,12 +144,23 @@ interface Entry {
   retry: { timer: NodeJS.Timeout; done: Promise<number | null>; resolve: (port: number | null) => void } | null;
   /** Tidpunkter för automatiska omstarter inom fönstret. */
   restarts: number[];
-  /** Kraschat för ofta eller går inte att starta: 'crashed' tills restart(). */
+  /** Kraschat för ofta eller går inte att starta: 'crashed' tills restart(), eller tills koden ändras (tried). */
   gaveUp: boolean;
+  /** Koden det senaste startförsöket gjordes med (sourceStamp): en uppgiven backend startas igen när den ändras. */
+  tried: string | null;
+  /** Raderna från den senaste starten (högst RECENT_LINES), för onCrashed. */
+  recent: string[];
+  /** Den senaste processens stdout och stderr är stängda (de sista raderna kan komma efter 'exit'). */
+  drained: Promise<void>;
   /** Ska backenden köra? false efter stop(). */
   wanted: boolean;
+  /** Pågående uttryckliga stop() (deleteApp): då startar ensure() ingen ny process. Tomgångsstoppet räknas inte. */
+  stopping: number;
   lines: { windowStart: number; count: number; dropped: number; timer: NodeJS.Timeout | null; paused: Readable[] };
   lsofWarned: boolean;
+  /** Pågående förfrågningar och uppgraderade socketar (hold). */
+  inflight: number;
+  idleTimer: NodeJS.Timeout | null;
 }
 
 type ListenCheck = { kind: 'ok' } | { kind: 'exposed'; names: string[] } | { kind: 'foreign' } | null;
@@ -131,6 +188,11 @@ function seconds(ms: number): string {
   return String(ms / 1000).replace('.', ',') + ' s';
 }
 
+/** Som seconds, men i minuter från en minut ("10 min" i stället för "600 s"). */
+export function duration(ms: number): string {
+  return ms < 60_000 ? seconds(ms) : String(Math.round(ms / 6000) / 10).replace('.', ',') + ' min';
+}
+
 /** backend.entry enligt sökvägsreglerna i §4.6. Returnerar den absoluta realpathen eller kastar med orsaken. */
 export async function resolveEntry(appReal: string, entry: unknown): Promise<string> {
   const shown = JSON.stringify(entry);
@@ -154,6 +216,19 @@ export async function resolveEntry(appReal: string, entry: unknown): Promise<str
   const st = await fs.promises.stat(real);
   if (!st.isFile()) throw new Error(`backend.entry är ingen fil: ${shown}`);
   return real;
+}
+
+/** Koden en backend startas med: entry i manifestet, ingångsfilen och appens package.json (mtime och storlek). */
+async function codeStamp(appReal: string, entry: unknown, entryReal: string): Promise<string> {
+  const stat = async (p: string): Promise<string> => {
+    try {
+      const st = await fs.promises.stat(p);
+      return `${st.mtimeMs}:${st.size}`;
+    } catch {
+      return '-';
+    }
+  };
+  return JSON.stringify([entry, entryReal, await stat(entryReal), await stat(path.join(appReal, 'package.json'))]);
 }
 
 /** apps/<id>/data: skapas om den saknas, och vägras om den är en symbolisk länk eller ingen katalog. */
@@ -193,10 +268,76 @@ export async function prepareTmpDir(dataDir: string): Promise<string> {
   return dir;
 }
 
-/** De delade tillfälliga katalogerna som stängs i profilen: TMPDIR, /tmp och /var/tmp (realpath, de som finns). */
+/** Innehållet i apps/package.json: inget "type", så appar utan egen package.json tolkas som om ingen fanns. */
+const PACKAGE_SCOPE = '{ "description": "Workbench: gränsen för Nodes paketuppslag, så att apparna inte tolkas efter workbenchens package.json (CONTRACT §9)." }\n';
+
+/**
+ * apps/package.json, gränsen för Nodes paketuppslag (§9): skapas om den saknas och lämnas annars orörd. Utan den letar
+ * Node uppåt från appens mapp till workbenchens package.json. Under sandlådan nekas läsningen, vilket Node 24 inte tål,
+ * och utan sandlåda skulle workbenchens "type": "module" avgöra apparnas modulformat. Ett fel här stoppar ingen start.
+ */
+export async function preparePackageScope(appsReal: string): Promise<string> {
+  const file = path.join(appsReal, 'package.json');
+  try {
+    await fs.promises.writeFile(file, PACKAGE_SCOPE, { flag: 'wx', mode: 0o644 });
+  } catch {
+    // finns redan, eller apps/ är inte skrivbar: Node 25 klarar sig utan
+  }
+  return file;
+}
+
+/**
+ * Användarens katalog under /private/var/folders/<a>/<b> (realpath), eller null: föräldern till TMPDIR (T) och dess
+ * grannar C (DARWIN_USER_CACHE_DIR, andra programs cacher) och 0 (DARWIN_USER_DIR). Ur getconf, som inte går efter
+ * miljöns TMPDIR; annars föräldern till en TMPDIR som heter T. Bara en katalog med just den formen godtas.
+ */
+export function darwinUserRoot(): string | null {
+  let dir = '';
+  try {
+    dir = execFileSync('/usr/bin/getconf', ['DARWIN_USER_DIR'], { encoding: 'utf8', env: childEnv(), timeout: 2000 }).trim();
+  } catch {
+    /* inte macOS, eller ingen getconf */
+  }
+  try {
+    const real = fs.realpathSync.native(dir ? dir.replace(/\/+$/, '') : os.tmpdir());
+    const parent = path.dirname(real);
+    if (!dir && path.basename(real) !== 'T') return null;
+    return /^\/private\/var\/folders\/[^/]+\/[^/]+$/.test(parent) ? parent : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * De delade tillfälliga katalogerna som stängs i profilen (realpath, de som finns): användarens katalog under
+ * /private/var/folders (darwinUserRoot, med TMPDIR, cacherna och DARWIN_USER_DIR), TMPDIR om den ligger någon annanstans,
+ * /tmp och /var/tmp.
+ */
 export function sharedTmpDirs(): string[] {
   const out = new Set<string>();
+  const user = darwinUserRoot();
+  if (user) out.add(user);
   for (const p of [os.tmpdir(), '/tmp', '/var/tmp']) {
+    try {
+      const real = fs.realpathSync.native(p);
+      if (!user || !isWithin(real, user)) out.add(real);
+    } catch {
+      /* finns inte */
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Det som profilen spärrar för skrivning men inte läsning (realpath, det som finns): Node-prefixet (nodeReadDir), katalogen
+ * som nodePath ligger i (för Homebrew /opt/homebrew/bin med länken som npm run dev kör), workbenchens repo (server/,
+ * node_modules/ och guard.mjs körs osandlådat, också när repot ligger utanför $HOME), Homebrew, /Users/Shared, /Volumes,
+ * /Applications, /Library och /cores. De tre sista har kataloger som admin-gruppen eller alla kan skriva i: ett typsnitt i
+ * /Library/Fonts laddas av alla program, och /Library/Caches och /cores överlever appen.
+ */
+export function writeDeniedDirs(nodePath: string, nodeDir: string, root: string): string[] {
+  const out = new Set<string>([nodeDir]);
+  for (const p of [path.dirname(nodePath), root, '/opt/homebrew', '/usr/local', '/Users/Shared', '/Volumes', '/Applications', '/Library', '/cores']) {
     try {
       out.add(fs.realpathSync.native(p));
     } catch {
@@ -228,7 +369,7 @@ function realHome(): string {
 export function createBackends(
   deps: { config: Config; paths: Paths; registry: AppRegistry; logs: AppLogs },
   options: Partial<BackendOptions> = {},
-): Backends {
+): BackendsEx {
   const { config, paths, registry, logs } = deps;
   const opt: BackendOptions = { ...DEFAULT_OPTIONS, ...options };
   const guardFile = path.join(config.root, 'server', 'backends', 'guard.mjs');
@@ -236,7 +377,7 @@ export function createBackends(
   let allocating: Promise<unknown> = Promise.resolve();
   let closed = false;
   // Beräknas vid första sandlådade start.
-  let sandboxBase: { home: string; sharedTmp: string[]; guardReal: string; nodeDir: string } | null = null;
+  let sandboxBase: { home: string; sharedTmp: string[]; guardReal: string; nodeDir: string; writeDenied: string[] } | null = null;
 
   /* ---------------------------- hjälpare ---------------------------- */
 
@@ -284,9 +425,15 @@ export function createBackends(
         retry: null,
         restarts: [],
         gaveUp: false,
+        tried: null,
+        recent: [],
+        drained: Promise.resolve(),
         wanted: false,
+        stopping: 0,
         lines: { windowStart: 0, count: 0, dropped: 0, timer: null, paused: [] },
         lsofWarned: false,
+        inflight: 0,
+        idleTimer: null,
       };
       entries.set(id, e);
     }
@@ -326,6 +473,8 @@ export function createBackends(
     }
     if (l.count < opt.logLinesPerSecond) {
       l.count++;
+      e.recent.push(line);
+      if (e.recent.length > RECENT_LINES) e.recent.shift();
       try {
         logs.append(e.id, 'backend', line);
       } catch {
@@ -343,12 +492,13 @@ export function createBackends(
     }
   }
 
-  /** stdout/stderr radvis till loggen; rader längre än MAX_LINE delas. */
-  function readLines(e: Entry, stream: Readable | null): void {
+  /** stdout/stderr radvis till loggen; rader längre än MAX_LINE delas. Med proc (stderr) minns den sista felraden. */
+  function readLines(e: Entry, stream: Readable | null, proc?: Proc): void {
     if (!stream) return;
     stream.setEncoding('utf8');
     let buf = '';
     const emit = (line: string): void => {
+      if (proc && troubleLine('stderr', line)) proc.lastError = line;
       for (let i = 0; i < line.length; i += MAX_LINE) logLine(e, line.slice(i, i + MAX_LINE));
     };
     stream.on('data', (chunk: string) => {
@@ -419,7 +569,28 @@ export function createBackends(
   function preempt(e: Entry): void {
     e.wanted = false;
     cancelRetry(e);
+    clearIdle(e);
     if (e.proc) terminate(e.proc, 'stop');
+  }
+
+  function clearIdle(e: Entry): void {
+    if (!e.idleTimer) return;
+    clearTimeout(e.idleTimer);
+    e.idleTimer = null;
+  }
+
+  /** Tomgångsstoppet: körs backenden utan pågående förfrågningar stoppas den efter idleMs, på vanligt sätt. */
+  function armIdle(e: Entry): void {
+    clearIdle(e);
+    const proc = e.proc;
+    if (opt.idleMs <= 0 || closed || e.inflight > 0 || !e.wanted || e.state !== 'running' || !proc?.alive) return;
+    e.idleTimer = setTimeout(() => {
+      e.idleTimer = null;
+      if (closed || e.inflight > 0 || e.proc !== proc || !proc.alive || !e.wanted || e.state !== 'running' || e.starting) return;
+      note(e, `Backenden stoppades efter ${duration(opt.idleMs)} utan förfrågningar; nästa förfrågan startar den igen.`);
+      void stopEntry(e);
+    }, opt.idleMs);
+    e.idleTimer.unref();
   }
 
   async function stopRunning(e: Entry): Promise<void> {
@@ -454,14 +625,16 @@ export function createBackends(
     return run;
   }
 
-  async function writeProfile(e: Entry, appReal: string, port: number, tmpDir: string): Promise<string> {
+  async function writeProfile(e: Entry, appReal: string, port: number, tmpDir: string, packageScope: string): Promise<string> {
     if (!sandboxBase) {
       const home = realHome();
+      const nodeDir = nodeReadDir(opt.nodePath, closedRoots(home, config.home));
       sandboxBase = {
         home,
         sharedTmp: sharedTmpDirs(),
         guardReal: fs.realpathSync.native(guardFile),
-        nodeDir: nodeReadDir(opt.nodePath, closedRoots(home, config.home)),
+        nodeDir,
+        writeDenied: writeDeniedDirs(opt.nodePath, nodeDir, config.root),
       };
     }
     const others: number[] = [];
@@ -474,6 +647,8 @@ export function createBackends(
       sharedTmp: sandboxBase.sharedTmp,
       guardFile: sandboxBase.guardReal,
       nodeDir: sandboxBase.nodeDir,
+      writeDenied: sandboxBase.writeDenied,
+      packageScope,
       deniedPorts: [config.port, config.hmrPort, ...others],
     });
     const dir = paths.appDataDir(e.id);
@@ -533,15 +708,42 @@ export function createBackends(
     });
   }
 
+  /** lsof igen medan backenden kör, så att en lyssnare som öppnas senare (till exempel av ett barn utan vakten) också fångas. */
+  function watchListeners(e: Entry, proc: Proc): void {
+    if (opt.listenCheckMs <= 0) return;
+    proc.listenTimer = setTimeout(() => {
+      proc.listenTimer = null;
+      const current = (): boolean => proc.alive && e.proc === proc && e.wanted && e.state === 'running';
+      if (!current()) return;
+      void checkListeners(proc).then((check) => {
+        if (!current()) return;
+        if (check?.kind === 'exposed') {
+          // Samma uppgivna läge som efter redo, så användaren får samma not (onCrashed, §9).
+          const reason = `Backenden lyssnade på ${check.names.join(', ')}, inte bara på 127.0.0.1, och stoppades.`;
+          note(e, reason);
+          e.gaveUp = true;
+          terminate(proc, 'exposed', 0);
+          setState(e, 'crashed');
+          announce(e, reason);
+          return;
+        }
+        watchListeners(e, proc);
+      });
+    }, opt.listenCheckMs);
+    proc.listenTimer.unref();
+  }
+
   function onExit(e: Entry, proc: Proc, code: number | null, signal: NodeJS.Signals | null): void {
     if (!proc.alive) return;
     proc.alive = false;
     if (proc.killTimer) clearTimeout(proc.killTimer);
+    if (proc.listenTimer) clearTimeout(proc.listenTimer);
     signalGroup(proc, 'SIGKILL'); // barn som blev kvar i gruppen
     proc.markExited();
     flushDropped(e);
     if (e.proc !== proc) return;
     e.proc = null;
+    clearIdle(e);
     if (proc.reason === 'stop' || proc.reason === 'exposed') return; // tillståndet sätts av den som stoppade
     if (proc.reason === null) {
       note(e, code !== null ? `Backenden avslutades med kod ${code}.` : `Backenden avslutades av signalen ${signal}.`);
@@ -550,16 +752,50 @@ export function createBackends(
     scheduleRestart(e);
   }
 
+  /**
+   * Supervisorn har gett upp (§9): orsaken och backendens sista rader från den senaste starten (utan stackrader, Nodes
+   * markering ^ under källraden och versionsraden, och med sökvägar relativa appens mapp) till onCrashed, när processens
+   * stdout och stderr stängts, eftersom de sista raderna kan komma efter 'exit'. Hann en restart() före görs ingenting.
+   */
+  function announce(e: Entry, reason: string): void {
+    const waited = new Promise<void>((r) => setTimeout(r, DRAIN_WAIT_MS).unref());
+    void Promise.race([e.drained, waited]).then(() => {
+      if (!e.gaveUp || closed) return;
+      let dir = '';
+      try {
+        dir = fs.realpathSync.native(paths.appDir(e.id));
+      } catch {
+        // appen kan ha tagits bort
+      }
+      const relative = (l: string): string => (dir ? l.split(`${pathToFileURL(dir).href}/`).join('').split(`${dir}/`).join('') : l);
+      const cut = (l: string): string => {
+        const cps = Array.from(l);
+        return cps.length > CRASH_LINE_MAX ? cps.slice(0, CRASH_LINE_MAX - 1).join('') + '…' : l;
+      };
+      const lines = e.recent
+        .map((l) => relative(l.trim()))
+        .filter((l) => l && !/^at /.test(l) && !/^\^+$/.test(l) && !/^Node\.js v\d/.test(l))
+        .slice(-CRASH_LINES)
+        .map(cut);
+      try {
+        opt.onCrashed(e.id, [reason, ...lines].join('\n'));
+      } catch {
+        // mottagaren får aldrig stoppa supervisorn
+      }
+    });
+  }
+
   function scheduleRestart(e: Entry): void {
     const now = Date.now();
     e.restarts = e.restarts.filter((t) => now - t < opt.restartWindowMs);
     if (e.restarts.length >= opt.restartDelaysMs.length) {
       e.gaveUp = true;
       setState(e, 'crashed');
-      note(
-        e,
-        `Backenden har kraschat ${e.restarts.length + 1} gånger på ${seconds(opt.restartWindowMs)} och startas inte om förrän appen laddas om.`,
-      );
+      // Användaren läser orsaken i HUD:en (onCrashed, §8.1), så den säger vad som startar backenden igen: Claudes ändring
+      // (koden ändras, eller turen slutar) eller Ångra. Förut "förrän appen laddas om", och ingen omladdning gjorde det.
+      const reason = `Backenden kraschade ${e.restarts.length + 1} gånger på ${seconds(opt.restartWindowMs)}. Den startar igen när Claude ändrar appen eller när du ångrar.`;
+      note(e, reason);
+      announce(e, reason);
       return;
     }
     const delay = opt.restartDelaysMs[e.restarts.length];
@@ -580,35 +816,52 @@ export function createBackends(
     note(e, text);
     e.gaveUp = true;
     setState(e, 'crashed');
+    announce(e, text);
     return null;
+  }
+
+  /**
+   * Koden ett startförsök görs med (§9): entry i manifestet, ingångsfilen och appens package.json (mtime och storlek), utan
+   * realpath, så att den går att räkna också när entry är ogiltig eller filen saknas.
+   */
+  function sourceStamp(id: string, entry: unknown): Promise<string> {
+    const dir = paths.appDir(id);
+    return codeStamp(dir, entry, typeof entry === 'string' && entry ? path.join(dir, entry) : '');
   }
 
   /** Själva starten; körs alltid i appens kö. */
   async function start(e: Entry): Promise<number | null> {
     if (closed || !e.wanted) return null;
+    e.recent = [];
     const entry = manifestEntry(e.id);
     if (entry === null) {
       setState(e, 'none');
       return null;
     }
+    e.tried = await sourceStamp(e.id, entry);
     let appReal: string;
+    let appsReal: string;
     let entryReal: string;
     let dataDir: string;
     let tmpDir: string;
     try {
       appReal = await fs.promises.realpath(paths.appDir(e.id));
-      if (!isWithin(appReal, await fs.promises.realpath(paths.appsDir))) throw new Error('appens mapp ligger utanför apps/');
+      appsReal = await fs.promises.realpath(paths.appsDir);
+      if (!isWithin(appReal, appsReal)) throw new Error('appens mapp ligger utanför apps/');
       entryReal = await resolveEntry(appReal, entry);
       dataDir = await prepareDataDir(appReal);
       tmpDir = await prepareTmpDir(dataDir);
     } catch (err) {
       return giveUp(e, `Backenden kan inte startas: ${(err as Error).message}.`);
     }
+    const stamp = await codeStamp(appReal, entry, entryReal);
+    const packageScope = await preparePackageScope(appsReal);
     if (closed || !e.wanted) return null;
     const port = await allocatePort(e);
     if (port === null) return giveUp(e, `Ingen ledig port mellan ${opt.portBase} och ${opt.portBase + opt.portSpan - 1}.`);
 
-    const nodeArgs = [`--import=${pathToFileURL(guardFile).href}`, '--', entryReal];
+    const guardImport = `--import=${pathToFileURL(guardFile).href}`;
+    const nodeArgs = [guardImport, '--', entryReal];
     let command = opt.nodePath;
     let args = nodeArgs;
     if (!config.sandbox) {
@@ -617,7 +870,7 @@ export function createBackends(
       note(e, `${opt.sandboxExec} saknas: backenden körs utan sandlåda.`);
     } else {
       try {
-        const profile = await writeProfile(e, appReal, port, tmpDir);
+        const profile = await writeProfile(e, appReal, port, tmpDir, packageScope);
         command = opt.sandboxExec;
         args = ['-f', profile, opt.nodePath, ...nodeArgs];
       } catch (err) {
@@ -629,9 +882,16 @@ export function createBackends(
     setState(e, 'starting');
     let child: ChildProcess;
     try {
+      // NODE_OPTIONS: Node-processer som backenden startar med en bar spawn(node, …) laddar också vakten (fork och
+      // worker_threads ärver redan --import). En file:-URL har inga mellanslag, citattecken eller omvända snedstreck
+      // (de procentkodas), så den behöver ingen citering, och vakten körs bara en gång fast den importeras två gånger.
+      // Varningen för en package.json utan "type" gäller apps/package.json, som appen inte äger (preparePackageScope).
       child = spawn(command, args, {
         cwd: appReal,
-        env: childEnv({ PORT: String(port), HOST: '127.0.0.1', DATA_DIR: dataDir, APP_ID: e.id, NODE_ENV: 'development', TMPDIR: tmpDir }),
+        env: childEnv({
+          PORT: String(port), HOST: '127.0.0.1', DATA_DIR: dataDir, APP_ID: e.id, NODE_ENV: 'development', TMPDIR: tmpDir,
+          NODE_OPTIONS: `${guardImport} --disable-warning=MODULE_TYPELESS_PACKAGE_JSON`,
+        }),
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
@@ -644,16 +904,31 @@ export function createBackends(
     }
     let markExited: () => void = noop;
     const exited = new Promise<void>((r) => (markExited = r));
-    const proc: Proc = { child, pid: child.pid, port, alive: true, exited, markExited, reason: null, killTimer: null };
+    const proc: Proc = {
+      child, pid: child.pid, port, alive: true, exited, markExited, reason: null, killTimer: null, listenTimer: null, appReal, entryReal, stamp,
+      lastError: null,
+    };
     e.proc = proc;
+    e.drained = new Promise<void>((r) => child.once('close', () => r()));
     readLines(e, child.stdout);
-    readLines(e, child.stderr);
+    readLines(e, child.stderr, proc);
     child.on('error', (err: NodeJS.ErrnoException) => {
       note(e, `Backendprocessen: ${err.message}`);
       // 'error' kommer också när en signal inte gick fram; bara ett misslyckat spawn betyder att processen är borta.
       if (err.syscall?.startsWith('spawn')) onExit(e, proc, null, null);
     });
     child.on('exit', (code, signal) => onExit(e, proc, code, signal));
+    // Felsignalen (§7.2): en backend som avslutas utan att någon bett om det har fått ett ohanterat fel. Ett hanterat fel
+    // som loggas med console.error ser likadant ut på stderr och räknas inte. 'close' kommer efter 'exit' och efter
+    // strömmarna, så att kraschens felrad hunnit läsas.
+    child.on('close', () => {
+      if (proc.reason !== null || !proc.lastError) return;
+      try {
+        registry.noteLog(e.id, 'stderr', proc.lastError);
+      } catch {
+        // appen kan ha tagits bort
+      }
+    });
 
     const ready = await waitReady(proc);
     if (ready === 'exited') return null; // onExit har loggat och vid behov schemalagt en omstart
@@ -670,11 +945,13 @@ export function createBackends(
       if (!e.lsofWarned) note(e, `${opt.lsof} gick inte att köra: backendens adresser kontrolleras inte.`);
       e.lsofWarned = true;
     } else if (check.kind === 'exposed') {
-      note(e, `Backenden lyssnade på ${check.names.join(', ')}, inte bara på 127.0.0.1, och stoppades.`);
+      const reason = `Backenden lyssnade på ${check.names.join(', ')}, inte bara på 127.0.0.1, och stoppades.`;
+      note(e, reason);
       e.gaveUp = true;
       terminate(proc, 'exposed', 0);
       await proc.exited;
       setState(e, 'crashed');
+      announce(e, reason);
       return null;
     } else if (check.kind === 'foreign') {
       note(e, `Port ${port} användes av en annan process.`);
@@ -685,6 +962,8 @@ export function createBackends(
     }
     if (closed || !e.wanted || !proc.alive) return null;
     setState(e, 'running');
+    watchListeners(e, proc);
+    armIdle(e);
     return port;
   }
 
@@ -715,7 +994,7 @@ export function createBackends(
 
   /* ---------------------------- gränssnittet ---------------------------- */
 
-  return {
+  const api: BackendsEx = {
     async ensure(appId) {
       if (closed) return null;
       const e = entryFor(appId);
@@ -724,10 +1003,40 @@ export function createBackends(
         setState(e, 'none');
         return null;
       }
-      if (e.proc?.alive && e.state === 'running') return e.proc.port;
+      const proc = e.proc;
+      // wanted: en process som håller på att stoppas (stopp, omstart, tomgång) lämnas inte ut.
+      if (proc?.alive && e.state === 'running' && e.wanted) {
+        const stale = (await codeStamp(proc.appReal, manifestEntry(appId), proc.entryReal)) !== proc.stamp;
+        if (proc.alive && e.proc === proc && e.state === 'running' && e.wanted) {
+          if (!stale) {
+            armIdle(e); // en förfrågan är aktivitet, även call_backend som inte går genom routern
+            return proc.port;
+          }
+          note(e, 'Backendens kod har ändrats sedan start: startar om.');
+          return api.restart(appId);
+        }
+        if (closed) return null;
+      }
       if (e.starting) return e.starting;
       if (e.retry) return e.retry.done;
-      if (e.gaveUp) return null;
+      if (e.gaveUp) {
+        // Uppgiven: startas igen först när koden ändrats sedan det senaste försöket (en rättning för hand eller av Claude
+        // mitt i en tur), och då av appens nästa förfrågan eller call_backend. Annars bara av restart().
+        const tried = e.tried;
+        const now = await sourceStamp(appId, manifestEntry(appId));
+        if (closed) return null;
+        // Har något hänt under väntan (restart(), ett nytt försök) avgör ensure() på nytt.
+        if (e.gaveUp && e.tried === tried) {
+          if (tried === null || now === tried) return null;
+          e.gaveUp = false;
+          e.restarts = [];
+          note(e, 'Backendens kod har ändrats sedan den gavs upp: startar igen.');
+        }
+        return api.ensure(appId);
+      }
+      // Under ett uttryckligt stopp (deleteApp tar bort appen direkt efter) köas ingen ny start. Under tomgångsstoppet
+      // sätts ingen sådan flagga, så där köas en ny start direkt efter stoppet.
+      if (e.stopping > 0) return null;
       return startQueued(e);
     },
 
@@ -764,7 +1073,13 @@ export function createBackends(
 
     async stop(appId) {
       const e = entries.get(appId);
-      if (e) await stopEntry(e);
+      if (!e) return;
+      e.stopping++;
+      try {
+        await stopEntry(e);
+      } finally {
+        e.stopping--;
+      }
     },
 
     async stopAll() {
@@ -782,5 +1097,24 @@ export function createBackends(
       const e = entries.get(appId);
       return e && e.state === 'running' && e.proc?.alive ? e.proc.port : null;
     },
+
+    hold(appId) {
+      let e: Entry;
+      try {
+        e = entryFor(appId);
+      } catch {
+        return noop;
+      }
+      e.inflight++;
+      clearIdle(e);
+      let held = true;
+      return () => {
+        if (!held) return;
+        held = false;
+        e.inflight--;
+        if (e.inflight === 0) armIdle(e);
+      };
+    },
   };
+  return api;
 }

@@ -4,7 +4,11 @@
 
 En tom grå yta. Rita en fyrkant, säg vad du vill ha, och Claude Code bygger appen i fyrkanten, med backend om det behövs. Varje app har en blå prick som tar fram chatten igen så att du kan bygga vidare. Allt går att zooma, och en app kan ha flera sidor.
 
-Kräver Node 25, Google Chrome och en inloggad Claude Code. Agent SDK:n använder samma inloggning.
+![En fyrkant ritas på den grå ytan, en blå HUD glider ut och ”En analog klocka” skrivs in. Claude bygger, och en analog klocka dyker upp i fyrkanten med svaret i HUD:en.](docs/workbench.webp)
+
+*Klippet är försnabbat medan Claude bygger.*
+
+Kräver macOS, Node 25 (Node 26 är oprovad), Google Chrome och en inloggad Claude Code. Agent SDK:n använder samma inloggning. Tal till text med en lokal Whisper kräver också `ffmpeg`.
 
 ## Starta
 
@@ -15,10 +19,14 @@ npm run dev                  # skalet på http://localhost:8220, HMR på 8229
 
 Produktion: `npm run build` och sedan `npm start`.
 
+Tester: `npm test` och `npm run test:e2e`. Före push: `scripts/fresh-clone-check.sh`, som kör `npm run check` och `npm test` i en färsk klon av HEAD med lång sökväg.
+
 - Varje app ligger på sin egen adress, `http://<id>.localhost:8220`.
-- `npm run dev` startar om servern när något i `server/` eller `shared/` ändras. En omstart avbryter pågående Claude-turer, och sessionen fortsätter vid nästa meddelande. Sidan laddas om, och öppna HUD:ar kommer tillbaka med det du hunnit skriva.
+- `npm run dev` startar om servern när något i `server/` eller `shared/` ändras. Pågår en Claude-tur väntar servern tills den är klar (högst 15 minuter) och startar om först sedan; ett meddelande som skickas under tiden körs inte, och HUD:en säger det. Ctrl+C i terminalen stänger direkt och avbryter turen, liksom en andra signal till en server som väntar. Sessionen fortsätter vid nästa meddelande. Sidan laddas om, och öppna HUD:ar kommer tillbaka med det du hunnit skriva.
 - `WORKBENCH_FAKE_CLAUDE=1` kör ett låtsas-Claude som inte förbrukar kvot.
 - Andra portar och kataloger: `WORKBENCH_PORT`, `WORKBENCH_HMR_PORT` och `WORKBENCH_HOME` (där `apps/` och `data/` ligger).
+- En apps backend som inte fått någon förfrågan på tio minuter stoppas och startar igen vid nästa (`WORKBENCH_BACKEND_IDLE_MS`, 0 = aldrig).
+- En backend som kraschar fyra gånger på en minut får vila, och HUD:en säger det. Den startar igen när Claude ändrar appen, när dess kod ändras eller när du ångrar.
 - Tal till text går till en lokal Whisper-server (`WHISPER_URL`, standard `127.0.0.1:54205`), annars till OpenAI om `OPENAI_API_KEY` finns.
 
 ## Ytan och kameran
@@ -29,9 +37,10 @@ Produktion: `npm run build` och sedan `npm start`.
 | Nyp, eller ctrl + hjul | zoomar kring pekaren |
 | Tvåfingers scroll | panorerar. Över en app scrollar appen om den kan, annars panoreras ytan. |
 | ⌘ + scroll | panorerar alltid, även över en app |
-| Tvåfingers dubbeltryck (smart zoom) | flyger till fönstret under pekaren, eller tillbaka |
+| Tvåfingers dubbeltryck (smart zoom) | flyger till fönstret under pekaren, eller tillbaka. På tom yta visar det allt när det inte finns något att flyga tillbaka till. |
+| Dubbelklick på tom yta | flyger tillbaka, eller visar allt |
 | ⌘0 | visar allt |
-| Prick vid vyns kant | en app utanför bild; klick flyger dit |
+| Blå prick vid vyns kant | en app utanför bild; klick flyger dit |
 
 ## Fönster
 
@@ -51,7 +60,7 @@ Esc under ett drag avbryter det, och fönstret går tillbaka.
 
 ## Appar med flera sidor
 
-Varje byggd app har en sista sida, Förslag, där Claude föreslår förbättringar. Ett klick på ett förslag bygger det.
+Varje byggd app har en sista sida, Förslag, där Claude föreslår förbättringar. Ett klick på ett förslag bygger det. Har appen fått ett fel sedan bygget står "Rätta felet" först.
 
 | Gest | Gör |
 |---|---|
@@ -72,13 +81,37 @@ Flera appar kan ha sin HUD öppen samtidigt. Den du skriver i är aktiv och ligg
 | Enter / ⇧Enter | skickar / ny rad. Skickar du medan Claude bygger köas meddelandet. |
 | Skriv var som helst | när en HUD är öppen och fokus inte ligger i en app eller ett annat fält hamnar tecknen i den aktiva HUD:en. Utan öppen HUD öppnas fältet: en adress går till webbläsaren, ett datum till kalendern, och passar ingen app föreslås en ny. |
 | Håll mikrofonen, eller håll mellanslag i en tom inmatning | talar in ett meddelande, som skickas när du släpper. Första meningen i Claudes svar läses då upp. |
-| Stoppknappen | stoppar turen och det som köats efter den |
-| ⋯ | Ångra senaste ändringen, Öppna i egen flik, Minimera, Ta bort appen |
+| Håll mellanslag när ingen HUD är öppen | talar in i fältet. När du släpper går texten dit den passar, som om du skrivit den, och ett förslag att bygga en ny app läses upp. Håll igen för att säga något annat; Enter bygger. |
+| Stoppknappen | stoppar turen och det som köats efter den. Det Claude hann skriva står kvar, och ett meddelande som aldrig kördes visas dämpat. |
+| ⋯ | Ångra senaste ändringen, Gör om (bara efter ett ångra, fram till nästa tur), Öppna i egen flik, Visa loggen (appens senaste loggrader i en egen flik), Minimera, Ta bort appen. Ångra och gör om rör aldrig appens data. |
 | Esc | det innersta först: avbryter ett drag, stänger den aktiva HUD:en, flyger tillbaka |
 
 - Esc på en nyritad fyrkant där inget skickats och inmatningen är tom tar bort fyrkanten. Med text i inmatningen stänger Esc bara HUD:en.
 - Väntar Claude på svar (ett kort i HUD:en) kan du också skriva svaret. Texten besvarar kortet.
 - Väntar en app på svar öppnas dess HUD av sig själv. Skriver du i en annan HUD tar den inte fokus, och den blir aktiv när du stänger den du skriver i.
-- Pricken andas lugnt i vila, snabbare när Claude bygger och blinkar när Claude väntar på dig. Den blir bärnstensfärgad vid fel.
+- Pricken andas lugnt i vila, snabbare när Claude bygger och blinkar när Claude väntar på dig. Den blir bärnstensfärgad vid fel, också när appen själv fått ett fel efter bygget. En app kan visa ett kort märke bredvid pricken, till exempel antalet olästa mejl.
 
-Hur det hänger ihop står i `CONTRACT.md`.
+## Så hänger det ihop
+
+En Node-process (`server/main.ts`) serverar skalet och apparna och startar allt annat: Claude, backends och Chrome för skärmbilderna.
+
+- Varje app har en egen Claude Code-session genom Agent SDK:n, med `apps/<id>/` som arbetskatalog. Sessionen ser ingenting av din egen Claude-konfiguration.
+- Appen serveras på `<id>.localhost` och får egen origin, egen process och egen lagring. Skalet ritar pricken, greppet och sidprickarna utanför appens iframe, så att de fungerar även när appen hänger.
+- En backend får en port från 18300 och uppåt och körs, liksom Claudes Bash, i macOS-sandlådan.
+- `apps/<id>/` är appens egna filer. `data/apps/<id>/` sköts av servern: chatten, appens git-katalog, loggen och förslagen. Dit når Claude inte.
+- Varje avslutad tur blir en commit i appens git, och Ångra backar den senaste.
+
+```
+server/      Node-servern: vakten, REST och /ws, Claude-sessionerna (claude/) och backends (backends/)
+web/         skalet (Vite): kameran, fönstren och prismorna (src/world/), HUD:arna och rösten (src/hud/)
+sdk/wb.js    appbryggan, som läggs först i varje app-sida
+shared/      protokollet och fältets igenkänning, som servern och skalet delar
+apps/        apparna (ignoreras av git)
+data/        scenen, varje apps chatt, git och logg, och papperskorgen (ignoreras av git)
+```
+
+`CONTRACT.md` är specifikationen: gränssnitten, säkerheten och varje beslut med sina mätningar.
+
+## Buggar och säkerhet
+
+Rapportera buggar som [issues](https://github.com/fltman/workbench/issues) och säkerhetsproblem privat enligt [SECURITY.md](SECURITY.md).

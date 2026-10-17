@@ -38,7 +38,8 @@ export interface RouterDeps {
   registry: AppRegistry;
   logs: AppLogs;
   git: AppGit;
-  backends: Backends;
+  /** hold (supervisor.ts) räknar pågående förfrågningar mot backenden för tomgångsstoppet (§9). */
+  backends: Backends & { hold?(appId: string): () => void };
   sessions: Sessions;
   proxy: ProxyFns;
   transcribe: Transcribe;
@@ -145,6 +146,9 @@ export function createRouter(deps: RouterDeps): Router {
   }
 
   async function proxyHttpTo(req: IncomingMessage, res: ServerResponse, appId: string): Promise<void> {
+    // Förfrågan håller backenden vid liv tills svaret stängs (tomgångsstoppet, §9), också en lång SSE-ström.
+    const release = backends.hold?.(appId);
+    if (release) res.on('close', release);
     let port: number | null = null;
     try {
       port = await backends.ensure(appId);
@@ -157,6 +161,9 @@ export function createRouter(deps: RouterDeps): Router {
   }
 
   async function proxyUpgradeTo(req: IncomingMessage, socket: Duplex, head: Buffer, appId: string): Promise<void> {
+    // En uppgraderad socket (WebSocket) håller backenden vid liv tills den stängs.
+    const release = backends.hold?.(appId);
+    if (release) socket.on('close', release);
     let port: number | null = null;
     try {
       port = await backends.ensure(appId);

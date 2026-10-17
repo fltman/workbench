@@ -1,7 +1,8 @@
 // voice.ts — håll-för-att-tala (CONTRACT §12): MediaRecorder (audio/webm;codecs=opus, 32 kbps) medan
-// mikrofonknappen eller mellanslag i en tom inmatning hålls. Inspelningar under 300 ms och tysta inspelningar
-// kastas (voice-gate.ts), resten skrivs ut av servern (store.transcribe) och skickas som röstmeddelande.
-// Mikrofonen hålls varm en kort stund efter senaste inspelningen och släpps när HUD:en stängs.
+// mikrofonknappen eller mellanslag i en tom inmatning hålls, eller mellanslag på skalet utan öppen HUD (fältet,
+// §10.9). Inspelningar under 300 ms och tysta inspelningar kastas (voice-gate.ts), resten skrivs ut av servern
+// (store.transcribe) och skickas som röstmeddelande. Mikrofonen hålls varm en kort stund efter senaste
+// inspelningen och släpps när HUD:en stängs, och en mikrofon som webbläsaren ger först efter det stängs direkt.
 import { mixDown, speechGate } from './voice-gate.ts';
 import { stopSpeaking } from './tts.ts';
 
@@ -44,6 +45,8 @@ export function createVoice(h: VoiceHooks): Voice {
   let generation = 0;
   let raf = 0;
   let warmTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Räknas upp av release(), så att en mikrofon som öppnas medan den släpps aldrig blir kvar. */
+  let releases = 0;
 
   const set = (s: VoiceState) => {
     state = s;
@@ -57,9 +60,16 @@ export function createVoice(h: VoiceHooks): Voice {
 
   async function getStream(): Promise<MediaStream> {
     if (stream && stream.getAudioTracks().some((t) => t.readyState === 'live')) return stream;
-    stream = await navigator.mediaDevices.getUserMedia({
+    const r = releases;
+    const s = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
+    if (r !== releases) {
+      // Släppt medan webbläsaren öppnade mikrofonen eller frågade om lov (fältet stängdes med Esc): stäng den direkt.
+      for (const t of s.getTracks()) t.stop();
+      throw new Error('mikrofonen släpptes');
+    }
+    stream = s;
     source = null;
     return stream;
   }
@@ -217,6 +227,7 @@ export function createVoice(h: VoiceHooks): Voice {
   }
 
   function release(): void {
+    releases++;
     if (warmTimer) clearTimeout(warmTimer);
     warmTimer = null;
     if (state === 'recording' || state === 'arming') cancel();

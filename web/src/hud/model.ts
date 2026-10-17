@@ -3,7 +3,8 @@
 import type { AppPermission, AppStatus, Ask, ChatEvent } from '../../../shared/protocol.ts';
 
 export type Message =
-  | { key: string; kind: 'user'; text: string; via: 'text' | 'voice' }
+  /** dropped: meddelandet kördes aldrig (en note pekar ut det, §13); raden visas dämpad. */
+  | { key: string; kind: 'user'; text: string; via: 'text' | 'voice'; dropped: boolean }
   | { key: string; kind: 'reply'; text: string }
   | { key: string; kind: 'note'; text: string };
 
@@ -19,6 +20,11 @@ export type Message =
  * Ett meddelande som besvarar ett väntande frågekort (§8.5 punkt 5) köas inte; det hör till turen.
  * `queued` är hur många meddelanden i slutet av listan som fortfarande väntar under turens text; den levande
  * texten visas ovanför dem.
+ *
+ * Noterna som kommer efter turslutet (§8.6: Avbröts, en commit som misslyckades) hör till turen som slutade. De står
+ * under dess innehåll, ovanför köade meddelanden vars tur inte börjat (ingen text, inget verktyg och inget frågekort
+ * efter dem; till exempel skickade under §8.6 eller efter Stopp, som blir en egen tur), i stället för under dem. En not
+ * som pekar ut ett meddelande (dropped) står under sin rad.
  */
 export function messages(events: readonly ChatEvent[], streaming = false): Message[] & { queued: number } {
   const out: Message[] = [];
@@ -26,20 +32,26 @@ export function messages(events: readonly ChatEvent[], streaming = false): Messa
   let open = false; // en tur pågår
   const asks = new Set<string>(); // frågekort som väntar (inte hemligheter, som aldrig får skriven text)
   let held: Message[] = []; // köat under den pågående turen, väntar under turens text
+  let cut: number | null = null; // där köade rader vars tur inte börjat står i out; turslutets noter hamnar där
+  // Meddelanden som aldrig kördes: noten kommer efter raden, så de samlas först.
+  const dropped = new Set<string>();
+  for (const e of events) if (e.k === 'note' && e.dropped) dropped.add(e.dropped);
   const release = (): void => {
     if (!held.length) return;
+    cut ??= out.length;
     out.push(...held);
     held = [];
     slot = -1;
   };
   for (const e of events) {
     if (e.k === 'user') {
-      const m: Message = { key: `u:${e.id}`, kind: 'user', text: e.text, via: e.via };
+      const m: Message = { key: `u:${e.id}`, kind: 'user', text: e.text, via: e.via, dropped: dropped.has(e.id) };
       if (open && asks.size === 0) held.push(m);
       else {
         release();
         out.push(m);
         slot = -1;
+        cut = null;
       }
     } else if (e.k === 'text') {
       const m: Message = { key: `t:${e.id}`, kind: 'reply', text: e.text };
@@ -47,16 +59,24 @@ export function messages(events: readonly ChatEvent[], streaming = false): Messa
       else {
         slot = out.length;
         out.push(m);
+        cut = null;
       }
       release();
-    } else if (e.k === 'note') (held.length ? held : out).push({ key: `n:${e.id}`, kind: 'note', text: e.text });
-    else if (e.k === 'ask') {
+    } else if (e.k === 'note') {
+      const m: Message = { key: `n:${e.id}`, kind: 'note', text: e.text };
+      if (held.length) held.push(m);
+      else if (!open && !e.dropped && cut !== null) out.splice(cut++, 0, m);
+      else out.push(m);
+    } else if (e.k === 'ask') {
       if (e.ask.kind !== 'secret') asks.add(e.id);
+      cut = null;
     } else if (e.k === 'ask-done') asks.delete(e.id);
+    else if (e.k === 'tool') cut = null; // Claude arbetar med det köade meddelandet: dess tur har börjat
     else if (e.k === 'turn') {
       release();
       open = e.phase === 'start';
-      if (!open) asks.clear();
+      if (open) cut = null;
+      else asks.clear();
       slot = -1;
     }
   }
@@ -133,6 +153,23 @@ export function closingText(events: readonly ChatEvent[]): string | null {
     if (e.k === 'text' && e.text.trim()) return e.text;
   }
   return null;
+}
+
+/**
+ * Uppläsningen (§12) när en tur slutar (events slutar med turslutet): hur användarens senaste meddelande skickades och
+ * turens avslutande text, eller 'wait' när meddelandet inte fått något svar än. Ett meddelande som skickas under §8.6
+ * eller efter Stopp står före turslutet men blir en egen tur efter det (§8.1), så turen som slutade svarade inte på
+ * det. Vilket svar som hör till vilket meddelande avgörs som i HUD:en (messages). Ett meddelande som aldrig kördes
+ * (dropped) får inget svar: text null.
+ */
+export function spokenReply(events: readonly ChatEvent[]): 'wait' | { via: 'text' | 'voice'; text: string | null } {
+  const list = messages(events);
+  const i = list.findLastIndex((m) => m.kind === 'user');
+  const user = list[i];
+  if (!user || user.kind !== 'user') return { via: 'text', text: null };
+  if (user.dropped) return { via: user.via, text: null };
+  if (!list.slice(i + 1).some((m) => m.kind === 'reply')) return 'wait';
+  return { via: user.via, text: closingText(events) };
 }
 
 /** Den största tidsstämpeln i listan (för att skilja nya händelser från historik). */

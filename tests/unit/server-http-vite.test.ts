@@ -1,7 +1,7 @@
 // Vite som middleware (CONTRACT §4.3) med exakt kontraktets optioner, mot en tillfällig WORKBENCH_HOME:
 // /@fs/<home>/data/workbench.json och /@fs/<home>/apps/… ska ge 403 eller 404 även till skalets egen origin.
 // Detektorn kalibreras först mot en planterad läcka (fs.allow som släpper in hela repot) där den MÅSTE larma.
-// HMR-porten 8249 är server-http-byggarens egen.
+// HMR-porten är en ledig port (tests/ports.ts).
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,10 +10,11 @@ import path from 'node:path';
 import type { ViteDevServer } from 'vite';
 import { createShellVite, shellViteOptions } from '../../server/http/vite.ts';
 import { shellCsp } from '../../server/http/headers.ts';
+import { testPort } from '../ports.ts';
 import { NAV, REPO, request, rmDir, sameOrigin, startRouter, tempDir } from './server-http-fakes.test.ts';
 import type { Res, Started } from './server-http-fakes.test.ts';
 
-const HMR = 8249;
+const HMR = await testPort();
 const APP = 'avite123';
 const CANARY = { scene: 'KANARIE-SCEN', app: 'KANARIE-APP', secret: 'KANARIE-HEMLIS', chat: 'KANARIE-CHATT' };
 
@@ -68,13 +69,13 @@ describe('Vite-middleware: apps/ och data/ serveras aldrig', () => {
       { cacheDir: path.join(root, 'vite-cache'), logLevel: 'silent', optimizeDeps: { noDiscovery: true, include: [] }, server: { watch: null } },
     );
     s = await startRouter({ home, dev: true, hmrPort: HMR, vite });
-  });
+  }, { timeout: 60_000 });
 
   after(async () => {
     await s?.close();
     await vite?.close();
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   test('optionerna är exakt kontraktets (§4.3)', () => {
     assert.deepEqual(shellViteOptions({ root: '/r', hmrPort: 8229, port: 8220 }), {
@@ -164,7 +165,7 @@ describe('Vite-middleware: apps/ och data/ serveras aldrig', () => {
     assert.equal(client.status, 403, 'HMR-token i /@vite/client får inte nå en app');
   });
 
-  test('HMR-websocketen lyssnar på 127.0.0.1:8249 och inte på ::1', async () => {
+  test('HMR-websocketen lyssnar på 127.0.0.1:<HMR-porten> och inte på ::1', async () => {
     assert.equal(await tryConnect('127.0.0.1', HMR), true, 'kontroll: HMR svarar inte på 127.0.0.1');
     assert.equal(await tryConnect('::1', HMR), false, 'HMR lyssnar på ::1');
   });

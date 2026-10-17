@@ -2,24 +2,30 @@
 // Riktiga nodeprocesser i riktiga appmappar under $HOME, med sandlådan påslagen (standard),
 // bakom en "workbench"-server som gör som server-http: await ensure(), sedan proxyn.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { after, afterEach, before, describe, test } from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 import { proxyHttp, proxyUpgrade } from '../../server/backends/proxy.ts';
-import { DEFAULT_OPTIONS, createBackends, isLoopbackListener, parseLsof } from '../../server/backends/supervisor.ts';
-import type { BackendOptions } from '../../server/backends/supervisor.ts';
+import { sbplString } from '../../server/backends/sandbox.ts';
+import { DEFAULT_OPTIONS, backendIdleMs, createBackends, duration, isLoopbackListener, parseLsof } from '../../server/backends/supervisor.ts';
+import type { BackendOptions, BackendsEx } from '../../server/backends/supervisor.ts';
 import type { Backends, Config } from '../../server/types.ts';
+import { testPortSpan } from '../ports.ts';
 import {
-  fakeLogs, fakeRegistry, frontServer, installWs, isAlive, listeners, makeApp, makeHome, request, sleep, waitFor,
+  ROOT, fakeLogs, fakeRegistry, frontServer, installWs, isAlive, listeners, makeApp, makeHome, request, sleep, waitFor,
 } from './server-backends-harness.test.ts';
 import type { FakeLogs, FakeRegistry, TestHome } from './server-backends-harness.test.ts';
+import { applyLeak, type Patch } from '../bridge-harness/leaks.ts';
 
-// Utanför produktionens spann (18300–18499), så att en workbench som körs samtidigt inte tar testets portar.
-const OPTIONS: Partial<BackendOptions> = { portBase: 18600, portSpan: 40 };
+// Ett eget spann utanför produktionens (18300–18499), så att varken en workbench som körs samtidigt eller en
+// annan testkörning tar testets portar.
+const BASE = await testPortSpan(40);
+const OPTIONS: Partial<BackendOptions> = { portBase: BASE, portSpan: 40 };
 
 const NORMAL = `
 import fs from 'node:fs';
@@ -70,6 +76,31 @@ console.log('BARN ' + child.pid);
 http.createServer((req, res) => res.end('ok')).listen(Number(process.env.PORT));
 `;
 
+// Startar ett barnbarn med en bar spawn(process.execPath, …), utan --import, och svarar med var dess listen(0, '0.0.0.0') band.
+// helper: ett barnbarn med en egen HTTP-server, och vad den svarar med Host på sin egen port och med en främmande Host.
+const GRANDCHILD = `
+import http from 'node:http';
+import { spawn } from 'node:child_process';
+const probe = () => new Promise((resolve) => {
+  const child = spawn(process.execPath, ['-e', 'const s = require("net").createServer(); s.listen(0, "0.0.0.0", () => { console.log(s.address().address); s.close(); })'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', (d) => (out += d));
+  child.stderr.on('data', (d) => (out += d));
+  child.on('exit', () => resolve(out.trim()));
+});
+const helper = () => new Promise((resolve) => {
+  const child = spawn(process.execPath, ['-e', 'const s = require("http").createServer((q, r) => r.end("barn")); s.listen(0, () => console.log(s.address().port))'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  child.stdout.once('data', async (d) => {
+    const port = Number(String(d).trim());
+    const status = (host) => new Promise((ok) => http.get({ host: '127.0.0.1', port, headers: { host }, agent: false }, (r) => { r.resume(); ok(r.statusCode); }).on('error', (e) => ok(e.code)));
+    const result = { own: await status('127.0.0.1:' + port), foreign: await status('evil.example:' + port) };
+    child.kill();
+    resolve(result);
+  });
+});
+http.createServer(async (req, res) => res.end(JSON.stringify({ grandchild: await probe(), nodeOptions: process.env.NODE_OPTIONS ?? null, helper: await helper() }))).listen(Number(process.env.PORT));
+`;
+
 const CHATTY = `
 import http from 'node:http';
 process.stdout.write('x'.repeat(20000) + '\\n');
@@ -85,16 +116,20 @@ let registry: FakeRegistry;
 let logs: FakeLogs;
 const open: Backends[] = [];
 
-function supervisor(options: Partial<BackendOptions> = {}, config: Config = t.config): Backends {
+function supervisor(options: Partial<BackendOptions> = {}, config: Config = t.config): BackendsEx {
   const b = createBackends({ config, paths: t.paths, registry, logs }, { ...OPTIONS, ...options });
   open.push(b);
   return b;
 }
 
-/** Som server-http: await ensure(), 503 utan backend, annars proxyn. */
-async function workbench(b: Backends, appId: string): Promise<Awaited<ReturnType<typeof frontServer>>> {
+/**
+ * Som server-http: hold() tills svaret eller socketen stängs, await ensure(), 503 utan backend, annars proxyn.
+ * hold: false är det planterade felet för tomgångsstoppet (inga pågående förfrågningar räknas).
+ */
+async function workbench(b: BackendsEx, appId: string, { hold = true } = {}): Promise<Awaited<ReturnType<typeof frontServer>>> {
   return frontServer(
     (req, res) => {
+      if (hold) res.on('close', b.hold(appId));
       void b.ensure(appId).then((port) => {
         if (port === null) {
           res.writeHead(503, { 'content-type': 'application/json' });
@@ -103,6 +138,7 @@ async function workbench(b: Backends, appId: string): Promise<Awaited<ReturnType
       });
     },
     (req, socket, head) => {
+      if (hold) socket.on('close', b.hold(appId));
       void b.ensure(appId).then((port) => {
         if (port === null) socket.destroy();
         else proxyUpgrade(req, socket, head, port);
@@ -110,6 +146,25 @@ async function workbench(b: Backends, appId: string): Promise<Awaited<ReturnType
     },
   );
 }
+
+/** En kopia av supervisor.ts med ett planterat fel (exakta textbyten), för kalibreringar. */
+const plantedFiles: string[] = [];
+async function plantedSupervisor(patches: readonly Patch[]): Promise<typeof createBackends> {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+  const dir = path.join(root, '.scratch', 'supervisor-plants');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `supervisor-${process.pid}-${plantedFiles.length}.ts`);
+  const orig = path.join(root, 'server/backends/supervisor.ts');
+  // Varje relativ import pekar på originalets moduler, så att kopian tål en ny import i supervisor.ts.
+  const src = applyLeak(fs.readFileSync(orig, 'utf8'), patches)
+    .replace(/(from\s+)'(\.{1,2}\/[^']+)'/g, (_, from: string, rel: string) => `${from}'${pathToFileURL(path.resolve(path.dirname(orig), rel)).href}'`);
+  fs.writeFileSync(file, src);
+  plantedFiles.push(file);
+  return ((await import(pathToFileURL(file).href)) as { createBackends: typeof createBackends }).createBackends;
+}
+after(() => {
+  for (const f of plantedFiles) fs.rmSync(f, { force: true });
+});
 
 const pidsOf = (appId: string, prefix = 'STARTED '): number[] =>
   logs.of(appId, 'backend').filter((l) => l.startsWith(prefix)).map((l) => Number(l.slice(prefix.length)));
@@ -132,12 +187,12 @@ before(() => {
 // Varje test lämnar inga processer efter sig, inte heller när det fallerar.
 afterEach(async () => {
   await Promise.all(open.splice(0).map((b) => b.stopAll()));
-});
+}, { timeout: 30_000 });
 
 after(async () => {
   await Promise.all(open.map((b) => b.stopAll()));
   fs.rmSync(path.dirname(t.paths.appsDir), { recursive: true, force: true });
-});
+}, { timeout: 30_000 });
 
 describe('normal drift', { timeout: 60_000 }, () => {
   test('ensure startar backenden; GET, POST, ström och WebSocket går genom proxyn', async () => {
@@ -152,7 +207,7 @@ describe('normal drift', { timeout: 60_000 }, () => {
     const front = await workbench(b, 'anormal1');
     try {
       const port = await b.ensure('anormal1');
-      assert.ok(port !== null && port >= 18600 && port < 18640, String(port));
+      assert.ok(port !== null && port >= BASE && port < BASE + 40, String(port));
       assert.equal(b.state('anormal1'), 'running');
       assert.equal(b.port('anormal1'), port);
       assert.deepEqual(registry.statesOf('anormal1'), ['starting', 'running']);
@@ -184,6 +239,9 @@ describe('normal drift', { timeout: 60_000 }, () => {
 
       const profile = path.join(t.paths.appDataDir('anormal1'), 'backend.sb');
       assert.equal(fs.statSync(profile).mode & 0o777, 0o600);
+      // Workbenchens repo är skrivspärrat (npm run dev kör det osandlådat), också när appen ligger i det, som här.
+      const repo = `(subpath ${sbplString(fs.realpathSync.native(ROOT))})`;
+      assert.ok(fs.readFileSync(profile, 'utf8').split('\n').some((l) => l.startsWith('(deny file-write* ') && l.includes(repo)), repo);
       assert.equal(pidsOf('anormal1').length, 1);
     } finally {
       await front.close();
@@ -192,6 +250,28 @@ describe('normal drift', { timeout: 60_000 }, () => {
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;
       }
+    }
+  });
+
+  test('ett barnbarn från en bar spawn(node) laddar också vakten (NODE_OPTIONS), som släpper in barnets egen port men inte en främmande Host, även med mellanslag i repots sökväg', async () => {
+    // Ett repo vars sökväg har mellanslag: en rå sökväg i NODE_OPTIONS delas där, och då startar inte ens backenden.
+    const root = path.join(path.dirname(t.paths.appsDir), 'rot med mellanslag');
+    fs.mkdirSync(path.join(root, 'server', 'backends'), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, 'server', 'backends', 'guard.mjs'), path.join(root, 'server', 'backends', 'guard.mjs'));
+    makeApp(t, registry, 'abarnbarn1', { 'server.mjs': GRANDCHILD });
+    const b = supervisor({}, { ...t.config, root });
+    const front = await workbench(b, 'abarnbarn1');
+    try {
+      const r = JSON.parse((await request(front.port, { path: '/api/x' })).body) as {
+        grandchild: string; nodeOptions: string | null; helper: { own: number | string; foreign: number | string };
+      };
+      assert.equal(r.grandchild, '127.0.0.1', JSON.stringify(r));
+      assert.ok(r.nodeOptions?.includes('/rot%20med%20mellanslag/server/backends/guard.mjs'), String(r.nodeOptions));
+      // Vakten ärver backendens PORT, men en hjälpserver i ett barn svarar ändå på sin egen port (och 421 på en främmande Host).
+      assert.deepEqual(r.helper, { own: 200, foreign: 421 }, JSON.stringify(r));
+    } finally {
+      await front.close();
+      await b.stopAll();
     }
   });
 
@@ -231,7 +311,7 @@ describe('krascher', { timeout: 60_000 }, () => {
     makeApp(t, registry, 'akrasch1', { 'server.mjs': CRASH_AT_START });
     const b = supervisor();
     assert.equal(await b.ensure('akrasch1'), null);
-    await waitFor(() => notes('akrasch1').some((l) => l.includes('startas inte om')), 15_000, 'att backenden ges upp');
+    await waitFor(() => notes('akrasch1').some((l) => l.includes('Den startar igen när')), 15_000, 'att backenden ges upp');
     const log = registry.backendLog.filter((x) => x.appId === 'akrasch1');
     assert.deepEqual(
       log.map((x) => x.state),
@@ -251,7 +331,7 @@ describe('krascher', { timeout: 60_000 }, () => {
       'Startar om backenden om 4 s.',
     ]);
     assert.ok(notes('akrasch1').includes('Backenden avslutades med kod 1.'));
-    assert.ok(notes('akrasch1').includes('Backenden har kraschat 4 gånger på 60 s och startas inte om förrän appen laddas om.'));
+    assert.ok(notes('akrasch1').includes('Backenden kraschade 4 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.'));
     // stderr radvis till loggen, även stackspåret
     const out = logs.of('akrasch1', 'backend');
     assert.ok(out.includes('Fel: trasig backend'));
@@ -303,9 +383,106 @@ describe('krascher', { timeout: 60_000 }, () => {
     const [pid] = pidsOf('atyst1');
     assert.ok(!isAlive(pid), 'processen som inte svarade lever');
     assert.ok(notes('atyst1').some((l) => /^Backenden svarade inte på port \d+ inom 0,8 s\.$/.test(l)), notes('atyst1').join(' | '));
-    await waitFor(() => notes('atyst1').some((l) => l.includes('startas inte om')), 5000, 'att den ges upp');
+    await waitFor(() => notes('atyst1').some((l) => l.includes('Den startar igen när')), 5000, 'att den ges upp');
     assert.equal(b.state('atyst1'), 'crashed');
     assert.ok(pidsOf('atyst1').every((p) => !isAlive(p)));
+    await b.stopAll();
+  });
+
+  test('ger supervisorn upp anropas onCrashed med orsaken och backendens sista rader, en gång per uppgivande (§9)', async () => {
+    const crashed: { appId: string; text: string }[] = [];
+    makeApp(t, registry, 'agivup1', { 'server.mjs': CRASH_AT_START });
+    const b = supervisor({ restartDelaysMs: [30, 30], onCrashed: (appId: string, text: string) => void crashed.push({ appId, text }) });
+    assert.equal(await b.ensure('agivup1'), null);
+    // Kalibrering: medan supervisorn startar om (kraschat men inte uppgivet) anropas den inte.
+    assert.equal(crashed.length, 0, 'den första kraschen är ingen uppgivning');
+    await waitFor(() => crashed.length > 0, 15_000, 'onCrashed efter uppgivandet');
+    await sleep(200);
+    assert.equal(crashed.length, 1);
+    const [head, ...tail] = crashed[0].text.split('\n');
+    assert.deepEqual({ appId: crashed[0].appId, head }, { appId: 'agivup1', head: 'Backenden kraschade 3 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.' });
+    assert.ok(tail.length >= 1 && tail.length <= 3, tail.join(' | '));
+    assert.ok(tail.includes('Error: trasig backend'), `backendens felrad: ${tail.join(' | ')}`);
+    // Sökvägar i appens mapp står relativt den (som etiketterna, §8.3), inte som file:///Users/…/apps/<id>/server.mjs.
+    const appReal = fs.realpathSync.native(t.paths.appDir('agivup1'));
+    assert.ok(tail.every((l) => !l.includes(appReal)), `en absolut sökväg: ${tail.join(' | ')}`);
+    assert.ok(tail.some((l) => /^server\.mjs:\d+$/.test(l)), `källraden: ${tail.join(' | ')}`);
+    assert.ok(tail.every((l) => !/^\s*at /.test(l) && !/^\^+$/.test(l) && !/^Node\.js v/.test(l) && l.length <= 200), 'inga stackrader, markeringar eller versionsrader');
+    // En start som inte går ger upp direkt (giveUp): orsaken, utan backendrader eftersom ingen process startade.
+    makeApp(t, registry, 'agivup2', {}, { backend: { entry: 'saknas.mjs' } });
+    assert.equal(await b.ensure('agivup2'), null);
+    assert.deepEqual(crashed.at(-1), { appId: 'agivup2', text: 'Backenden kan inte startas: backend.entry finns inte: "saknas.mjs".' });
+    assert.equal(await b.ensure('agivup2'), null);
+    assert.equal(crashed.filter((c) => c.appId === 'agivup2').length, 1, 'en uppgiven backend anropar inte igen förrän restart()');
+    await b.stopAll();
+  });
+
+  test('en uppgiven backend startar igen när koden ändrats sedan det senaste försöket, vid nästa ensure() (kalibrerat: utan ändring startar ensure() ingen)', async () => {
+    const crashed: string[] = [];
+    const dir = makeApp(t, registry, 'arattad1', { 'server.mjs': CRASH_AT_START });
+    const b = supervisor({ restartDelaysMs: [30], onCrashed: (_appId: string, text: string) => void crashed.push(text) });
+    assert.equal(await b.ensure('arattad1'), null);
+    await waitFor(() => crashed.length > 0, 10_000, 'uppgivandet');
+    // Kalibrering: med samma kod startar ensure() ingen ny process.
+    assert.equal(await b.ensure('arattad1'), null);
+    assert.equal(pidsOf('arattad1').length, 2);
+    // En rättning för hand (eller av Claude mitt i en tur), och sedan appens nästa förfrågan eller call_backend.
+    fs.writeFileSync(path.join(dir, 'server.mjs'), "import http from 'node:http';\nconsole.log('STARTED ' + process.pid);\nhttp.createServer((q, s) => s.end('rättad')).listen(Number(process.env.PORT));\n");
+    const port = await b.ensure('arattad1');
+    assert.ok(port, notes('arattad1').join(' | '));
+    assert.equal(b.state('arattad1'), 'running');
+    assert.equal(pidsOf('arattad1').length, 3);
+    assert.ok(notes('arattad1').includes('Backendens kod har ändrats sedan den gavs upp: startar igen.'), notes('arattad1').join(' | '));
+    assert.equal(crashed.length, 1, 'ingen ny not när den startar');
+    // Det användaren läser i HUD:en (§8.1) säger vad som startar den igen. Förut: "förrän appen laddas om", och ingen
+    // omladdning gjorde det (QA 17 oktober).
+    assert.equal(crashed[0].split('\n')[0], 'Backenden kraschade 2 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.');
+    await b.stopAll();
+  });
+
+  test('en backend som lyssnar utanför loopback stoppas, och onCrashed får orsaken en gång (§9)', async () => {
+    const crashed: { appId: string; text: string }[] = [];
+    // Ett låtsat lsof som rapporterar en lyssnare på alla gränssnitt (de riktiga läckorna provas i server-backends-escape).
+    const lsof = path.join(t.home, 'lsof-alla-granssnitt.sh');
+    fs.writeFileSync(lsof, "#!/bin/sh\necho p1\necho 'n*:4242'\n", { mode: 0o755 });
+    makeApp(t, registry, 'aexpo1', { 'server.mjs': "import http from 'node:http';\nconsole.log('STARTED ' + process.pid);\nhttp.createServer((req, res) => res.end('ok')).listen(Number(process.env.PORT));\n" });
+    const b = supervisor({ lsof, onCrashed: (appId: string, text: string) => void crashed.push({ appId, text }) });
+    assert.equal(await b.ensure('aexpo1'), null);
+    assert.equal(b.state('aexpo1'), 'crashed');
+    await waitFor(() => crashed.length > 0, 5000, 'onCrashed efter stoppet');
+    await sleep(200);
+    assert.equal(crashed.length, 1);
+    assert.deepEqual(
+      { appId: crashed[0].appId, head: crashed[0].text.split('\n')[0] },
+      { appId: 'aexpo1', head: 'Backenden lyssnade på *:4242, inte bara på 127.0.0.1, och stoppades.' },
+    );
+    // Uppgiven: ensure() startar den inte igen, och onCrashed anropas inte igen förrän restart().
+    assert.equal(await b.ensure('aexpo1'), null);
+    await sleep(200);
+    assert.equal(crashed.length, 1);
+    await b.stopAll();
+  });
+
+  test('en lyssnare utanför loopback som öppnas under drift fångas av lsof igen, och onCrashed får samma orsak en gång (§9)', async () => {
+    const crashed: { appId: string; text: string }[] = [];
+    // Det riktiga lsof efter redo, sedan en låtsad lyssnare på alla gränssnitt, som ett barn som öppnar en senare.
+    const mark = path.join(t.home, 'lsof-senare.mark');
+    const lsof = path.join(t.home, 'lsof-senare.sh');
+    fs.writeFileSync(lsof, `#!/bin/sh\nif [ -e '${mark}' ]; then echo p1; echo 'n*:4242'; exit 0; fi\n: > '${mark}'\nexec ${DEFAULT_OPTIONS.lsof} "$@"\n`, { mode: 0o755 });
+    makeApp(t, registry, 'aexpo2', { 'server.mjs': "import http from 'node:http';\nconsole.log('STARTED ' + process.pid);\nhttp.createServer((req, res) => res.end('ok')).listen(Number(process.env.PORT));\n" });
+    const b = supervisor({ lsof, listenCheckMs: 200, onCrashed: (appId: string, text: string) => void crashed.push({ appId, text }) });
+    // Kalibrering: kontrollen efter redo släpper igenom backenden, och onCrashed har inte anropats.
+    assert.ok(await b.ensure('aexpo2'), 'backenden kör efter den första kontrollen');
+    assert.equal(crashed.length, 0);
+    await waitFor(() => b.state('aexpo2') === 'crashed', 5000, 'stoppet efter kontrollen under drift');
+    await waitFor(() => crashed.length > 0, 5000, 'onCrashed efter kontrollen under drift');
+    await sleep(300);
+    assert.equal(crashed.length, 1);
+    assert.deepEqual(
+      { appId: crashed[0].appId, head: crashed[0].text.split('\n')[0] },
+      { appId: 'aexpo2', head: 'Backenden lyssnade på *:4242, inte bara på 127.0.0.1, och stoppades.' },
+    );
+    assert.ok(pidsOf('aexpo2').every((p) => !isAlive(p)));
     await b.stopAll();
   });
 });
@@ -507,6 +684,56 @@ describe('loggar och portar', { timeout: 60_000 }, () => {
     await b.stopAll();
   });
 
+  // Felsignalen (§7.2): bara en krasch räknas. Ett hanterat fel som loggas med console.error ser likadant ut på stderr
+  // som kraschens felrad, så en backend som loggar ett misslyckat anrop per förfrågan skulle annars vara bärnstensfärgad.
+  const HANDLED = `
+import http from 'node:http';
+console.error(new Error('connect ECONNREFUSED 127.0.0.1:993'));
+console.error('Error handling enabled');
+console.log('Error: på stdout');
+setInterval(() => console.error(new TypeError('fetch failed')), 100);
+http.createServer((req, res) => res.end('ok')).listen(Number(process.env.PORT));
+`;
+  /** Planterat fel: varje stderr-rad lämnas till registret (som före granskningen), inte bara kraschens. */
+  const PER_LINE: readonly Patch[] = [["      if (proc && troubleLine('stderr', line)) proc.lastError = line;\n", "      if (proc) registry.noteLog(e.id, 'stderr', line);\n"]];
+
+  test('felsignalen: hanterade fel på stderr lämnas inte till registret, inte heller när backenden stoppas; kalibrerat', async () => {
+    const run = async (make: typeof createBackends, appId: string) => {
+      makeApp(t, registry, appId, { 'server.mjs': HANDLED });
+      const b = make({ config: t.config, paths: t.paths, registry, logs }, OPTIONS);
+      open.push(b);
+      assert.ok(await b.ensure(appId));
+      await waitFor(() => logs.of(appId, 'backend').filter((l) => l === 'TypeError: fetch failed').length >= 3, 4000, 'raderna');
+      await b.stop(appId);
+      await sleep(200); // 'close' kommer efter 'exit'
+      return registry.noted.filter((n) => n.appId === appId).map((n) => [n.source, n.line]);
+    };
+    assert.deepEqual(await run(createBackends, 'astd1'), [], 'en backend som loggar ett fel och lever vidare har inte kraschat');
+    const planted = await run(await plantedSupervisor(PER_LINE), 'astd2');
+    assert.ok(planted.some(([, l]) => l === 'Error: connect ECONNREFUSED 127.0.0.1:993'), `testet ska fälla det planterade felet (${JSON.stringify(planted)})`);
+  });
+
+  test('felsignalen: en backend som kraschar lämnar sin sista felrad till registret, en gång per krasch', async () => {
+    const CRASH_LATER = `
+import http from 'node:http';
+console.error(new Error('hanterat före kraschen'));
+http.createServer((req, res) => res.end('ok')).listen(Number(process.env.PORT), () => {
+  setTimeout(() => { throw new TypeError('trasig efter start'); }, 300);
+});
+`;
+    makeApp(t, registry, 'acrash1', { 'server.mjs': CRASH_LATER });
+    const b = supervisor({ restartDelaysMs: [60_000] });
+    assert.ok(await b.ensure('acrash1'));
+    await waitFor(() => registry.noted.some((n) => n.appId === 'acrash1'), 5000, 'kraschens felrad');
+    await sleep(300);
+    await b.stop('acrash1');
+    assert.deepEqual(
+      registry.noted.filter((n) => n.appId === 'acrash1').map((n) => [n.source, n.line]),
+      [['stderr', 'TypeError: trasig efter start']],
+      'kraschens rad, inte det hanterade felet före den eller platsraderna',
+    );
+  });
+
   test('en backend som översvämmar stdout bromsas av röret (ROB-5), kalibrerat mot läsning utan paus', async () => {
     const FLOOD = `
 import http from 'node:http';
@@ -538,14 +765,17 @@ http.createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), pump);
 
   test('upptagna portar och workbenchens egna portar hoppas över', async () => {
     const blocker = net.createServer();
-    await new Promise<void>((r) => blocker.listen(18600, '127.0.0.1', r));
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(BASE, '127.0.0.1', resolve);
+    });
     const plain = 'import http from "node:http"; http.createServer((q, s) => s.end("ok")).listen(Number(process.env.PORT));';
     makeApp(t, registry, 'aport1', { 'server.mjs': plain });
     makeApp(t, registry, 'aport2', { 'server.mjs': plain });
-    const b = supervisor({}, { ...t.config, hmrPort: 18602 });
+    const b = supervisor({}, { ...t.config, hmrPort: BASE + 2 });
     try {
       const ports = await Promise.all([b.ensure('aport1'), b.ensure('aport2')]);
-      assert.deepEqual([...ports].sort(), [18601, 18603]);
+      assert.deepEqual([...ports].sort(), [BASE + 1, BASE + 3]);
     } finally {
       await b.stopAll();
       blocker.close();
@@ -560,4 +790,297 @@ http.createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), pump);
     for (const ok of ['127.0.0.1:1', '[::1]:2', '127.5.6.7:3']) assert.ok(isLoopbackListener(ok), ok);
     for (const bad of ['*:1', '0.0.0.0:2', '[::]:3', '192.168.1.4:4', '[fe80::1%lo0]:5', '10.0.0.1:6']) assert.ok(!isLoopbackListener(bad), bad);
   });
+});
+
+/* ---------------------------- tomgång och färskhet ---------------------------- */
+
+const IDLE = `
+import http from 'node:http';
+import { WebSocketServer } from 'ws';
+console.log('STARTED ' + process.pid);
+const server = http.createServer((req, res) => {
+  if (req.url === '/api/pid') { res.end(String(process.pid)); return; }
+  if (req.url === '/api/slow') { setTimeout(() => res.end(String(process.pid)), 900); return; }
+  if (req.url === '/api/sse') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('data: ' + process.pid + '\\n\\n'); return; }
+  res.statusCode = 404; res.end();
+});
+new WebSocketServer({ server, path: '/api/ws' }).on('connection', (ws) => ws.on('message', (m) => ws.send(process.pid + ':' + m)));
+server.listen(Number(process.env.PORT), process.env.HOST);
+`;
+
+describe('tomgång (idleMs)', { timeout: 60_000 }, () => {
+  const IDLE_MS = 300;
+
+  /** En öppen SSE-ström genom fronten; close() avbryter den. */
+  function sse(port: number): Promise<{ first: string; close: () => void }> {
+    return new Promise((resolve, reject) => {
+      const req = http.get({ host: '127.0.0.1', port, path: '/api/sse', agent: false }, (res) => {
+        res.once('data', (d: Buffer) => resolve({ first: String(d), close: () => req.destroy() }));
+      });
+      req.on('error', reject);
+    });
+  }
+
+  function wsOpen(port: number): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/ws`);
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    });
+  }
+
+  test('stoppas efter idleMs utan förfrågningar, och nästa förfrågan startar den igen', async () => {
+    installWs(makeApp(t, registry, 'avila1', { 'server.mjs': IDLE }));
+    const b = supervisor({ idleMs: IDLE_MS });
+    const front = await workbench(b, 'avila1');
+    try {
+      const pid1 = Number((await request(front.port, { path: '/api/pid' })).body);
+      assert.equal(b.state('avila1'), 'running');
+      await waitFor(() => b.state('avila1') === 'stopped', 3000, 'tomgångsstoppet');
+      await waitFor(() => !isAlive(pid1), 3000, 'att processen är borta');
+      assert.ok(notes('avila1').includes('Backenden stoppades efter 0,3 s utan förfrågningar; nästa förfrågan startar den igen.'), notes('avila1').join(' | '));
+      const pid2 = Number((await request(front.port, { path: '/api/pid' })).body);
+      assert.ok(pid2 > 0 && pid2 !== pid1, `${pid1} → ${pid2}`);
+      assert.equal(b.state('avila1'), 'running');
+      assert.deepEqual(registry.statesOf('avila1'), ['starting', 'running', 'stopped', 'starting', 'running']);
+    } finally {
+      await front.close();
+      await b.stopAll();
+    }
+  });
+
+  test('inte mitt i en förfrågan, kalibrerat mot en workbench som inte räknar dem', async () => {
+    installWs(makeApp(t, registry, 'avila2', { 'server.mjs': IDLE }));
+    const b = supervisor({ idleMs: IDLE_MS });
+    // Planterat fel: utan räkningen stoppas backenden under den långsamma förfrågan (900 ms mot 300 ms).
+    const planted = await workbench(b, 'avila2', { hold: false });
+    try {
+      const r = await request(planted.port, { path: '/api/slow' });
+      assert.equal(r.status, 502, `planterat: ${r.status} ${r.body}`);
+    } finally {
+      await planted.close();
+    }
+    await waitFor(() => b.state('avila2') === 'stopped', 3000, 'stoppet i kalibreringen');
+    const front = await workbench(b, 'avila2');
+    try {
+      const pid = Number((await request(front.port, { path: '/api/pid' })).body);
+      const slow = await request(front.port, { path: '/api/slow' });
+      assert.equal(slow.status, 200);
+      assert.equal(Number(slow.body), pid, 'samma process svarade');
+      assert.equal(b.state('avila2'), 'running');
+      await waitFor(() => b.state('avila2') === 'stopped', 3000, 'stoppet efter förfrågan');
+    } finally {
+      await front.close();
+      await b.stopAll();
+    }
+  });
+
+  test('inte medan en WebSocket eller en SSE-ström är öppen, kalibrerat mot en workbench som inte räknar dem', async () => {
+    installWs(makeApp(t, registry, 'avila3', { 'server.mjs': IDLE }));
+    const b = supervisor({ idleMs: IDLE_MS });
+    // Uppgraderade socketar stänger inte med servern: varje klient avslutas, så att ett fel aldrig hänger testet.
+    const clients: { terminate(): void }[] = [];
+    // Planterat fel: utan räkningen stoppas backenden, och WebSocketen stängs med den.
+    const planted = await workbench(b, 'avila3', { hold: false });
+    try {
+      const ws = await wsOpen(planted.port);
+      clients.push(ws);
+      const closed = await new Promise<boolean>((resolve) => {
+        ws.once('close', () => resolve(true));
+        setTimeout(() => resolve(false), 3000);
+      });
+      assert.ok(closed, 'planterat: WebSocketen stängdes aldrig');
+    } finally {
+      for (const c of clients.splice(0)) c.terminate();
+      await planted.close();
+    }
+    await waitFor(() => b.state('avila3') === 'stopped', 3000, 'stoppet i kalibreringen');
+    const front = await workbench(b, 'avila3');
+    try {
+      const ws = await wsOpen(front.port);
+      clients.push(ws);
+      await sleep(IDLE_MS * 3);
+      assert.equal(b.state('avila3'), 'running', 'WebSocketen håller backenden vid liv');
+      ws.send('hej');
+      const reply = await new Promise<string>((resolve) => ws.once('message', (m) => resolve(String(m))));
+      assert.match(reply, /^\d+:hej$/);
+      const stream = await sse(front.port);
+      clients.push({ terminate: stream.close });
+      assert.match(stream.first, /^data: \d+/);
+      ws.close();
+      await sleep(IDLE_MS * 3);
+      assert.equal(b.state('avila3'), 'running', 'SSE-strömmen håller backenden vid liv');
+      stream.close();
+      await waitFor(() => b.state('avila3') === 'stopped', 3000, 'stoppet när allt stängts');
+    } finally {
+      for (const c of clients.splice(0)) c.terminate();
+      await front.close();
+      await b.stopAll();
+    }
+  });
+
+  test('tomgångsstoppet är ingen krasch: ingen onCrashed och ingen felsignal, fast backenden loggat ett fel på stderr (kalibrerat mot ett planterat stopp utan orsak)', async () => {
+    const LOGS_ERROR = `
+import http from 'node:http';
+console.log('STARTED ' + process.pid);
+console.error(new Error('hanterat fel'));
+http.createServer((req, res) => res.end(String(process.pid))).listen(Number(process.env.PORT), process.env.HOST);
+`;
+    // Planterat fel: tomgångsstoppet signalerar processen direkt, utan stoppets orsak, som en krasch.
+    const NO_REASON: readonly Patch[] = [['      void stopEntry(e);\n    }, opt.idleMs);', "      signalGroup(proc, 'SIGTERM');\n    }, opt.idleMs);"]];
+    const run = async (make: typeof createBackends, appId: string) => {
+      makeApp(t, registry, appId, { 'server.mjs': LOGS_ERROR });
+      const crashed: string[] = [];
+      const b = make({ config: t.config, paths: t.paths, registry, logs }, { ...OPTIONS, idleMs: IDLE_MS, restartDelaysMs: [30], onCrashed: (_a: string, text: string) => void crashed.push(text) });
+      open.push(b);
+      assert.ok(await b.ensure(appId));
+      await waitFor(() => logs.of(appId, 'backend').includes('Error: hanterat fel'), 3000, 'felraden på stderr');
+      return { b, crashed, noted: () => registry.noted.filter((n) => n.appId === appId).map((n) => n.line) };
+    };
+    const planted = await run(await plantedSupervisor(NO_REASON), 'avila6');
+    await waitFor(() => planted.crashed.length > 0, 8000, 'att det planterade felet syns som en uppgiven krasch');
+    assert.ok(planted.noted().includes('Error: hanterat fel'), `testet ska fälla det planterade felet: ${JSON.stringify(planted.noted())}`);
+    const real = await run(createBackends, 'avila5');
+    await waitFor(() => real.b.state('avila5') === 'stopped', 3000, 'tomgångsstoppet');
+    // Lika länge som det planterade felet behövde för två stopp och uppgivandet (stopp, omstart 30 ms, stopp, högst 1 s väntan).
+    await sleep(IDLE_MS * 4 + 1200);
+    assert.deepEqual(real.crashed, []);
+    assert.deepEqual(real.noted(), []);
+    assert.equal(real.b.state('avila5'), 'stopped');
+    assert.ok(!registry.statesOf('avila5').includes('crashed'), registry.statesOf('avila5').join(','));
+  });
+
+  test('idleMs 0 stoppar aldrig; standard 10 min, som WORKBENCH_BACKEND_IDLE_MS kan ändra', async () => {
+    assert.equal(DEFAULT_OPTIONS.idleMs, 600_000);
+    const cases: [string | undefined, number][] = [[undefined, 600_000], ['', 600_000], ['0', 0], ['1500', 1500], ['abc', 600_000], ['-1', 600_000], ['2.7', 2], ['3000000000', 2_147_483_647]];
+    for (const [v, want] of cases) assert.equal(backendIdleMs(v), want, String(v));
+    // Loggraden vid tomgångsstoppet: minuter från en minut, annars sekunder.
+    for (const [ms, text] of [[600_000, '10 min'], [90_000, '1,5 min'], [60_000, '1 min'], [300, '0,3 s'], [59_000, '59 s']] as const) {
+      assert.equal(duration(ms), text, String(ms));
+    }
+    installWs(makeApp(t, registry, 'avila4', { 'server.mjs': IDLE }));
+    const b = supervisor({ idleMs: 0 });
+    assert.ok(await b.ensure('avila4'));
+    await sleep(IDLE_MS * 3);
+    assert.equal(b.state('avila4'), 'running');
+    await b.stopAll();
+  });
+});
+
+describe('ensure() medan backenden stoppas', { timeout: 60_000 }, () => {
+  // Avslutas först en sekund efter SIGTERM (före SIGKILL efter 2 s), så att en förfrågan hinner komma medan stoppet pågår.
+  const SLOW_EXIT = `
+import http from 'node:http';
+console.log('STARTED ' + process.pid);
+process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1000));
+http.createServer((q, s) => s.end(String(process.pid))).listen(Number(process.env.PORT));
+`;
+
+  test('under ett uttryckligt stop() (deleteApp tar sedan bort appen) startas ingen ny process', async () => {
+    makeApp(t, registry, 'astopp1', { 'server.mjs': SLOW_EXIT });
+    const b = supervisor();
+    assert.ok(await b.ensure('astopp1'));
+    const [pid1] = pidsOf('astopp1');
+    const stopping = b.stop('astopp1');
+    await sleep(50);
+    assert.ok(isAlive(pid1), 'stoppet pågår');
+    const during = b.ensure('astopp1');
+    await stopping;
+    assert.equal(await during, null);
+    await sleep(1000);
+    assert.deepEqual(pidsOf('astopp1'), [pid1], 'ingen ny process efter stoppet');
+    assert.ok(!isAlive(pid1));
+    assert.equal(b.state('astopp1'), 'stopped');
+    // När stoppet är klart startar nästa förfrågan backenden som vanligt.
+    assert.ok(await b.ensure('astopp1'));
+    assert.equal(pidsOf('astopp1').length, 2);
+  });
+
+  test('under tomgångsstoppet startas en ny process direkt efter stoppet', async () => {
+    makeApp(t, registry, 'astopp2', { 'server.mjs': SLOW_EXIT });
+    const b = supervisor({ idleMs: 300 });
+    assert.ok(await b.ensure('astopp2'));
+    const [pid1] = pidsOf('astopp2');
+    await waitFor(() => notes('astopp2').some((l) => l.startsWith('Backenden stoppades efter')), 3000, 'tomgångsstoppet');
+    assert.ok(isAlive(pid1), 'stoppet pågår');
+    const port = await b.ensure('astopp2');
+    const pids = pidsOf('astopp2');
+    assert.ok(port !== null, notes('astopp2').join(' | '));
+    assert.equal(pids.length, 2, 'en ny process, inte den som stoppas');
+    assert.ok(!isAlive(pid1));
+    assert.ok(isAlive(pids[1]));
+  });
+});
+
+describe('färskhet: ensure() efter en ändring i backendens kod', { timeout: 60_000 }, () => {
+  const version = (v: string): string =>
+    `import http from 'node:http'; console.log('STARTED ' + process.pid); http.createServer((q, s) => s.end('${v} ' + process.pid)).listen(Number(process.env.PORT));\n`;
+
+  test('en ändrad ingångsfil, package.json eller entry i manifestet ger en ny process genom omstartsvägen', async () => {
+    const dir = makeApp(t, registry, 'afarsk1', { 'server.mjs': version('v1'), 'annan.mjs': version('annan') });
+    const b = supervisor();
+    const front = await workbench(b, 'afarsk1');
+    const body = async (): Promise<string> => (await request(front.port, { path: '/api/x' })).body;
+    try {
+      assert.match(await body(), /^v1 \d+$/);
+      assert.match(await body(), /^v1 \d+$/);
+      assert.equal(pidsOf('afarsk1').length, 1, 'oförändrad kod: samma process');
+      fs.writeFileSync(path.join(dir, 'server.mjs'), version('v2'));
+      assert.match(await body(), /^v2 \d+$/);
+      assert.equal(pidsOf('afarsk1').length, 2);
+      fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"afarsk1"}\n');
+      assert.match(await body(), /^v2 \d+$/);
+      assert.equal(pidsOf('afarsk1').length, 3, 'package.json räknas');
+      registry.manifests.set('afarsk1', { name: 'afarsk1', backend: { entry: 'annan.mjs' } });
+      assert.match(await body(), /^annan \d+$/);
+      assert.equal(pidsOf('afarsk1').length, 4);
+      // Omstartsvägen, inte kraschvägen: ingen crashed, ingen schemalagd omstart, och en rad som säger varför.
+      assert.ok(!registry.statesOf('afarsk1').includes('crashed'), registry.statesOf('afarsk1').join(','));
+      assert.ok(!notes('afarsk1').some((l) => l.startsWith('Startar om backenden om')));
+      assert.equal(notes('afarsk1').filter((l) => l === 'Backendens kod har ändrats sedan start: startar om.').length, 3);
+      assert.equal(pidsOf('afarsk1').filter(isAlive).length, 1);
+    } finally {
+      await front.close();
+      await b.stopAll();
+    }
+  });
+});
+
+/* ---------------------------- paketuppslaget och andra Node-versioner ---------------------------- */
+
+// WB_TEST_NODE=/sökväg/till/node provar samma backends under ännu en Node: under Node 24 dog varje sandlådad backend
+// av ERR_INVALID_PACKAGE_CONFIG på workbenchens package.json, och Node 26 är oprovad.
+const NODES = [process.execPath, ...(process.env.WB_TEST_NODE ? [process.env.WB_TEST_NODE] : [])];
+
+describe('paketuppslaget: backends utan egen package.json, i CommonJS och ESM', { timeout: 60_000 }, () => {
+  const CJS = `const http = require('node:http'); const h = require('./lib/hjalp.js'); console.log('STARTED ' + process.pid); http.createServer((q, s) => s.end('cjs ' + h() + ' ' + process.version)).listen(Number(process.env.PORT));\n`;
+  const ESM = `import http from 'node:http'; import { WebSocketServer } from 'ws'; import { h } from './lib/hjalp.js'; console.log('STARTED ' + process.pid); http.createServer((q, s) => s.end('esm ' + h() + ' ' + typeof WebSocketServer + ' ' + process.version)).listen(Number(process.env.PORT));\n`;
+  for (const node of NODES) {
+    const version = execFileSync(node, ['--version'], { encoding: 'utf8' }).trim();
+    test(`${version}: apps/package.json stoppar uppslaget före workbenchens, och apparnas moduler tolkas som utan fil`, async () => {
+      const tag = version.replace(/\W/g, '');
+      const cjsId = `apkt${tag}c`;
+      const esmId = `apkt${tag}e`;
+      makeApp(t, registry, cjsId, { 'server.js': CJS, 'lib/hjalp.js': "module.exports = () => 'hjälp';\n" }, { name: cjsId, backend: { entry: 'server.js' } });
+      installWs(makeApp(t, registry, esmId, { 'server.mjs': ESM, 'lib/hjalp.js': "export const h = () => 'hjälp';\n" }));
+      const b = supervisor({ nodePath: node });
+      const cjsFront = await workbench(b, cjsId);
+      const esmFront = await workbench(b, esmId);
+      const why = (id: string): string => [...notes(id), ...logs.of(id, 'backend')].join(' | ');
+      try {
+        assert.equal((await request(cjsFront.port, { path: '/api/x' })).body, `cjs hjälp ${version}`, why(cjsId));
+        assert.equal((await request(esmFront.port, { path: '/api/x' })).body, `esm hjälp function ${version}`, why(esmId));
+        assert.equal(JSON.parse(fs.readFileSync(path.join(t.paths.appsDir, 'package.json'), 'utf8')).type, undefined);
+        // Profilen som supervisorn skrev läser gränsfilen; det syns oavsett Node-version (Node 25 tål att den saknas).
+        const profile = fs.readFileSync(path.join(t.paths.appDataDir(cjsId), 'backend.sb'), 'utf8');
+        assert.ok(profile.includes(`(literal ${sbplString(path.join(fs.realpathSync.native(t.paths.appsDir), 'package.json'))})`), profile);
+        // Gränsfilen saknar "type", och varningen om det når inte loggen (kalibrerad i server-backends-sandbox.test.ts).
+        assert.ok(!logs.of(esmId, 'backend').some((l) => l.includes('MODULE_TYPELESS_PACKAGE_JSON')), why(esmId));
+      } finally {
+        await cjsFront.close();
+        await esmFront.close();
+        await b.stopAll();
+      }
+    });
+  }
 });

@@ -10,6 +10,7 @@ import { after, before, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { buildProfile, closedRoots, isWithin, nodeReadDir, sbplString } from '../../server/backends/sandbox.ts';
 import type { ProfileInput } from '../../server/backends/sandbox.ts';
+import { darwinUserRoot, preparePackageScope, sharedTmpDirs, writeDeniedDirs } from '../../server/backends/supervisor.ts';
 import { ROOT, SCRATCH } from './server-backends-harness.test.ts';
 
 const BASE: ProfileInput = {
@@ -106,6 +107,71 @@ describe('buildProfile', { timeout: 60_000 }, () => {
     assert.deepEqual(closedRoots('/Users/test', '/tmp/x'), ['/Users/test', '/tmp/x']);
   });
 
+  test('skrivspärren: Node, Homebrew, /Users/Shared och /Volumes nekas skrivning före tillåtelserna, aldrig läsning', () => {
+    const writeDenied = ['/opt/homebrew/Cellar/node/25.9.0_1', '/opt/homebrew', '/Users/Shared', '/Volumes', '/opt/homebrew'];
+    const ls = lines(buildProfile({ ...BASE, writeDenied }));
+    const order = [
+      indexOf(ls, '(deny file-write* (subpath "/Users/test"))'),
+      indexOf(ls, '(deny file-write* (subpath "/opt/homebrew/Cellar/node/25.9.0_1") (subpath "/opt/homebrew") (subpath "/Users/Shared") (subpath "/Volumes"))'),
+      indexOf(ls, '(allow file-write* (subpath "/private/var/folders/xy/T"))'),
+      indexOf(ls, '(allow file-write* (subpath "/Users/test/Projekt/workbench/apps/aabc123/data"))'),
+    ];
+    assert.deepEqual(order, [...order].sort((a, b) => a - b));
+    assert.ok(!ls.some((l) => l.startsWith('(deny file-read') && /homebrew|Shared|Volumes/.test(l)), 'läsning nekas aldrig');
+    assert.ok(!buildProfile(BASE).includes('/Users/Shared'), 'utan writeDenied ingen spärr');
+  });
+
+  test('en app i ett skrivspärrat område går; ett skrivspärrat område i appen eller TMPDIR vägras', () => {
+    // WORKBENCH_HOME på en annan disk: data/ och TMPDIR öppnas efter spärren och förblir skrivbara.
+    const wb = '/Volumes/Disk/wb';
+    const onDisk = { ...BASE, workbenchHome: wb, appDir: wb + '/apps/aabc123', tmpDir: wb + '/apps/aabc123/data/tmp', writeDenied: ['/Volumes'] };
+    assert.ok(lines(buildProfile(onDisk)).includes('(allow file-write* (subpath "/Volumes/Disk/wb/apps/aabc123/data"))'));
+    assert.throws(() => buildProfile({ ...BASE, writeDenied: [BASE.appDir + '/node'] }), /skrivspärrad/);
+    assert.throws(() => buildProfile({ ...BASE, writeDenied: [BASE.tmpDir] }), /skrivspärrad/);
+    assert.throws(() => buildProfile({ ...BASE, writeDenied: ['opt/homebrew'] }), /absolut/);
+  });
+
+  test('apps/package.json läses som enskild fil, aldrig workbenchens egen; något annat som packageScope vägras', () => {
+    const ls = lines(buildProfile({ ...BASE, packageScope: '/Users/test/Projekt/workbench/apps/package.json' }));
+    assert.match(ls[indexOf(ls, '(allow file-read* ')], /\(literal "\/Users\/test\/Projekt\/workbench\/apps\/package\.json"\)/);
+    assert.ok(!ls.some((l) => l.includes('"/Users/test/Projekt/workbench/package.json"')));
+    for (const bad of ['/Users/test/Projekt/workbench/apps/x.json', BASE.appDir + '/package.json', '/Users/test/annat/package.json']) {
+      assert.throws(() => buildProfile({ ...BASE, packageScope: bad }), /packageScope/, bad);
+    }
+  });
+
+  test('writeDeniedDirs: Node-prefixet, nodePaths katalog, workbenchens repo och de fasta katalogerna som finns, som realpath', () => {
+    const nodeDir = nodeReadDir(process.execPath, []);
+    const dirs = writeDeniedDirs(process.execPath, nodeDir, ROOT);
+    assert.equal(dirs[0], nodeDir);
+    assert.ok(dirs.includes(fs.realpathSync.native(path.dirname(process.execPath))));
+    // Repot (server/, node_modules/, guard.mjs) körs osandlådat av npm run dev, också när det ligger utanför $HOME.
+    assert.ok(dirs.includes(fs.realpathSync.native(ROOT)), dirs.join(' '));
+    for (const d of ['/opt/homebrew', '/usr/local', '/Users/Shared', '/Volumes', '/Applications', '/Library', '/cores']) {
+      assert.equal(fs.existsSync(d) && dirs.includes(fs.realpathSync.native(d)), fs.existsSync(d), d);
+    }
+    // En nodePath via Homebrews länk spärrar länkens katalog, inte bara Cellar.
+    if (fs.existsSync('/opt/homebrew/bin/node')) assert.ok(writeDeniedDirs('/opt/homebrew/bin/node', nodeDir, ROOT).includes('/opt/homebrew/bin'));
+    assert.equal(new Set(dirs).size, dirs.length);
+  });
+
+  test('sharedTmpDirs: användarens katalog under /private/var/folders (TMPDIR, andra programs cacher och DARWIN_USER_DIR), /private/tmp och /private/var/tmp', () => {
+    const dirs = sharedTmpDirs();
+    const user = darwinUserRoot();
+    if (process.platform === 'darwin') assert.ok(user, 'ingen katalog under /private/var/folders');
+    if (user) {
+      assert.match(user, /^\/private\/var\/folders\/[^/]+\/[^/]+$/);
+      assert.ok(dirs.includes(user), dirs.join(' '));
+      // Förut stängdes bara TMPDIR (T): C och 0 bredvid den gick att läsa och skriva (granskningen 17 oktober).
+      for (const name of ['DARWIN_USER_TEMP_DIR', 'DARWIN_USER_CACHE_DIR', 'DARWIN_USER_DIR']) {
+        const d = fs.realpathSync.native(execFileSync('/usr/bin/getconf', [name], { encoding: 'utf8' }).trim().replace(/\/+$/, ''));
+        assert.ok(dirs.some((r) => isWithin(d, r)), `${name} (${d}) stängs inte: ${dirs.join(' ')}`);
+      }
+    }
+    for (const d of ['/private/tmp', '/private/var/tmp']) assert.ok(dirs.includes(d), d);
+    assert.equal(new Set(dirs).size, dirs.length);
+  });
+
   test('strängar citeras; kontrolltecken och relativa sökvägar vägras', () => {
     assert.equal(sbplString('/a "b" \\c å'), '"/a \\"b\\" \\\\c å"');
     assert.throws(() => sbplString('/a\nb'), /kontrolltecken/);
@@ -118,7 +184,7 @@ describe('buildProfile', { timeout: 60_000 }, () => {
 });
 
 describe('nodeReadDir', { timeout: 60_000 }, () => {
-  const dir = path.join(SCRATCH, 'sandbox-nodedir');
+  const dir = path.join(SCRATCH, `sandbox-nodedir-${process.pid}`);
   before(() => {
     fs.rmSync(dir, { recursive: true, force: true });
     for (const p of ['home/bin/node', 'home/.nvm/versions/node/v25/bin/node']) {
@@ -146,7 +212,7 @@ function run(cmd: string, args: string[], cwd: string): Promise<{ code: number |
 }
 
 describe('profilen under sandbox-exec', { skip: !fs.existsSync('/usr/bin/sandbox-exec'), timeout: 60_000 }, () => {
-  const dir = path.join(SCRATCH, 'sandbox-real');
+  const dir = path.join(SCRATCH, `sandbox-real-${process.pid}`);
   let app = '';
   let input: ProfileInput;
   const guard = path.join(ROOT, 'server', 'backends', 'guard.mjs');
@@ -208,6 +274,76 @@ describe('profilen under sandbox-exec', { skip: !fs.existsSync('/usr/bin/sandbox
     const fail = await sandboxed(write('home-node-bare.sb', buildProfile({ ...input, nodeDir: null })), node);
     assert.notEqual(fail.code, 0);
     assert.match(fail.out, /blocked by sandbox|Operation not permitted|EPERM/);
+  });
+
+  test('apps/package.json stoppar paketuppslaget: CommonJS och ES-moduler som utan fil (läsrätt till förfädernas vore fel, planterat)', async () => {
+    // Workbenchens package.json har "type": "module"; det är den som inte får gälla för apparna.
+    assert.equal(JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).type, 'module');
+    fs.writeFileSync(path.join(app, 'cjs.js'), "const fs = require('node:fs'); console.log('CJS', typeof fs.readFileSync);\n");
+    fs.writeFileSync(path.join(app, 'esm.js'), "import fs from 'node:fs'; console.log('ESM', typeof fs.readFileSync);\n");
+    const entry = (p: string, file: string) => run('/usr/bin/sandbox-exec', ['-f', p, process.execPath, `--import=${pathToFileURL(guard).href}`, '--', file], app);
+    const scope = await preparePackageScope(path.dirname(input.appDir));
+    try {
+      assert.equal(JSON.parse(fs.readFileSync(scope, 'utf8')).type, undefined);
+      const ok = write('scope.sb', buildProfile({ ...input, packageScope: scope }));
+      for (const [file, want] of [['cjs.js', /^CJS function$/m], ['esm.js', /^ESM function$/m]] as const) {
+        const r = await entry(ok, file);
+        assert.equal(r.code, 0, `${file}: ${r.out}`);
+        assert.match(r.out, want);
+      }
+      // Kalibrering för supervisorns NODE_OPTIONS: utan --disable-warning varnar Node för gränsfilen (den saknar "type").
+      assert.match((await entry(ok, 'esm.js')).out, /MODULE_TYPELESS_PACKAGE_JSON/);
+    } finally {
+      fs.rmSync(scope, { force: true });
+    }
+    // Planterat fel: läsrätt till varje förfaders package.json i stället för gränsfilen. Då hittar Node workbenchens.
+    const literals: string[] = [];
+    for (let d = path.dirname(input.appDir); isWithin(d, input.home); d = path.dirname(d)) {
+      literals.push(`(literal ${sbplString(path.join(d, 'package.json'))})`);
+      if (d === input.home) break;
+    }
+    const planted = await entry(write('ancestors.sb', buildProfile(input) + `(allow file-read* ${literals.join(' ')})\n`), 'cjs.js');
+    assert.notEqual(planted.code, 0, planted.out);
+    assert.match(planted.out, /require is not defined in ES module scope/);
+  });
+
+  test('en app under en skrivspärrad katalog skriver i data/ och TMPDIR men inte bredvid (kalibrerat mot spärren sist)', async (t) => {
+    let wb: string;
+    try {
+      wb = fs.realpathSync.native(fs.mkdtempSync('/Users/Shared/wbtest-'));
+    } catch {
+      t.skip('/Users/Shared är inte skrivbar');
+      return;
+    }
+    try {
+      // WORKBENCH_HOME på en annan disk (/Users/Shared står för /Volumes): utanför hemkatalogen, alltså en stängd rot.
+      const appDir = path.join(wb, 'apps', 'aspärr1');
+      fs.mkdirSync(path.join(appDir, 'data', 'tmp'), { recursive: true });
+      fs.writeFileSync(
+        path.join(appDir, 'main.mjs'),
+        `import fs from 'node:fs';
+const t = (f) => { try { f(); return 'ALLOWED'; } catch (e) { return 'BLOCKED ' + e.code; } };
+console.log(JSON.stringify({
+  data: t(() => fs.writeFileSync('data/x', 'x')),
+  tmp: t(() => fs.writeFileSync('data/tmp/x', 'x')),
+  shared: t(() => fs.writeFileSync(${JSON.stringify(path.join('/Users/Shared', path.basename(wb) + '-bredvid'))}, 'x')),
+}));\n`,
+      );
+      const profile = buildProfile({ ...input, workbenchHome: wb, appDir, tmpDir: path.join(appDir, 'data', 'tmp'), writeDenied: ['/Users/Shared'] });
+      const runIn = (p: string) =>
+        run('/usr/bin/sandbox-exec', ['-f', p, process.execPath, `--import=${pathToFileURL(guard).href}`, '--', 'main.mjs'], appDir);
+      const ok = await runIn(write('sparr.sb', profile));
+      assert.equal(ok.code, 0, ok.out);
+      assert.deepEqual(JSON.parse(ok.out), { data: 'ALLOWED', tmp: 'ALLOWED', shared: 'BLOCKED EPERM' });
+      // Planterat fel: spärren sist, efter tillåtelserna, stänger också appens data/.
+      const denyLine = '(deny file-write* (subpath "/Users/Shared"))';
+      const last = profile.split('\n').filter((l) => l !== denyLine).join('\n') + denyLine + '\n';
+      assert.notEqual(last, profile);
+      const fail = await runIn(write('sparr-sist.sb', last));
+      assert.deepEqual(JSON.parse(fail.out), { data: 'BLOCKED EPERM', tmp: 'BLOCKED EPERM', shared: 'BLOCKED EPERM' });
+    } finally {
+      fs.rmSync(wb, { recursive: true, force: true });
+    }
   });
 
   // §9: en backend får inte kunna starta ett program via LaunchServices (open). Kalibrerat: utanför sandlådan

@@ -3,9 +3,13 @@
 // Varje toppnavigering till en annan origin än appens egen avbryts, och förfrågningar till skalet, andra appar
 // och andra lokala portar stoppas, så att en app aldrig kan visa Claude något annat än sig själv.
 import { chromium } from 'playwright-core';
-import type { Browser, BrowserContext, Page } from 'playwright-core';
+import type { Browser, BrowserContext, Frame, Page } from 'playwright-core';
+import type { OpenItem } from '../../shared/protocol.ts';
+import { normalizeItem } from '../../shared/open.ts';
 import { childEnv } from '../config.ts';
 import type { AppLogs, AppRegistry, Config, SceneStore, Shots } from '../types.ts';
+import { sample } from './samples.ts';
+import type { SampleKind } from './samples.ts';
 
 export const SHOTS_IDLE_MS = 10 * 60_000;
 /** try_app (K8): högst så länge per steg och per körning, och så många tecken synlig text. */
@@ -30,6 +34,20 @@ export interface TryStep {
   shot?: boolean;
   /** Punkter [x, y] i fönstrets CSS-px: tryck vid den första, rör genom de andra, släpp vid den sista. */
   drag?: number[][];
+  /** En inbyggd provfil (sample) till en filväljare, en släppyta eller som inklistrad. */
+  upload?: string;
+  drop?: string;
+  paste?: string;
+  sample?: SampleKind;
+  /** Något från fältet till wb.onOpen, som skalet lämnar det (§10.9). */
+  open?: { kind: string; url?: string; date?: string; text?: string };
+}
+
+/** Det som open-steget lämnar fram, kontrollerat och normaliserat som skalets sendOpen gör, eller null. */
+export function openItem(o: unknown): OpenItem | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  return normalizeItem(r.kind, r.kind === 'url' ? r.url : r.kind === 'date' ? r.date : r.text);
 }
 
 export interface TryInput {
@@ -121,7 +139,51 @@ function describeStep(st: TryStep): string {
     const pt = (p: unknown) => (Array.isArray(p) ? `(${p.map((v) => (typeof v === 'number' ? Math.round(v * 10) / 10 : '?')).join(',')})` : '(?)');
     return `drag ${pts.length} points ${pt(pts[0])}→${pt(pts[pts.length - 1])}`;
   }
+  const filing = st.upload !== undefined ? 'upload' : st.drop !== undefined ? 'drop' : st.paste !== undefined ? 'paste' : null;
+  if (filing) {
+    const s = st.sample ? sample(st.sample) : null;
+    return `${filing} ${JSON.stringify(st.upload ?? st.drop ?? st.paste)} ${s ? `${s.name} (${s.mimeType}, ${s.buffer.length} bytes)` : '?'}`;
+  }
+  if (st.open !== undefined) {
+    const it = openItem(st.open);
+    return it ? `open ${it.kind} ${JSON.stringify(clip(it.kind === 'url' ? it.url : it.kind === 'date' ? it.date : it.text, 80))}` : 'open ?';
+  }
   return 'shot';
+}
+
+/** Som skalets iframes (§4.4): utan top-navigation. */
+const IFRAME_SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads';
+
+/**
+ * Ramen i en körning med open-steg: en sida på skalets origin med appen i en iframe, som i Workbench. wb.js tar bara
+ * emot meddelanden från en förälder på skalets origin (§11), så open-meddelandet går genom samma kontroll som i skalet,
+ * och ingen sida kan lämna det åt sig själv. Ramen svarar på hello med face (§11) och noterar appens face-önskan, som
+ * provkörningen följer med frame.goto: ramen får inte navigera iframen själv, eftersom Chrome räknar en sida som inte
+ * kom från nätet som publik och då stoppar navigeringen till appens lokala adress (Local Network Access, uppmätt).
+ * Sidan byggs här och fulfills av provkörningens route: den når aldrig servern.
+ */
+function frameHtml(appOrigin: string, faceIds: string[], allow: string): string {
+  const data = JSON.stringify({ app: appOrigin, faces: faceIds }).replace(/</g, '\\u003c');
+  const attr = allow.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return `<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;height:100%;overflow:hidden;background:#fff}iframe{display:block;border:0;width:100%;height:100%}</style></head><body>
+<iframe sandbox="${IFRAME_SANDBOX}" allow="${attr}"></iframe>
+<script>
+const W = ${data};
+window.__wbFace = null;
+const fr = document.querySelector('iframe');
+let hellos = 0;
+window.__wbHellos = () => hellos;
+addEventListener('message', (e) => {
+  if (e.source !== fr.contentWindow || e.origin !== W.app || !e.data || e.data.wb !== 1) return;
+  const d = e.data;
+  if (d.type === 'hello') {
+    hellos++;
+    if (typeof d.face === 'string' && /^[a-z0-9-]{1,32}$/.test(d.face)) fr.contentWindow.postMessage({ wb: 1, type: 'face', current: d.face }, W.app);
+  } else if (d.type === 'face' && typeof d.show === 'string' && W.faces.includes(d.show)) {
+    window.__wbFace = d.show;
+  }
+});
+</script></body></html>`;
 }
 const SETTLE_MS = 300;
 const GOTO_TIMEOUT_MS = 20_000;
@@ -161,7 +223,8 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
     if (browser?.isConnected()) return browser;
     if (launching) return launching;
     launching = (async () => {
-      const b = await chromium.launch({ channel: 'chrome', headless: true, env: childEnv() });
+      // Låtsade kamera och mikrofon, för try_app:s behörigheter (skärmbildssidan får aldrig någon behörighet).
+      const b = await chromium.launch({ channel: 'chrome', headless: true, env: childEnv(), args: ['--use-fake-device-for-media-stream'] });
       b.on('disconnected', () => {
         if (browser === b) {
           browser = null;
@@ -275,7 +338,8 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
     if (trying.has(appId)) throw new Error('A try_app run is already in progress for this app.');
     if (input.signal?.aborted) throw new Error('The turn was stopped.');
     const t0 = Date.now();
-    const faces = registry.manifest(appId).faces;
+    const manifest = registry.manifest(appId);
+    const faces = manifest.faces;
     const win = scene.window(appId);
     const f = input.face !== undefined ? faces.find((x) => x.id === input.face) : faces[Math.min(Math.max(0, win?.face ?? 0), faces.length - 1)];
     if (!f) throw new Error(`No face ${JSON.stringify(input.face)}. Faces: ${faces.map((x) => x.id).join(', ')}.`);
@@ -299,11 +363,21 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
     const consoleErrors: string[] = [];
     const logged: string[] = [];
     const isolate = !input.unsafeNoIsolation;
+    // Kamera och mikrofon: låtsade enheter (--use-fake-device-for-media-stream), bara för appens egen origin (i ramen
+    // för open också ramens) och bara det app.json anger. De provar kedjan efter behörigheten, inte skalets fråga om den.
+    const media = (['camera', 'microphone'] as const).filter((p) => manifest.permissions.includes(p));
+    // Med ett open-steg körs appen i en ram på skalets origin (frameHtml), annars på toppnivå som förut.
+    const framed = input.steps.some((st) => st.open !== undefined);
+    const frameUrl = `http://localhost:${config.port}/__wb/try-frame`;
+    const pagePath = (pg: string) => '/' + pg.split('/').map(encodeURIComponent).join('/');
     // Spärren tas först här (inget await sedan kontrollen ovan) och släpps i finally, även om Chrome inte startar.
     trying.add(appId);
     let context: BrowserContext;
     try {
       context = await (await getBrowser()).newContext({ viewport: { width: w, height: h }, deviceScaleFactor: 1, serviceWorkers: 'block' });
+      if (media.length) await context.grantPermissions([...media], { origin });
+      // Chrome prövar en inbäddad rams kamera och mikrofon mot toppsidans origin, som skalets i Workbench.
+      if (media.length && framed) await context.grantPermissions([...media], { origin: new URL(frameUrl).origin });
     } catch (err) {
       trying.delete(appId);
       throw err;
@@ -312,6 +386,8 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
     input.signal?.addEventListener('abort', onAbort, { once: true });
     try {
       const page = await context.newPage();
+      /** Appens egen ram: sidan själv, eller ramens iframe i en körning med open-steg. */
+      let app: Frame = page.mainFrame();
       const json = (status: number, body: unknown) => ({ status, contentType: 'application/json; charset=utf-8', body: JSON.stringify(body) });
       await context.route('**/*', async (route) => {
         try {
@@ -332,7 +408,24 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
               return false;
             }
           })();
-          if (req.isNavigationRequest() && (!ours || (mainFrame && !same))) {
+          const appFrame = ours && (() => {
+            try {
+              return req.frame() === app;
+            } catch {
+              return false;
+            }
+          })();
+          // Ramen: bara dess egen sida, som byggs här; den når aldrig skalet.
+          if (framed && mainFrame && req.isNavigationRequest()) {
+            if (url.href === frameUrl) {
+              // Med appens origin utskriven: iframen saknar src, och då täcker standardlistan 'src' inte appen.
+              const allow = ['fullscreen', 'clipboard-write', ...media].map((p) => `${p} ${origin}`).join('; ');
+              return await route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: frameHtml(origin, faces.map((x) => x.id), allow) });
+            }
+            opened.push(url.href);
+            return await route.abort('blockedbyclient');
+          }
+          if (req.isNavigationRequest() && (!ours || (appFrame && !same))) {
             opened.push(url.href);
             return await route.abort('blockedbyclient');
           }
@@ -431,10 +524,9 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
       await page.addInitScript(() => {
         (window as unknown as { __wbTry: boolean }).__wbTry = true;
       });
-      const pagePath = (pg: string) => '/' + pg.split('/').map(encodeURIComponent).join('/');
       let lastPath = pagePath(f.page);
       page.on('framenavigated', (fr) => {
-        if (fr !== page.mainFrame()) return;
+        if (fr !== app) return;
         try {
           const u = new URL(fr.url());
           if (u.origin !== origin || u.pathname === lastPath) return;
@@ -446,9 +538,57 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
           /* about:blank */
         }
       });
-      const res = await page.goto(`${origin}${pagePath(f.page)}`, { waitUntil: 'load', timeout: Math.min(GOTO_TIMEOUT_MS, TRY_RUN_MS) });
+      if (framed) {
+        await page.goto(frameUrl, { waitUntil: 'load', timeout: Math.min(GOTO_TIMEOUT_MS, TRY_RUN_MS) });
+        const child = page.mainFrame().childFrames()[0];
+        if (!child) throw new Error('The frame for the open step could not be created.');
+        app = child;
+      }
+      const res = await app.goto(`${origin}${pagePath(f.page)}`, { waitUntil: 'load', timeout: Math.min(GOTO_TIMEOUT_MS, TRY_RUN_MS) });
       if (!res || res.status() >= 400) throw new Error(`The page ${f.page} could not be loaded${res ? ` (HTTP ${res.status()})` : ''}.`);
+      // Tangenterna ska nå appen även i ramen, som när sidan ligger på toppnivå.
+      if (framed) await page.evaluate(() => document.querySelector('iframe')?.focus());
       await page.waitForTimeout(SETTLE_MS);
+      /** I ramen: en sida som appen bett om med wb.face.show (ramen noterar den), som på toppnivå med __wbTry. */
+      const followFace = async (timeout: number): Promise<void> => {
+        if (!framed) return;
+        const want = await page.evaluate(() => {
+          const w = window as unknown as { __wbFace: string | null };
+          const v = w.__wbFace;
+          w.__wbFace = null;
+          return v;
+        });
+        const fd = want ? faces.find((x) => x.id === want) : undefined;
+        if (fd && pagePath(fd.page) !== lastPath) await app.goto(`${origin}${pagePath(fd.page)}`, { waitUntil: 'load', timeout });
+      };
+      await followFace(TRY_STEP_MS).catch(() => {});
+      /** Som World.show och deliver (§10.9): första sidan fram, och meddelandet när den sagt hej. */
+      const deliver = async (item: OpenItem, timeout: number): Promise<void> => {
+        const hellos = () => (window as unknown as { __wbHellos(): number }).__wbHellos();
+        let before = await page.evaluate(hellos);
+        const first = pagePath(faces[0].page);
+        if (lastPath !== first) {
+          await app.goto(`${origin}${first}`, { waitUntil: 'load', timeout });
+        } else if (before > 0) before = -1; // sidan har redan sagt hej
+        try {
+          await page.waitForFunction((n) => (window as unknown as { __wbHellos(): number }).__wbHellos() > n, before, { timeout });
+        } catch {
+          throw new Error(`The first face (${faces[0].id}) never said hello to Workbench, so nothing was handed over.`);
+        }
+        await page.evaluate(([it, o]) => document.querySelector('iframe')?.contentWindow?.postMessage({ wb: 1, type: 'open', item: it }, o), [item, origin] as const);
+      };
+      /** En provfil i sidan, som en DataTransfer (släppt eller inklistrad fil). */
+      const transfer = (kind: SampleKind) => {
+        const s = sample(kind);
+        return app.evaluateHandle(
+          ([b64, name, type]) => {
+            const d = new DataTransfer();
+            d.items.add(new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], name, { type }));
+            return d;
+          },
+          [s.buffer.toString('base64'), s.name, s.mimeType] as const,
+        );
+      };
       const lines: string[] = [];
       const pngs: Buffer[] = [];
       let failed = false;
@@ -462,21 +602,49 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
         const timeout = Math.min(TRY_STEP_MS, left);
         const ts = Date.now();
         try {
-          if (st.click !== undefined) await page.locator(st.click).first().click({ timeout });
-          else if (st.hover !== undefined) await page.locator(st.hover).first().hover({ timeout });
-          else if (st.fill !== undefined) await page.locator(st.fill).first().fill(st.text ?? '', { timeout });
+          if (st.click !== undefined) await app.locator(st.click).first().click({ timeout });
+          else if (st.hover !== undefined) await app.locator(st.hover).first().hover({ timeout });
+          else if (st.fill !== undefined) await app.locator(st.fill).first().fill(st.text ?? '', { timeout });
           else if (st.type !== undefined) await page.keyboard.type(st.type);
           else if (st.press !== undefined) await page.keyboard.press(st.press);
           else if (typeof st.wait === 'number') await page.waitForTimeout(Math.min(3000, Math.max(0, st.wait)));
-          else if (typeof st.wait === 'string') await page.locator(st.wait).first().waitFor({ state: 'visible', timeout });
+          else if (typeof st.wait === 'string') await app.locator(st.wait).first().waitFor({ state: 'visible', timeout });
           else if (st.shot) pngs.push(await page.screenshot({ type: 'png', timeout }));
           else if (st.drag !== undefined) {
             const bad = dragProblem(st.drag, w, h);
             if (bad) throw new Error(bad);
             await within(dragAlong(page, st.drag), timeout);
+          } else if (st.upload !== undefined) {
+            const s = sample(st.sample as SampleKind);
+            await app.locator(st.upload).first().setInputFiles({ name: s.name, mimeType: s.mimeType, buffer: s.buffer }, { timeout });
+          } else if (st.drop !== undefined) {
+            const zone = app.locator(st.drop).first();
+            await within(
+              (async () => {
+                const dt = await transfer(st.sample as SampleKind);
+                for (const type of ['dragenter', 'dragover', 'drop']) await zone.dispatchEvent(type, { dataTransfer: dt }, { timeout });
+              })(),
+              timeout,
+            );
+          } else if (st.paste !== undefined) {
+            const target = app.locator(st.paste).first();
+            await within(
+              (async () => {
+                const dt = await transfer(st.sample as SampleKind);
+                await target.evaluate((el, d) => el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: d, bubbles: true, cancelable: true, composed: true })), dt, { timeout });
+              })(),
+              timeout,
+            );
+          } else if (st.open !== undefined) {
+            const item = openItem(st.open);
+            if (!item) throw new Error('open must be {"kind":"url","url":"https://…"}, {"kind":"date","date":"YYYY-MM-DD"} or {"kind":"text","text":"…"}.');
+            // Skalet lämnar bara fram det appen anger i opens (World.deliver); try_app gör likadant.
+            if (!manifest.opens?.includes(item.kind)) throw new Error(`app.json does not list "${item.kind}" in opens, so Workbench never hands it to the app. Add "${item.kind}" to "opens" in app.json and receive it with wb.onOpen.`);
+            await within(deliver(item, timeout), timeout);
           }
-          await page.waitForLoadState('networkidle', { timeout: 1000 }).catch(() => {});
+          await app.waitForLoadState('networkidle', { timeout: 1000 }).catch(() => {});
           await page.waitForTimeout(150);
+          await followFace(Math.max(1000, Math.min(TRY_STEP_MS, TRY_RUN_MS - (Date.now() - t0))));
           lines.push(`ok   ${i + 1} ${what} ${Date.now() - ts} ms`);
         } catch (err) {
           failed = true;
@@ -485,7 +653,7 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
       }
       let visible = '';
       try {
-        visible = clip((await page.locator('body').innerText({ timeout: 2000 })).replace(/\n{3,}/g, '\n\n').trim(), TRY_TEXT_MAX);
+        visible = clip((await app.locator('body').innerText({ timeout: 2000 })).replace(/\n{3,}/g, '\n\n').trim(), TRY_TEXT_MAX);
       } catch {
         visible = '(could not read the page text)';
       }
@@ -497,6 +665,7 @@ export function createShots(deps: { config: Config; registry: AppRegistry; scene
         shotFailed = `Final screenshot failed: ${firstLine(err)}`;
       }
       const out = [`Ran ${input.steps.length} step(s) in ${Date.now() - t0} ms at ${w}×${h}, face ${f.id}, store ${mode === 'copy' ? 'copy' : input.store === 'empty' ? 'empty' : 'seed'}. Nothing was saved.`, ...lines];
+      if (media.length) out.splice(1, 0, `Fake media: ${media.map((m) => `${m}: fake device granted`).join(', ')}. The permission card itself is not part of the run.`);
       out.push(writes.size ? `Discarded store writes:\n${[...writes].map(([k, v]) => `${k} = ${v === null ? '(deleted)' : clip(v, TRY_WRITE_SHOWN)}`).join('\n')}` : 'Discarded store writes: none');
       if (fakes.size) {
         const used = [...fakes.values()].map((x) => `${x.key} (${x.hits ? `${x.hits}×` : 'never requested'})`);

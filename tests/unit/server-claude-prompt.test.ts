@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { backendLine, commitLine, composeMessage, loadAppRules, NOTES_MAX_BYTES, readNotes, workbenchBlock } from '../../server/claude/prompt.ts';
+import { askToOpen } from '../../web/src/hud/field.ts';
 import { rmrf, tmpHome } from './server-claude-kit.ts';
 import type { WindowState } from '../../shared/protocol.ts';
 
@@ -13,7 +14,7 @@ const FACES = [{ id: 'main', page: 'index.html' }];
 describe('<workbench>-blocket', () => {
   test('grundformen ur kontraktet', () => {
     const b = workbenchBlock({ win: WIN, faces: FACES, backend: 'none', backendPort: null, undone: false, notes: null });
-    assert.equal(b, '<workbench>\nWindow: 640×480 CSS px (scale 1). Front face: main (1 of 1).\nBack end: none.\nWrite every message to the user in Swedish.\n</workbench>');
+    assert.equal(b, '<workbench>\nWindow: 640×480 CSS px (scale 1). Front face: main (1 of 1).\nBack end: none.\nWrite every text block in Swedish, including notes between tool calls: the user reads them all in the HUD.\n</workbench>');
   });
 
   test('språkraden finns i varje block, före anteckningarna', () => {
@@ -21,7 +22,7 @@ describe('<workbench>-blocket', () => {
       for (const notes of [null, '', '# Mejl\n']) {
         const b = workbenchBlock({ win: WIN, faces: FACES, backend: 'running', backendPort: 18300, undone, notes });
         const lines = b.split('\n');
-        const i = lines.indexOf('Write every message to the user in Swedish.');
+        const i = lines.indexOf('Write every text block in Swedish, including notes between tool calls: the user reads them all in the HUD.');
         assert.ok(i > 0, 'språkraden saknas');
         const n = lines.indexOf('Your notes (CLAUDE.md):');
         if (notes !== null) assert.ok(i < n, 'språkraden ska stå före anteckningarna');
@@ -33,8 +34,15 @@ describe('<workbench>-blocket', () => {
     assert.equal(backendLine('none', null), 'Back end: none.');
     assert.equal(backendLine('running', 18300), 'Back end: running on port 18300');
     assert.equal(backendLine('crashed', null), 'Back end: crashed – see get_app_logs');
-    assert.match(backendLine('stopped', null), /^Back end: stopped/);
+    // Stoppad (aldrig startad, eller efter tomgångsstoppet, §9): nästa förfrågan startar den, utan reload_app.
+    assert.equal(backendLine('stopped', null), 'Back end: stopped (the next request or call_backend starts it).');
     assert.match(backendLine('starting', null), /^Back end: starting/);
+  });
+
+  test('reglerna om backendens tomgång och package.json före npm install (§8.11)', () => {
+    const rules = loadAppRules(path.resolve(import.meta.dirname, '..', '..'));
+    assert.match(rules, /stops a back end that has had no requests for 10 minutes/);
+    assert.match(rules, /Create `package\.json` before the first `npm install`/);
   });
 
   test('flera sidor, skala och främre sidan', () => {
@@ -48,6 +56,16 @@ describe('<workbench>-blocket', () => {
     const b = workbenchBlock({ win: WIN, faces: FACES, backend: 'none', backendPort: null, undone: true, notes: null });
     assert.match(b, /^Since your last turn: the user undid your last change; files are restored to the previous version\.$/m);
     assert.doesNotMatch(workbenchBlock({ win: WIN, faces: FACES, backend: 'none', backendPort: null, undone: false, notes: null }), /undid/);
+  });
+
+  test('ångra-raden räknar netto efter gör om och påstår aldrig mer än som hänt (§8.4)', () => {
+    const line = (steps: number) =>
+      workbenchBlock({ win: WIN, faces: FACES, backend: 'none', backendPort: null, undone: true, steps, notes: null }).split('\n').filter((l) => l.startsWith('Since your last turn:'));
+    assert.deepEqual(line(1), ['Since your last turn: the user undid your last change; files are restored to the previous version.']);
+    assert.deepEqual(line(2), ['Since your last turn: the user undid your last 2 changes; files are restored to an earlier version.']);
+    assert.deepEqual(line(0), ['Since your last turn: the user undid and then redid your changes; the files are as you left them.']);
+    assert.deepEqual(line(-1), ['Since your last turn: the user redid a change that had been undone earlier; the files now include it again.']);
+    assert.deepEqual(line(-3), ['Since your last turn: the user redid 3 changes that had been undone earlier; the files now include them again.']);
   });
 
   test('anteckningarna sist i blocket', () => {
@@ -68,10 +86,49 @@ describe('<workbench>-blocket', () => {
   test('app-rules.md laddas som systemprompt', () => {
     const rules = loadAppRules(path.resolve(import.meta.dirname, '..', '..'));
     assert.match(rules, /^# You are building one app inside Workbench/);
-    // Slutsvaret: svenska och högst två korta meningar, både bland reglerna för samtalet och sist i checklistan (AQ-1, AQ-2).
-    assert.match(rules, /Write every message to the user in Swedish/);
-    assert.match(rules, /Then write your closing message last: in Swedish, at most two short sentences\./);
+    // Allt Claude skriver syns i HUD:en, även noter mellan verktygsanropen: allt på svenska (två engelska noter mitt i
+    // en tur nådde HUD:en när regeln sa "message to the user"). En kort lägesrad per fas i stället för förbudet mot
+    // text mitt i turen, som aldrig hölls. Slutsvaret: två eller tre korta meningar, både bland reglerna för samtalet
+    // och sist i checklistan, och de två uppmätta felen som dåliga exempel (granskningen 17 oktober).
+    assert.match(rules, /the HUD shows every text block you write, including notes between tool calls\. Write all of them in Swedish/);
+    assert.match(rules, /Between tool calls, write at most one short progress line per phase, about 8 words/);
+    assert.match(rules, /End the turn with one short message, two or three short sentences at most\./);
+    assert.match(rules, /Not: "Jag har inte kunnat testa/);
+    assert.match(rules, /Not: "Vissa sidor kan sakna ikoner/);
+    assert.match(rules, /Then write your closing message last: in Swedish, two or three short sentences at most\./);
+    for (const gone of [/Write no text between tool calls/, /about 20 words/, /message to the user/, /at most two short sentences/]) assert.doesNotMatch(rules, gone);
+    // Typsnittet är wb.js:s --wb-font (§11): stacken utskriven i reglerna stod utskriven i tio appfiler.
+    assert.match(rules, /`font: 13px var\(--wb-font\)`/);
+    assert.doesNotMatch(rules, /-apple-system/);
     assert.match(rules, /## Show the app early/);
+  });
+
+  // Fältets snabba väg (§10.9) utlöstes aldrig: ingen av sex appar angav opens, för reglerna sa bara att en app
+  // "kan", och den enda riktiga körningen av önskemålet lade till en egen backend-route i stället (granskningen 17 oktober).
+  test('reglerna: opens i första bygget, bara opens och wb.onOpen når fram, och try_app kan prova det', () => {
+    const rules = loadAppRules(path.resolve(import.meta.dirname, '..', '..'));
+    assert.match(rules, /In the first build, without being asked, declare each kind the app can take and show/);
+    assert.match(rules, /Only `opens` plus `wb\.onOpen` works\. A route of your own/);
+    assert.match(rules, /\{"open":\{"kind":"url","url":"https:\/\/example\.com\/"\}\}/);
+    assert.doesNotMatch(rules, /If the app can show such things/);
+  });
+
+  // try_app och call_backend läser om app.json (registry.refresh, §8.7), och ensure() startar om en backend vars
+  // ingångsfil ändrats (§9), så reload_app behövs inte för att prova något.
+  test('reglerna: try_app och call_backend ser den senaste app.json och server.mjs, och reload_app är till för användaren (§8.11)', () => {
+    const rules = loadAppRules(path.resolve(import.meta.dirname, '..', '..'));
+    assert.match(rules, /`try_app` and `call_backend` always see the latest `app\.json` and `server\.mjs`/);
+    assert.match(rules, /so test without `reload_app`; it is for showing the user/);
+  });
+
+  test('fältets önskemål till en app namnger samma mekanism som reglerna', () => {
+    for (const item of [{ kind: 'url', url: 'https://dn.se/' }, { kind: 'date', date: '2026-10-20' }, { kind: 'text', text: 'Köp mjölk' }] as const) {
+      const ask = askToOpen(item);
+      assert.match(ask, new RegExp(`lägg till ${item.kind} i opens i app\\.json`), ask);
+      assert.match(ask, /wb\.onOpen/, ask);
+      assert.match(ask, /En egen backend-route räcker inte\./, ask);
+    }
+    assert.match(askToOpen({ kind: 'url', url: 'https://dn.se/' }), /^Öppna https:\/\/dn\.se\/ här/);
   });
 });
 
@@ -128,5 +185,17 @@ describe('commit-raden', () => {
     assert.equal(commitLine('a\u0007b\u001bc'), 'abc');
     assert.equal(Array.from(commitLine('å'.repeat(100))).length, 72);
     assert.equal(commitLine('   '), 'Ändring');
+  });
+});
+
+describe('reglerna om märket och kanalen (§8.11)', () => {
+  test('wb.badge, wb.faces och wb.store.onChange står i reglerna, och inget eget BroadcastChannel-protokoll', () => {
+    const rules = loadAppRules(path.resolve(import.meta.dirname, '..', '..'));
+    assert.match(rules, /`wb\.badge\('3'\)`.*up to three characters beside the dot/);
+    assert.match(rules, /`wb\.badge\(null\)` clears it\. Workbench doesn't keep it, so set it again whenever the page loads\./);
+    assert.match(rules, /`wb\.store\.onChange\(\(\{ key \}\) => …\)`/);
+    assert.match(rules, /read it when the page loads, and follow later changes with `wb\.store\.onChange`/);
+    assert.match(rules, /`wb\.faces\.post\(msg\)` and receive it in the other faces with `wb\.faces\.onMessage\(fn\)`/);
+    assert.doesNotMatch(rules, /Share live state with `BroadcastChannel`/);
   });
 });

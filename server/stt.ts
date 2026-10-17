@@ -4,6 +4,8 @@
 // Texten trimmas; tom text räknas som misslyckad. Fungerar ingen metod kastar transcribe (routen svarar 503).
 // OPENAI_API_KEY läses bara här, i serverprocessen; ffmpeg får aldrig nyckeln (childEnv är en vitlista).
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { SttResponse } from '../shared/protocol.ts';
 import { childEnv } from './config.ts';
 import type { Config } from './types.ts';
@@ -113,6 +115,20 @@ export const DEFAULT_PROVIDER_OPTIONS: ProviderOptions = {
   openaiUrl: 'https://api.openai.com/v1/audio/transcriptions',
   ffmpeg: 'ffmpeg',
 };
+
+/** Hittar execFile ffmpeg i PATH (childEnv() ger barnet samma PATH)? Utan den misslyckas whisper-vägen. Startraden, §7. */
+export function ffmpegOnPath(pathEnv = process.env.PATH ?? ''): boolean {
+  return pathEnv.split(path.delimiter).some((dir) => {
+    if (!dir) return false;
+    const file = path.join(dir, DEFAULT_PROVIDER_OPTIONS.ffmpeg);
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
 
 export function createProviders(overrides: Partial<ProviderOptions> = {}): SttProviders {
   const o = { ...DEFAULT_PROVIDER_OPTIONS, ...overrides };

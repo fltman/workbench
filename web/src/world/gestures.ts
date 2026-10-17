@@ -48,6 +48,19 @@ export function classifyWheel(e: WheelLike, overHud: boolean): WheelAction {
   return { kind: 'pan', dx: -dx, dy: -dy };
 }
 
+export type SmartAction = 'fly-to' | 'back' | 'fit' | 'none';
+
+/**
+ * Smart zoom och dubbelklick på tom yta (§10.3). hit: appen vars fönster ligger under pekaren (null på tom yta).
+ * flownTo: appen kameran senast flög till. canGoBack: tillbaka-stacken har något. På tom yta utan något att flyga
+ * tillbaka till visar den allt, som ⌘0, så att det finns en väg tillbaka med pekaren när man zoomat vilse.
+ */
+export function smartAction(hit: string | null, flownTo: string | null, canGoBack: boolean): SmartAction {
+  if (hit && hit !== flownTo) return 'fly-to';
+  if (canGoBack) return 'back';
+  return hit ? 'none' : 'fit';
+}
+
 export interface KeyLike {
   code: string;
   key: string;

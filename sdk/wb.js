@@ -1,6 +1,6 @@
 // sdk/wb.js — appbryggan (CONTRACT §11). Ett vanligt skript (ingen modul) som servern lägger först i
 // <head> på varje app-sida. CSS-variablerna, window.wb och loggningen fungerar alltid, även på toppnivå
-// (skärmbilder, egen flik). Bara delarna som pratar med skalet (hjul, tangenter, focus, hello och sidor)
+// (skärmbilder, egen flik). Bara delarna som pratar med skalet (hjul, tangenter, focus, hello, sidor och märket)
 // hoppas över när window.parent === window.
 (() => {
   'use strict';
@@ -43,6 +43,8 @@
   let dropped = 0;
   let timer = 0;
   let inLog = false; // spärr mot rekursion: inget i loggvägen får logga igen
+  /** Appens rev när sidan laddades (x-wb-rev från /__wb/app.json): felsignalen räknar bara nuvarande version (§7.2). */
+  let pageRev = '';
 
   function show(v) {
     if (typeof v === 'string') return v;
@@ -98,8 +100,10 @@
       // keepalive-förfrågningar får vara högst 64 kB; resten hinner inte iväg när sidan stängs
       while (batch.length > 1 && new Blob([body]).size > 60000) body = JSON.stringify((batch = batch.slice(0, batch.length >> 1)));
     }
+    const headers = { 'content-type': 'application/json' };
+    if (pageRev) headers['x-wb-rev'] = pageRev;
     try {
-      nativeFetch(LOG, { method: 'POST', headers: { 'content-type': 'application/json' }, body, keepalive: final === true }).catch(() => {});
+      nativeFetch(LOG, { method: 'POST', headers, body, keepalive: final === true }).catch(() => {});
     } catch {
       /* ett misslyckat loggutskick loggas aldrig */
     }
@@ -186,7 +190,11 @@
   }
 
   const appLoaded = nativeFetch(ORIGIN + '/__wb/app.json', { cache: 'no-store' })
-    .then((res) => (res.ok ? res.json() : Promise.reject(new Error('HTTP ' + res.status))))
+    .then((res) => {
+      const r = res.headers.get('x-wb-rev');
+      if (r && /^\d{1,16}$/.test(r)) pageRev = r;
+      return res.ok ? res.json() : Promise.reject(new Error('HTTP ' + res.status));
+    })
     .then(useManifest)
     .catch((err) => {
       useManifest(null);
@@ -212,6 +220,53 @@
       return;
     }
     post({ wb: 1, type: 'face', show: id }); // på toppnivå gör post ingenting
+  }
+
+  /* ------------------------------ kanalen mellan appens sidor (§11) ------------------------------ */
+  // En BroadcastChannel per app för wb.store.onChange och wb.faces. Den når appens andra sidor och fönster (samma
+  // origin), aldrig avsändaren själv, och har ingen historik: en sida läser det den behöver när den laddas.
+  const changeFns = new Set();
+  const faceFns = new Set();
+  let channel = null;
+
+  function deliver(d) {
+    if (!d || d.wb !== 1) return;
+    const change = d.kind === 'store' && typeof d.key === 'string';
+    if (!change && d.kind !== 'faces') return;
+    const arg = change ? Object.freeze({ key: d.key }) : d.msg;
+    for (const fn of [...(change ? changeFns : faceFns)]) {
+      try {
+        fn(arg);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  }
+
+  function chan() {
+    if (channel === null) {
+      try {
+        channel = new BroadcastChannel('wb:' + hostId);
+        channel.onmessage = (e) => deliver(e.data);
+      } catch {
+        channel = false; // utan BroadcastChannel finns ingen kanal
+      }
+    }
+    return channel || null;
+  }
+
+  function broadcast(d) {
+    const ch = chan();
+    if (ch) ch.postMessage(d);
+  }
+
+  function listen(fns, fn, what) {
+    if (typeof fn !== 'function') throw new TypeError(what + ': en funktion behövs');
+    chan();
+    fns.add(fn);
+    return () => {
+      fns.delete(fn);
+    };
   }
 
   /* ------------------------------ wb.store → /__wb/store ------------------------------ */
@@ -249,12 +304,14 @@
       if (new Blob([body]).size > 1024 * 1024) throw new RangeError('wb.store.set: värdet för "' + key + '" är större än 1 MB');
       return nativeFetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body }).then((res) => {
         if (!res.ok) throw failed('wb.store.set("' + key + '")', res);
+        broadcast({ wb: 1, kind: 'store', key });
       });
     },
     delete(key) {
       const url = keyUrl(key, 'delete');
       return nativeFetch(url, { method: 'DELETE' }).then((res) => {
         if (!res.ok && res.status !== 404) throw failed('wb.store.delete("' + key + '")', res);
+        broadcast({ wb: 1, kind: 'store', key });
       });
     },
     all() {
@@ -263,7 +320,32 @@
         return res.json();
       });
     },
+    /** I appens andra sidor och fönster, med { key }, när en set eller delete gått igenom. Bara senare ändringar. */
+    onChange(fn) {
+      return listen(changeFns, fn, 'wb.store.onChange');
+    },
   });
+
+  const faces = Object.freeze({
+    post(msg) {
+      try {
+        broadcast({ wb: 1, kind: 'faces', msg });
+      } catch (err) {
+        throw new TypeError('wb.faces.post: meddelandet går inte att skicka till de andra sidorna (' + (err && err.message) + ')');
+      }
+    },
+    onMessage(fn) {
+      return listen(faceFns, fn, 'wb.faces.onMessage');
+    },
+  });
+
+  /** Appens märke bredvid pricken (§10.5). Skalet tvättar texten och behåller högst tre tecken. */
+  function badge(text) {
+    let t = text === undefined ? null : text;
+    if (typeof t === 'number' && Number.isFinite(t)) t = String(t);
+    if (t !== null && typeof t !== 'string') throw new TypeError('wb.badge: en sträng, ett tal eller null behövs');
+    post({ wb: 1, type: 'badge', text: t }); // på toppnivå gör post ingenting
+  }
 
   /* ------------------------------ wb.onOpen (fältet, §10.9) ------------------------------ */
   // Det som skrivs i Workbench-fältet och lämnas till appen: en adress, ett datum eller en text. Kommer det innan
@@ -320,6 +402,8 @@
       },
     }),
     store,
+    faces,
+    badge,
   });
 
   if (!EMBEDDED) return; // på toppnivå finns inget skal att prata med

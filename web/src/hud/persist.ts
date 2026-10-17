@@ -1,6 +1,6 @@
 // persist.ts — HUD:ens tillstånd över en omladdning av sidan (sessionStorage, alltså per flik).
 // I dev laddar Vites HMR-klient om hela skalet efter varje omstart av servern, och ⌘R gör detsamma.
-// Utan detta stängdes en öppen HUD och ett osänt utkast försvann (uppmätt, .scratch/rev-robust/c-reload.mjs).
+// Utan detta stängdes en öppen HUD och ett osänt utkast försvann (uppmätt).
 // Det som sparas: vilka appar som har sin HUD öppen (i den ordning de öppnades), för var och en hur den öppnades,
 // om något skickats sedan dess och vilken sida den står på, vilken som är aktiv, Esc-ordningen och de halvskrivna
 // utkasten per app. Ett värde i den äldre formen (en enda app) läses som en öppen HUD. Varje åtkomst är inlindad

@@ -127,6 +127,8 @@ export function makeRegistry(paths: Paths, rec: Recorder): AppRegistry & { apps:
         /* inget manifest */
       }
     },
+    noteLog() {},
+    troubles: () => [],
   };
 }
 
@@ -162,6 +164,12 @@ export function makeGit(rec: Recorder, delayMs = 0): AppGit & { commits: { appId
     },
     async undo() {
       return true;
+    },
+    async redo() {
+      return true;
+    },
+    async canRedo() {
+      return false;
     },
   };
 }

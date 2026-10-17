@@ -90,6 +90,7 @@ export interface AppInfo {
   backend: BackendState;
   rev: number;                   // ändras när skalet ska ladda om appen (tur klar, ångra, reload_app, manuell ändring)
   opens?: OpenKind[];            // normaliserade; saknas när appen inte öppnar något från fältet (§10.9)
+  trouble?: string;              // första raden av ett fel efter turen (§7.2), högst 120 tecken; saknas annars
 }
 
 /** Giltigt app-id: används som subdomän. */
@@ -127,7 +128,7 @@ export type ChatEvent =
   | { k: 'ask'; id: string; ask: Ask; at: number }
   | { k: 'ask-done'; id: string; decision: AskDecision }
   | { k: 'turn'; phase: 'start' | 'end'; ok?: boolean; interrupted?: boolean; error?: string; at: number }
-  | { k: 'note'; id: string; text: string; at: number };                // t.ex. "Ångrade senaste ändringen."
+  | { k: 'note'; id: string; text: string; at: number; dropped?: string }; // t.ex. "Ångrade senaste ändringen."; dropped = id för användarens meddelande som aldrig kördes (dämpas i HUD:en)
 
 /* ------------------------------------------------------------------ */
 /* WebSocket mellan skal och server: ws://localhost:<port>/ws           */
@@ -167,8 +168,10 @@ export type ServerMsg =
 // GET    /api/snapshot             -> { scene, apps }
 // POST   /api/apps                 CreateAppRequest -> CreateAppResponse  (sänder också 'app' och 'scene.window')
 // DELETE /api/apps/:id             -> { ok: true }        (flyttas till data/trash/)
-// POST   /api/apps/:id/undo        -> { ok: boolean }     (409 medan Claude arbetar; ok:false om inget att ångra)
+// POST   /api/apps/:id/undo        -> { ok: boolean, canRedo: boolean }  (409 medan Claude arbetar; ok:false om inget att ångra)
+// POST   /api/apps/:id/redo        -> { ok: true, canRedo: boolean }     (409 medan Claude arbetar eller om inget att göra om)
 // GET    /api/apps/:id/chat        -> ChatHistoryResponse
+// GET    /api/apps/:id/logs?n=     -> text/plain, appens senaste loggrader (n 1–2000, standard 400)
 // POST   /api/stt                  ljud i kroppen (audio/webm, audio/mp4) -> SttResponse
 
 /** Det ritade fönstret: x, y i världskoordinater, w, h = appens layoutstorlek i hela CSS-px, scale = förstoring. */
@@ -216,7 +219,8 @@ export type BridgeFromApp =
     }
   | { wb: 1; type: 'key'; code: 'KeyK' | 'Digit0' | 'ArrowLeft' | 'ArrowRight' | 'Escape'; meta: boolean; ctrl: boolean; alt: boolean; shift: boolean }
   | { wb: 1; type: 'focus' }
-  | { wb: 1; type: 'face'; show: string }; // appen ber skalet vrida fram sidan med detta id
+  | { wb: 1; type: 'face'; show: string } // appen ber skalet vrida fram sidan med detta id
+  | { wb: 1; type: 'badge'; text: string | null }; // appens märke bredvid pricken (§10.5), högst 3 kodpunkter; null tar bort det
 
 /** Från skalet till appen. */
 export type BridgeToApp =

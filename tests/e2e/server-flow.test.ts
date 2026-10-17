@@ -1,10 +1,11 @@
 // tests/e2e/server-flow.test.ts — hela servern (CONTRACT §7–§9) mot låtsas-Claude, i en riktig process.
-// Startar `node server/main.ts` med WORKBENCH_FAKE_CLAUDE=1, WORKBENCH_FAKE_SPEED=4, egna portar (8270/8279)
+// Startar `node server/main.ts` med WORKBENCH_FAKE_CLAUDE=1, WORKBENCH_FAKE_SPEED=4, lediga portar (eller WB_E2E_PORT)
 // och en tillfällig WORKBENCH_HOME under .scratch. Flödet (en ordnad kedja): snapshot → skapa app →
 // chat.open/send → händelseström och turslut → commit och rev → appens origin serverar den byggda sidan med
 // wb.js först → store fram och tillbaka → backend-appen via proxyn → "fråga" (behörighet) → "hemlig"
 // (secret, värdet bara i data/secrets.json) → ångra → ta bort (papperskorg + 421). Till sist en skärmbild
 // genom shots.ts mot den levande origin (riktig Chrome): viewport-avrundning och avbruten främmande navigering.
+// Saknas Chrome hoppas testerna som behöver den över.
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
@@ -19,16 +20,18 @@ import { promisify } from 'node:util';
 import { WebSocket } from 'ws';
 import { chromium } from 'playwright-core';
 import type { Browser } from 'playwright-core';
+import { sample } from '../../server/claude/samples.ts';
 import { createShots } from '../../server/claude/shots.ts';
-import { tryApp } from '../../server/claude/tools.ts';
+import { callBackend, tryApp } from '../../server/claude/tools.ts';
 import type { ToolDeps } from '../../server/claude/tools.ts';
 import type { AppInfo, ChatEvent, Scene, ServerMsg, WindowState } from '../../shared/protocol.ts';
 import type { AppRegistry, SceneStore, Shots } from '../../server/types.ts';
+import { testPort } from '../ports.ts';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-// Andra portar med WB_E2E_PORT (HMR = porten + 9), så att flera körningar inte krockar.
-const PORT = Number(process.env.WB_E2E_PORT) || 8270;
-const HMR = PORT + 9;
+// Lediga portar (tests/ports.ts), så att flera körningar inte krockar; WB_E2E_PORT väljer en (HMR = porten + 9).
+const PORT = await testPort('WB_E2E_PORT');
+const HMR = process.env.WB_E2E_PORT ? PORT + 9 : await testPort();
 const SHELL = `http://localhost:${PORT}`;
 // Tillfälliga hem och felloggar: WB_E2E_DIR, annars .scratch/integrator.
 const SCRATCH = process.env.WB_E2E_DIR ? path.resolve(process.env.WB_E2E_DIR) : path.join(ROOT, '.scratch', 'integrator');
@@ -158,9 +161,30 @@ async function gitCommits(home: string, id: string): Promise<string[]> {
   return stdout.split('\n').filter(Boolean);
 }
 
+/** Ett annat git-anrop i appens externa git-katalog (trimmad utdata). */
+async function gitOut(home: string, id: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileP(
+    'git',
+    ['-c', 'core.hooksPath=/dev/null', `--git-dir=${path.join(home, 'data', 'apps', id, 'git')}`, `--work-tree=${path.join(home, 'apps', id)}`, ...args],
+    { cwd: path.join(home, 'apps', id), env: { PATH: process.env.PATH ?? '', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8' },
+  );
+  return stdout.trim();
+}
+
 let server: ChildProcess | null = null;
 let home = '';
+
+// Saknas Chrome hoppas testerna som behöver den över (som tests/e2e/shell-flow.test.ts). Alla andra fel vid start
+// får testet att falla.
 let browser: Browser | null = null;
+let noChrome: string | false = false;
+try {
+  browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--force-device-scale-factor=2'] });
+} catch (err) {
+  const msg = String((err as Error)?.message ?? err);
+  if (/distribution 'chrome' is not (found|supported)|doesn't exist|ENOENT/i.test(msg)) noChrome = 'Chrome saknas';
+  else throw err;
+}
 
 async function startServer(): Promise<void> {
   fs.mkdirSync(SCRATCH, { recursive: true });
@@ -239,7 +263,7 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
       fs.writeFileSync(path.join(SCRATCH, 'before-err.txt'), `${String((err as Error).stack ?? err)}\n--- server.log ---\n${log}`);
       throw err;
     }
-  });
+  }, { timeout: 60_000 });
 
   after(async () => {
     c?.close();
@@ -258,7 +282,7 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
       }
     }
     if (home) fs.rmSync(home, { recursive: true, force: true });
-  });
+  }, { timeout: 30_000 });
 
   test('snapshot via hello', () => {
     const snap = c.msgs.find((m): m is Extract<ServerMsg, { t: 'snapshot' }> => m.t === 'snapshot');
@@ -338,6 +362,10 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
     const id = await build(c, 'Bygg en app med backend', { x: 800, y: 0, w: 480, h: 360, scale: 1 });
     const end = await c.turnEnd(id);
     assert.equal(end.ok, true);
+    // Turslutet sänds efter §8.6 steg 3 (backendens omstart), så en GET direkt efter det når den nya backenden.
+    // Förut kom turslutet före commiten och manifestet, och samma GET gav 503.
+    const first = await req({ path: '/api/tid', host: appHost(id), headers: sameOrigin(appOriginOf(id)) });
+    assert.equal(first.status, 200, `GET /api/tid direkt efter turslutet: ${first.status} ${first.text}`);
     await c.waitFor(async () => (await snapshotApp(id))?.backend === 'running', 20_000, 'backend running');
     const r = await req({ path: '/api/tid', host: appHost(id), headers: sameOrigin(appOriginOf(id)) });
     assert.equal(r.status, 200, `GET /api/tid: ${r.status} ${r.text}`);
@@ -393,11 +421,30 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
     const commitsBefore = await gitCommits(home, id);
     const r = await req({ method: 'POST', path: `/api/apps/${id}/undo`, headers: sameOrigin(SHELL) });
     assert.equal(r.status, 200);
-    assert.deepEqual(JSON.parse(r.text), { ok: true });
+    assert.deepEqual(JSON.parse(r.text), { ok: true, canRedo: true });
     await c.waitFor(() => c.chat(id).some((e) => e.k === 'note' && /Ångrade/.test((e as { text: string }).text)), 10_000, 'ångra-note');
     await c.waitFor(async () => ((await snapshotApp(id))?.rev ?? 0) > before, 10_000, 'rev efter ångra');
     const commitsAfter = await gitCommits(home, id);
     assert.equal(commitsAfter.length, commitsBefore.length - 1, 'en commit ångrades');
+  });
+
+  test('gör om: note, den ångrade commiten tillbaka byte för byte med backenden, rev bumpad; sedan 409', async () => {
+    const id = (c as unknown as { backendId: string }).backendId;
+    const target = await gitOut(home, id, 'rev-parse', 'refs/wb/redo');
+    assert.notEqual(await gitOut(home, id, 'rev-parse', 'HEAD'), target, 'kalibrering: ångra flyttade HEAD från commiten');
+    const before = (await snapshotApp(id))!.rev;
+    const r = await req({ method: 'POST', path: `/api/apps/${id}/redo`, headers: sameOrigin(SHELL) });
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(JSON.parse(r.text), { ok: true, canRedo: false });
+    await c.waitFor(() => c.chat(id).some((e) => e.k === 'note' && (e as { text: string }).text === 'Gjorde om ändringen.'), 10_000, 'gör om-note');
+    await c.waitFor(async () => ((await snapshotApp(id))?.rev ?? 0) > before, 10_000, 'rev efter gör om');
+    assert.equal(await gitOut(home, id, 'rev-parse', 'HEAD'), target, 'HEAD är den ångrade commiten igen');
+    assert.equal(await gitOut(home, id, 'status', '--porcelain', '--untracked-files=no'), '', 'arbetsträdet är commiten byte för byte');
+    // Samma steg som ångra: backenden startas om, nu med manifestets backend tillbaka.
+    const tid = await req({ path: '/api/tid', host: appHost(id), headers: sameOrigin(appOriginOf(id)) });
+    assert.equal(tid.status, 200, `GET /api/tid efter gör om: ${tid.status} ${tid.text}`);
+    const again = await req({ method: 'POST', path: `/api/apps/${id}/redo`, headers: sameOrigin(SHELL) });
+    assert.equal(again.status, 409, 'inget mer att göra om');
   });
 
   test('ta bort: papperskorg med rätt layout, och appens origin ger 421', async () => {
@@ -422,7 +469,7 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
     assert.equal(page.status, 421);
   });
 
-  test('skärmbild genom shots.ts mot den levande origin: viewport-avrundning och avbruten främmande navigering', async () => {
+  test('skärmbild genom shots.ts mot den levande origin: viewport-avrundning och avbruten främmande navigering', { skip: noChrome }, async () => {
     // Egen app med en udda storlek; shots använder round(w)×round(h) och deviceScaleFactor 1.
     const { app, win } = await createApp({ x: 1400, y: 0, w: 517, h: 383, scale: 1 });
     // Fakeservern bygger den inte (inget chat.send): skriv en enkel sida direkt och en som navigerar bort.
@@ -455,8 +502,7 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
         `<!doctype html><html lang="sv"><head><meta charset="utf-8"><title>Nav</title></head><body style="margin:0;background:#0a0"><script>location.href=${JSON.stringify(SHELL + '/')}</script></body></html>`,
       );
       // Kalibrering: utan shots route-avbrott navigerar en vanlig Chrome bort till skalet.
-      browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--force-device-scale-factor=2'] });
-      const page = await browser.newPage();
+      const page = await browser!.newPage();
       await page.goto(`${appOriginOf(app.id)}/`, { waitUntil: 'load' }).catch(() => {});
       await page.waitForTimeout(600);
       assert.equal(new URL(page.url()).origin, SHELL, 'kalibrering: sidan ska verkligen navigera bort utan avbrottet');
@@ -470,7 +516,7 @@ describe('server-flow (låtsas-Claude, riktig process)', { timeout: 180_000 }, (
   });
 
   // try_app (K8): isoleringen, kalibrerad mot en körning utan isolering.
-  test('try_app: skrivningar når aldrig den riktiga store eller backendens skrivande routes; utan isolering gör de det (kalibrering)', async () => {
+  test('try_app: skrivningar når aldrig den riktiga store eller backendens skrivande routes; utan isolering gör de det (kalibrering)', { skip: noChrome }, async () => {
     const { app, win } = await createApp({ x: 2200, y: 0, w: 480, h: 320, scale: 1 });
     const id = app.id;
     const dir = path.join(home, 'apps', id);
@@ -581,7 +627,7 @@ document.getElementById('b').onclick = async () => {
 
   // try_app drag och api, genom verktyget (checkTryInput + tryRun): ett drag går genom alla punkter
   // (kalibrerat mot ett klick), och låtsade GET-svar visas utan att backenden nås (kalibrerat utan api).
-  test('try_app: drag går genom punkterna och api låtsas GET-svar utan att nå backenden; kalibrerat mot klick och körning utan api', async () => {
+  test('try_app: drag går genom punkterna och api låtsas GET-svar utan att nå backenden; kalibrerat mot klick och körning utan api', { skip: noChrome }, async () => {
     const { app, win } = await createApp({ x: 2800, y: 0, w: 480, h: 320, scale: 1 });
     const id = app.id;
     const dir = path.join(home, 'apps', id);
@@ -624,11 +670,11 @@ document.getElementById('post').onclick = async () => { const r = await fetch('/
       await new Promise((res) => setTimeout(res, 300));
     }
     const count = async () => Number((await req({ path: '/api/items-count', host: appHost(id), headers: sameOrigin(own) })).text);
-    const registry = { get: (x: string) => (x === id ? app : undefined), manifest: () => ({ name: 'Ritblock', faces, permissions: [] }) } as unknown as AppRegistry;
+    const registry = { get: (x: string) => (x === id ? app : undefined), manifest: () => ({ name: 'Ritblock', faces, permissions: [] }), refresh: () => {} } as unknown as AppRegistry;
     const scene = { window: (x: string) => (x === id ? win : undefined) } as unknown as SceneStore;
     const shots = createShots({ config: { port: PORT } as never, registry, scene, logs: { append: () => {} } as never });
-    // tryApp använder bara appId och shots.
-    const d = { appId: id, shots } as unknown as ToolDeps;
+    // tryApp använder bara appId, registret (refresh först) och shots.
+    const d = { appId: id, registry, shots } as unknown as ToolDeps;
     const run = async (input: Parameters<typeof tryApp>[1]) => {
       const r = await tryApp(d, input);
       return { text: r.content.filter((x) => x.type === 'text').map((x) => (x as { text: string }).text).join('\n'), isError: r.isError === true };
@@ -695,6 +741,7 @@ document.getElementById('post').onclick = async () => { const r = await fetch('/
       // Lokala värdar avbryts i alla stavningar som Chrome når (§8.7): avslutande punkt, IPv4-mappad och
       // ospecificerad IPv6. Kalibrerat: med den gamla isLocalHost nådde alla tre lyssnaren.
       const seen: string[] = [];
+      const local = await testPort();
       const listeners = await Promise.all(
         ['127.0.0.1', '::1'].map(
           (host) =>
@@ -704,12 +751,12 @@ document.getElementById('post').onclick = async () => { const r = await fetch('/
                 s.end('x');
               });
               srv.once('error', rej);
-              srv.listen(PORT + 2, host, () => res(srv));
+              srv.listen(local, host, () => res(srv));
             }),
         ),
       );
       try {
-        const urls = [`http://localhost.:${PORT + 2}/punkt`, `http://[::ffff:127.0.0.1]:${PORT + 2}/mappad`, `http://[::]:${PORT + 2}/ospecificerad`];
+        const urls = [`http://localhost.:${local}/punkt`, `http://[::ffff:127.0.0.1]:${local}/mappad`, `http://[::]:${local}/ospecificerad`];
         fs.writeFileSync(
           path.join(dir, 'index.html'),
           `<!doctype html><p id="o"></p><script>Promise.allSettled(${JSON.stringify(urls)}.map((u) => fetch(u, { mode: 'no-cors' }))).then((r) => { document.getElementById('o').textContent = 'klart ' + r.map((x) => x.status).join(','); });</script>`,
@@ -720,6 +767,114 @@ document.getElementById('post').onclick = async () => { const r = await fetch('/
       } finally {
         for (const srv of listeners) srv.close();
       }
+    } finally {
+      await shots.close();
+    }
+  });
+
+  // Granskningen 17 oktober: try_app kunde inte ladda upp en fil eller låtsas kamera, call_backend tog bara text, och
+  // wb.onOpen gick inte att prova. Mot den riktiga servern: filväljaren och uppladdningen som stoppas, kameran med och
+  // utan behörighet (kalibrering: NotAllowedError), open genom ramen (vakten och frame-ancestors), och backendsidan
+  // med call_backend body_base64 och sedan GET.
+  test('try_app: upload, låtsad kamera och open, och call_backend med body_base64; kalibrerat utan behörighet och utan steg', { skip: noChrome }, async () => {
+    const { app, win } = await createApp({ x: 3400, y: 0, w: 480, h: 320, scale: 1 });
+    const id = app.id;
+    const dir = path.join(home, 'apps', id);
+    await new Promise((res) => setTimeout(res, 1500));
+    const faces = [{ id: 'main', page: 'index.html' }];
+    const manifest = { name: 'Frilägg', faces, backend: { entry: 'server.mjs' }, permissions: [] as string[], opens: ['url'] };
+    fs.writeFileSync(path.join(dir, 'app.json'), JSON.stringify(manifest));
+    fs.writeFileSync(
+      path.join(dir, 'server.mjs'),
+      `import fs from 'node:fs'; import http from 'node:http'; import path from 'node:path';
+const f = path.join(process.env.DATA_DIR, 'items.json');
+const list = () => (fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : []);
+http.createServer((q, s) => {
+  const u = new URL(q.url, 'http://x');
+  if (u.pathname === '/api/port') { s.end(String(process.env.PORT)); return; }
+  if (u.pathname === '/api/items' && q.method === 'POST') {
+    const chunks = []; q.on('data', (c) => chunks.push(c));
+    q.on('end', () => { const b = Buffer.concat(chunks); fs.writeFileSync(f, JSON.stringify([...list(), { name: u.searchParams.get('name'), type: q.headers['content-type'], size: b.length, png: b.subarray(1, 4).toString() === 'PNG' }])); s.end('ok'); });
+    return;
+  }
+  if (u.pathname === '/api/items') { s.setHeader('content-type', 'application/json'); s.end(JSON.stringify(list())); return; }
+  s.statusCode = 404; s.end();
+}).listen(Number(process.env.PORT), '127.0.0.1');`,
+    );
+    fs.writeFileSync(
+      path.join(dir, 'index.html'),
+      `<!doctype html><html lang="sv"><head><meta charset="utf-8"><title>Frilägg</title>
+<style>body{margin:0;font:13px var(--wb-font)} #mono{font-family:monospace} #prov{font-family:var(--wb-ingen)}</style></head><body>
+<input type="file" id="fil" hidden><button id="kamera">Kamera</button>
+<p id="ut">ingen fil</p><p id="media">ingen kamera</p><p id="oppnat">ingen öppning</p><p id="typsnitt"></p><div id="mono"><span id="prov"></span></div>
+<script>
+const $ = (id) => document.getElementById(id);
+$('typsnitt').textContent = 'typsnitt ' + getComputedStyle(document.body).fontFamily + ' / prov ' + getComputedStyle($('prov')).fontFamily;
+$('fil').addEventListener('change', async () => {
+  const f = $('fil').files[0];
+  $('ut').textContent = 'vald ' + f.name + ' ' + f.size + ' ' + f.type;
+  await fetch('/api/items?name=' + encodeURIComponent(f.name), { method: 'POST', headers: { 'content-type': f.type }, body: f }).catch(() => {});
+});
+$('kamera').onclick = async () => {
+  try { const t = (await navigator.mediaDevices.getUserMedia({ video: true })).getVideoTracks()[0]; $('media').textContent = 'spår ' + t.label; }
+  catch (e) { $('media').textContent = 'fel ' + e.name; }
+};
+wb.onOpen((item) => { $('oppnat').textContent = 'öppnad ' + item.url; });
+</script></body></html>`,
+    );
+    const own = appOriginOf(id);
+    let port = 0;
+    const t0 = Date.now();
+    for (;;) {
+      const r = await req({ path: '/api/port', host: appHost(id), headers: sameOrigin(own) });
+      if (r.status === 200) {
+        port = Number(r.text);
+        break;
+      }
+      if (Date.now() - t0 > 15000) throw new Error(`backenden startade inte: ${r.status} ${r.text}`);
+      await new Promise((res) => setTimeout(res, 300));
+    }
+    const registry = {
+      get: (x: string) => (x === id ? app : undefined),
+      manifest: () => ({ ...manifest, permissions: [...manifest.permissions] }),
+      refresh: () => {},
+    } as unknown as AppRegistry;
+    const scene = { window: (x: string) => (x === id ? win : undefined) } as unknown as SceneStore;
+    const shots = createShots({ config: { port: PORT } as never, registry, scene, logs: { append: () => {} } as never });
+    const d = { appId: id, registry, shots, logs: { tail: () => [] }, backends: { ensure: async () => port } } as unknown as ToolDeps;
+    const run = async (input: Parameters<typeof tryApp>[1]) => {
+      const r = await tryApp(d, input);
+      return r.content.filter((x) => x.type === 'text').map((x) => (x as { text: string }).text).join('\n');
+    };
+    try {
+      // Kalibrering: utan steget ingen fil, och utan behörigheten i app.json nekas kameran.
+      const cal = await run({ steps: [{ click: '#kamera' }, { wait: 'text=/spår|fel/' }] });
+      assert.match(cal, /ingen fil/, cal);
+      assert.match(cal, /fel NotAllowedError/, cal);
+      assert.doesNotMatch(cal, /Fake media/);
+      // --wb-font når appens sidor (wb.js sätter den, §11), så reglernas font: 13px var(--wb-font) gäller; kalibrerat mot
+      // en odefinierad variabel, som ärver monospace. (Chrome skriver BlinkMacSystemFont som "system-ui".)
+      assert.match(cal, /typsnitt -apple-system, [^/]*"SF Pro Text", "Segoe UI", sans-serif \/ prov monospace/, cal);
+      manifest.permissions = ['camera'];
+      const up = await run({ steps: [{ upload: '#fil', sample: 'png' }, { wait: 'text=/vald/' }, { click: '#kamera' }, { wait: 'text=/spår|fel/' }] });
+      assert.match(up, /^Fake media: camera: fake device granted\./m, up);
+      assert.match(up, /ok {3}1 upload "#fil" sample\.png \(image\/png, \d+ bytes\)/, up);
+      assert.match(up, /vald sample\.png \d+ image\/png/, up);
+      assert.match(up, /spår \S+/, up);
+      assert.match(up, /Blocked requests:\nPOST \/api\/items/, up);
+      // Uppladdningen nådde aldrig backenden; backendsidan provas med call_backend och body_base64, sedan GET.
+      assert.equal((await callBackend(d, { method: 'GET', path: '/api/items' })).content.map((x) => (x as { text: string }).text).join(''), 'HTTP 200\ncontent-type: application/json\n\n[]');
+      const png = sample('png').buffer;
+      const posted = await callBackend(d, { method: 'POST', path: '/api/items?name=prov.png', body_base64: png.toString('base64'), headers: { 'content-type': 'image/png' } });
+      assert.match(JSON.stringify(posted.content), /HTTP 200/);
+      const after = (await callBackend(d, { method: 'GET', path: '/api/items' })).content.map((x) => (x as { text: string }).text).join('');
+      assert.equal(after, `HTTP 200\ncontent-type: application/json\n\n[{"name":"prov.png","type":"image/png","size":${png.length},"png":true}]`);
+      // open genom ramen: appens sida laddas i en iframe under skalets origin genom den riktiga vakten och CSP:n, och
+      // kameran fungerar där också (iframen saknar src, och Chrome prövar en inbäddad ram mot toppsidan, §8.8).
+      const opened = await run({ steps: [{ open: { kind: 'url', url: 'dn.se' } }, { wait: 'text=/öppnad/' }, { click: '#kamera' }, { wait: 'text=/spår|fel/' }] });
+      assert.match(opened, /ok {3}1 open url "https:\/\/dn\.se\/"/, opened);
+      assert.match(opened, /öppnad https:\/\/dn\.se\//, opened);
+      assert.match(opened, /spår \S+/, opened);
     } finally {
       await shots.close();
     }

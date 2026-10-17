@@ -1,8 +1,8 @@
 // server/main.ts — kopplar ihop servern (CONTRACT §7), i ordningen
 //   config → paths → hub → scene → git → registry → logs → backends → shots → sessions → watcher → http.
 // Startstegen (läs scenen, registrera apps/, ta bort fönster utan app, status idle och rev = Date.now(),
-// laga chat.jsonl) sker i fabrikerna. Vid SIGINT/SIGTERM: sessions.closeAll → backends.stopAll →
-// shots.close → scene.flush och logs.flush → avsluta.
+// laga chat.jsonl) sker i fabrikerna. Vid SIGINT/SIGTERM: väntar ut pågående turer (shutdown.ts) → sessions.closeAll →
+// backends.stopAll → shots.close → scene.flush och logs.flush → avsluta.
 import type http from 'node:http';
 import type { ViteDevServer } from 'vite';
 import { loadConfig } from './config.ts';
@@ -12,16 +12,18 @@ import { createSceneStore } from './store/scene.ts';
 import { createAppGit } from './live/git.ts';
 import { createRegistry } from './store/registry.ts';
 import { createAppLogs } from './store/logs.ts';
-import { createBackends } from './backends/supervisor.ts';
+import { backendIdleMs, createBackends } from './backends/supervisor.ts';
 import { proxyHttp, proxyUpgrade } from './backends/proxy.ts';
 import { createShots } from './claude/shots.ts';
 import { createSessions } from './claude/sessions.ts';
+import { sandboxAvailable } from './claude/options.ts';
 import { watchApps } from './live/watcher.ts';
-import { transcribe } from './stt.ts';
+import { ffmpegOnPath, sttOrder, transcribe } from './stt.ts';
 import { createShellVite } from './http/vite.ts';
 import { createRouter, listenBoth } from './http/router.ts';
 import { createIdeas } from './claude/ideas.ts';
 import { createRoute } from './claude/route.ts';
+import { createSignalHandler } from './shutdown.ts';
 import type { Router } from './http/router.ts';
 
 let stopping = false;
@@ -36,7 +38,11 @@ const scene = createSceneStore(paths);
 const git = createAppGit(paths);
 const registry = createRegistry({ paths, scene, hub, git });
 const logs = createAppLogs(paths);
-const backends = createBackends({ config, paths, registry, logs });
+// En backend som getts upp blir en not i appens HUD (§9); sessions finns innan någon backend startar.
+const backends = createBackends(
+  { config, paths, registry, logs },
+  { idleMs: backendIdleMs(process.env.WORKBENCH_BACKEND_IDLE_MS), onCrashed: (appId, text) => sessions.note(appId, text) },
+);
 const shots = createShots({ config, registry, scene, logs });
 const sessions = createSessions({ config, paths, registry, scene, hub, backends, logs, shots, git });
 const stopWatching = watchApps({ paths, registry, sessions });
@@ -73,11 +79,18 @@ async function shutdown(code = 0): Promise<never> {
   process.exit(code);
 }
 
+// Första signalen väntar ut pågående turer (§7, shutdown.ts); 15 s-gränsen i shutdown() börjar först efter den.
+const onSignal = createSignalHandler({
+  busy: () => registry.list().filter((a) => sessions.busy(a.id)).length,
+  drain: () => sessions.drain(),
+  shutdown: () => void shutdown(0),
+  fake: config.fakeClaude,
+  log: (line) => console.log(line),
+});
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
-    if (stopping) process.exit(1); // en andra signal avslutar direkt
-    console.log(`[workbench] ${signal}: stänger`);
-    void shutdown(0);
+    if (stopping) process.exit(1); // en signal under avslutet avslutar direkt
+    onSignal(signal);
   });
 }
 
@@ -108,3 +121,10 @@ console.log(
     (config.fakeClaude ? ' med låtsas-Claude' : '') +
     ` · hem ${config.home}`,
 );
+// Det som annars märks först när en app startar en backend eller när någon talar (§7).
+if (config.sandbox && !sandboxAvailable()) {
+  console.warn('[workbench] /usr/bin/sandbox-exec saknas: backends och Claudes Bash körs utan sandlåda');
+}
+if (sttOrder(config.stt).includes('whisper') && !ffmpegOnPath()) {
+  console.warn('[workbench] ffmpeg saknas i PATH: tal till text kan inte gå via Whisper');
+}

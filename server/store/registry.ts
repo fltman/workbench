@@ -1,4 +1,5 @@
-// server/store/registry.ts — alla appar: mappar under apps/, manifest, status och rev (CONTRACT §6, §7, §4.6).
+// server/store/registry.ts — alla appar: mappar under apps/, manifest, status och rev (CONTRACT §6, §7, §4.6), och
+// felsignalen trouble för ett fel efter turen (§7.2).
 //
 // Vid start registreras varje katalog under apps/ vars namn matchar APP_ID_RE (aldrig symboliska länkar), fönster
 // vars app saknas tas bort, och alla appar får status 'idle' och rev = Date.now(). En app utan fönster (t.ex. om
@@ -36,6 +37,15 @@ const MAX_NAME = 64;
 const MAX_LABEL = 40;
 const ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 const FALLBACK_WINDOW = { w: 640, h: 480, scale: 1, gap: 80 } as const;
+/** Felsignalen (§7.2): AppInfo.trouble är första felets första rad, högst så många kodpunkter. */
+const TROUBLE_MAX = 120;
+/** Felraderna som sparas åt förslagen (§8.12): högst så många, och högst så långa. */
+const TROUBLE_LINES = 5;
+const TROUBLE_LINE_MAX = 300;
+/** Ett ohanterat fel i en sida: wb.js skriver "Uncaught …" för window.onerror och avvisade löften, handleLog "error: " före. */
+const CONSOLE_TROUBLE = /^error: (Uncaught\b.*)/;
+/** En felrad på backendens stderr börjar med ett felnamn: "Error: …", "TypeError [ERR_X]: …", "[UnhandledPromiseRejection: …". */
+const STDERR_TROUBLE = /^\s*\[?(?:Uncaught\s+)?(?:[A-Z][A-Za-z]*)?(?:Error|Exception|Rejection)\b/;
 
 /** Frön som create() skriver (§6). /data/ är förankrad, så att t.ex. src/data/ versioneras och kan ångras. */
 export const SEED_GITIGNORE = '/data/\nnode_modules/\n.DS_Store\n';
@@ -47,11 +57,34 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** Styrtecken och riktningsstyrande tecken blir mellanslag, blanktecken slås ihop, högst max kodpunkter. */
+/**
+ * Styrtecken och formattecken (Unicode Cc och Cf: riktningstecknen, också U+061C, och tecken med noll bredd) blir
+ * mellanslag, blanktecken slås ihop, högst max kodpunkter.
+ */
 function cleanText(v: unknown, max: number): string {
   if (typeof v !== 'string') return '';
-  const s = v.replace(/[\p{Cc}\u{200e}\u{200f}\u{202a}-\u{202e}\u{2066}-\u{2069}]/gu, ' ').replace(/\s+/gu, ' ').trim();
+  const s = v.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/gu, ' ').trim();
   return Array.from(s).slice(0, max).join('').trim();
+}
+
+/**
+ * Felsignalen (§7.2): texten för en loggrad som är ett fel efter turen, annars null. Från en sida räknas bara ett
+ * ohanterat fel, inte ett vanligt console.error (en pollande app skulle annars aldrig bli av med signalen), och från
+ * backendens stderr bara en rad som börjar med ett felnamn (inte Nodes varningar eller platsraderna i en krasch).
+ * Supervisorn minns den sista sådana raden och lämnar den bara när backenden kraschat (§9), eftersom ett hanterat fel
+ * som loggas med console.error ser likadant ut. Bara första raden, utan kontroll- och formattecken, högst
+ * TROUBLE_LINE_MAX kodpunkter.
+ */
+export function troubleLine(source: 'console' | 'stderr', line: string): string | null {
+  if (typeof line !== 'string') return null;
+  let first: string;
+  if (source === 'console') {
+    const m = CONSOLE_TROUBLE.exec(line);
+    if (!m) return null;
+    first = m[1].split(' ⏎ ')[0]; // handleLog gör radbrytningar till ⏎
+  } else if (source === 'stderr' && STDERR_TROUBLE.test(line)) first = line;
+  else return null;
+  return cleanText(first, TROUBLE_LINE_MAX) || null;
 }
 
 /* ------------------------------ sökvägar (§4.6) ------------------------------ */
@@ -213,6 +246,8 @@ interface Entry {
   manifest: NormalizedManifest;
   problem?: string;
   removing?: Promise<void>;
+  /** Felraderna sedan senaste turslut eller version (§7.2); info.trouble kommer från den första. */
+  troubles?: string[];
 }
 
 interface Inspection {
@@ -276,6 +311,12 @@ export function createRegistry(deps: { paths: Paths; scene: SceneStore; hub: Hub
   function active(appId: string): Entry | undefined {
     const e = apps.get(appId);
     return e && !e.removing ? e : undefined;
+  }
+
+  /** Felsignalen gäller bara tiden sedan senaste turslut och version (§7.2). */
+  function clearTrouble(e: Entry): void {
+    e.troubles = undefined;
+    delete e.info.trouble;
   }
 
   function inspect(appId: string): Inspection {
@@ -464,6 +505,8 @@ export function createRegistry(deps: { paths: Paths; scene: SceneStore; hub: Hub
     setStatus(appId, status) {
       const e = active(appId);
       if (!e || !STATUSES.includes(status) || e.info.status === status) return;
+      // Turen är slut (även utan ny version, till exempel när Claude Code inte kunde starta).
+      if ((e.info.status === 'building' || e.info.status === 'waiting') && (status === 'idle' || status === 'error')) clearTrouble(e);
       e.info.status = status;
       publish(e);
     },
@@ -479,6 +522,7 @@ export function createRegistry(deps: { paths: Paths; scene: SceneStore; hub: Hub
       const e = active(appId);
       if (!e) return;
       e.info.rev = Math.max(Date.now(), e.info.rev + 1);
+      clearTrouble(e);
       publish(e);
     },
 
@@ -486,6 +530,27 @@ export function createRegistry(deps: { paths: Paths; scene: SceneStore; hub: Hub
       const e = active(appId);
       if (!e) return;
       if (apply(e, inspect(appId))) publish(e);
+    },
+
+    noteLog(appId, source, line, rev) {
+      const e = active(appId);
+      if (!e || !e.info.built || e.info.status !== 'idle') return;
+      // En sida med en äldre version (den gamla iframen under bytet, Claudes skärmbildssida) satte annars tillbaka
+      // felet som just rättats.
+      if (source === 'console' && rev !== e.info.rev) return;
+      const t = troubleLine(source, line);
+      if (!t) return;
+      const list = (e.troubles ??= []);
+      if (list.length >= TROUBLE_LINES || list.includes(t)) return;
+      list.push(t);
+      if (e.info.trouble !== undefined) return; // sänds en gång per tur
+      const cps = Array.from(t);
+      e.info.trouble = cps.length > TROUBLE_MAX ? `${cps.slice(0, TROUBLE_MAX - 1).join('')}…` : t;
+      publish(e);
+    },
+
+    troubles(appId) {
+      return [...(apps.get(appId)?.troubles ?? [])];
     },
   };
 }

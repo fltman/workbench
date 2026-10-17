@@ -28,14 +28,14 @@ describe('/__wb/store', () => {
     s = await startRouter({ home: path.join(root, 'home') });
     s.registry.add(APP, { name: 'Lager', index: '<p>x</p>' });
     appDir = s.paths.appDir(APP);
-  });
+  }, { timeout: 30_000 });
   beforeEach(() => {
     fs.rmSync(path.join(appDir, 'data'), { recursive: true, force: true });
   });
   after(async () => {
-    await s.close();
+    await s?.close();
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   test('tomt från början, sedan set/get/all/delete', async () => {
     let r = await get('/__wb/store');
@@ -213,8 +213,8 @@ describe('/__wb/log, /__wb/wb.js och /__wb/app.json', () => {
   let root: string;
   const host = (): string => `${APP}.localhost:${s.port}`;
   const origin = (): string => `http://${APP}.localhost:${s.port}`;
-  const log = (body: string) =>
-    request(s.port, { method: 'POST', path: '/__wb/log', host: host(), headers: { ...sameOrigin(origin()), 'content-type': 'application/json' }, body });
+  const log = (body: string, extra: Record<string, string> = {}) =>
+    request(s.port, { method: 'POST', path: '/__wb/log', host: host(), headers: { ...sameOrigin(origin()), 'content-type': 'application/json', ...extra }, body });
 
   before(async () => {
     root = tempDir('wbapi');
@@ -223,11 +223,11 @@ describe('/__wb/log, /__wb/wb.js och /__wb/app.json', () => {
     fs.writeFileSync(path.join(root, 'repo', 'sdk', 'wb.js'), '/* wb */ window.wb = {};');
     s = await startRouter({ home: path.join(root, 'home'), root: path.join(root, 'repo') });
     s.registry.add(APP, { name: 'Loggar', faces: [{ id: 'main', page: 'index.html' }, { id: 'baksida', page: 'b.html', label: 'Baksida' }] });
-  });
+  }, { timeout: 30_000 });
   after(async () => {
-    await s.close();
+    await s?.close();
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   test('wb.js: text/javascript; charset=utf-8 och no-store', async () => {
     const r = await request(s.port, { path: '/__wb/wb.js', host: host(), headers: { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors', 'sec-fetch-dest': 'script' } });
@@ -242,11 +242,12 @@ describe('/__wb/log, /__wb/wb.js och /__wb/app.json', () => {
     assert.notEqual(r.text, '/* wb */ window.wb = {};');
   });
 
-  test('app.json: { id, name, faces }', async () => {
+  test('app.json: { id, name, faces }, och appens rev i huvudet x-wb-rev (felsignalen, §7.2)', async () => {
     const r = await request(s.port, { path: '/__wb/app.json', host: host(), headers: sameOrigin() });
     assert.deepEqual(JSON.parse(r.text), {
       id: APP, name: 'Loggar', faces: [{ id: 'main', page: 'index.html' }, { id: 'baksida', page: 'b.html', label: 'Baksida' }],
     });
+    assert.equal(r.headers['x-wb-rev'], String(s.registry.apps.get(APP)?.rev));
   });
 
   test('log: poster läggs i logs med källan console', async () => {
@@ -262,6 +263,28 @@ describe('/__wb/log, /__wb/wb.js och /__wb/app.json', () => {
       { appId: APP, source: 'console', line: 'warn: varning' },
       { appId: APP, source: 'console', line: 'log: hej' },
     ]);
+  });
+
+  test('log: varje godtagen post går också till registry.noteLog med sidans version (x-wb-rev; felsignalen, §7.2)', async () => {
+    s.registry.noted.length = 0;
+    const r = await log(JSON.stringify([
+      { level: 'error', text: 'Uncaught Error: kastat\n    at index.html:3' },
+      { level: 'log', text: 'hej' },
+    ]), { 'x-wb-rev': '1729170000123' });
+    assert.equal(r.status, 204);
+    assert.deepEqual(s.registry.noted, [
+      { appId: APP, source: 'console', line: 'error: Uncaught Error: kastat ⏎     at index.html:3', rev: 1729170000123 },
+      { appId: APP, source: 'console', line: 'log: hej', rev: 1729170000123 },
+    ]);
+    // Utan huvudet, eller med något annat än ett heltal, finns ingen version: registret räknar då inte posten.
+    s.registry.noted.length = 0;
+    for (const bad of [undefined, '', '12a', '-5', '1e3', '99999999999999999']) {
+      assert.equal((await log(JSON.stringify([{ level: 'error', text: 'Uncaught Error: x' }]), bad === undefined ? {} : { 'x-wb-rev': bad })).status, 204);
+    }
+    assert.deepEqual(s.registry.noted.map((n) => n.rev), [undefined, undefined, undefined, undefined, undefined, undefined]);
+    s.registry.noted.length = 0;
+    assert.equal((await log(JSON.stringify([{ level: 'error', text: 5 }]))).status, 400);
+    assert.deepEqual(s.registry.noted, [], 'en ogiltig kropp når inte registret');
   });
 
   test('log: ogiltiga kroppar ger 400', async () => {
@@ -308,8 +331,10 @@ describe('/__wb/log, /__wb/wb.js och /__wb/app.json', () => {
       return res as unknown as ServerResponse;
     };
     // En flod: hinken rymmer 1,5 s av takten (150), sedan fylls den på med 100 poster/s.
+    s.registry.noted.length = 0;
     for (let i = 0; i < 6; i++) await api.handle(fakeReq(batch), fakeRes(), APP, '/__wb/log');
     assert.equal(lines.length, LOG_BURST);
+    assert.equal(s.registry.noted.length, LOG_BURST, 'det som släpps når inte heller registret');
     t += 1000;
     for (let i = 0; i < 6; i++) await api.handle(fakeReq(batch), fakeRes(), APP, '/__wb/log');
     assert.equal(lines.length, LOG_BURST + LOG_RATE_PER_S);

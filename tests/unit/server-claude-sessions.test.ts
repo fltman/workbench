@@ -1,5 +1,5 @@
 // Sessionerna (CONTRACT §8.1–§8.6, §8.10) mot en skriptad SDK-motor: samma meddelandeformer som Claude Code
-// sänder, men utan modell. Riktiga Claude provas separat (se slutrapporten).
+// sänder, men utan modell. Riktiga Claude provas separat (tests/e2e/real-claude.test.ts, WORKBENCH_REAL=1).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import type { Sessions } from '../../server/types.ts';
 import type { ChatEvent } from '../../shared/protocol.ts';
 import { autoReply, makeWorld, readChat, ScriptEngine, sdk, sleep, until } from './server-claude-kit.ts';
 import type { ScriptProc, World } from './server-claude-kit.ts';
+import * as M from '../../web/src/hud/model.ts';
 import type { Config } from '../../server/types.ts';
 
 const ID = 'aapp001';
@@ -33,7 +34,7 @@ function setup(over: Partial<Config> = {}, opts: { gitDelayMs?: number; sandbox?
 afterEach(async () => {
   await s?.closeAll();
   w?.cleanup();
-});
+}, { timeout: 30_000 });
 
 const kinds = (evs: ChatEvent[]) => evs.map((e) => (e.k === 'turn' ? `turn:${e.phase}` : e.k));
 const chat = () => w.hub.chat(ID);
@@ -138,6 +139,36 @@ describe('en tur', () => {
     assert.doesNotMatch(m3, /undid/);
     assert.equal(engine.procs.length, 1, 'samma process');
   });
+
+  test('gör om: note som vid ångra, och blocket säger sanningen netto (§7.4, §8.4)', async () => {
+    setup();
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'ett', 'text');
+    await turnDone(1);
+    s.noteUndo(ID);
+    s.noteRedo(ID);
+    const note = chat().at(-1);
+    assert.deepEqual(note, { ...note, k: 'note', text: 'Gjorde om ändringen.' });
+    assert.ok(readChat(w, ID).some((e) => e.k === 'note' && e.text === 'Gjorde om ändringen.'), 'notisen sparas');
+    s.send(ID, 'två', 'text');
+    await turnDone(2);
+    s.noteUndo(ID);
+    s.noteUndo(ID);
+    s.noteRedo(ID);
+    s.send(ID, 'tre', 'text');
+    await turnDone(3);
+    s.noteRedo(ID); // ett steg som ångrades före förra meddelandet görs om
+    s.send(ID, 'fyra', 'text');
+    await turnDone(4);
+    s.send(ID, 'fem', 'text');
+    await turnDone(5);
+    const [, m2, m3, m4, m5] = proc().received;
+    assert.match(m2, /^Since your last turn: the user undid and then redid your changes; the files are as you left them\.$/m);
+    assert.doesNotMatch(m2, /restored/, 'efter gör om påstår blocket inte att filerna återställts');
+    assert.match(m3, /^Since your last turn: the user undid your last change; files are restored to the previous version\.$/m);
+    assert.match(m4, /^Since your last turn: the user redid a change that had been undone earlier; the files now include it again\.$/m);
+    assert.doesNotMatch(m5, /Since your last turn/, 'raden en gång');
+  });
 });
 
 describe('köade turer', () => {
@@ -174,7 +205,8 @@ describe('köade turer', () => {
     const c = w.rec.calls;
     const idle1 = c.indexOf(`setStatus:${ID}:idle`);
     assert.ok(idle1 > 0 && idle1 < c.indexOf('received:två'), c.join(' | '));
-    assert.deepEqual(kinds(chat()), ['user', 'turn:start', 'text', 'turn:end', 'user', 'turn:start', 'text', 'turn:end']);
+    // Turslutet sänds efter steg 3 (§8.6), så det hållna meddelandets rad står före det.
+    assert.deepEqual(kinds(chat()), ['user', 'turn:start', 'text', 'user', 'turn:end', 'turn:start', 'text', 'turn:end']);
     assert.deepEqual(w.git.commits.map((x) => x.message), ['ett', 'två']);
   });
 
@@ -406,7 +438,7 @@ describe('Bash i sandlådan (§8.5 punkt 2)', () => {
   // Claude Codes egna heuristiker frågar ibland trots sandlådan, till exempel med skälet nedan för JSON i en heredoc.
   // Det gav kortet "Köra ett kommando?" i 3 av 18 riktiga turer. Sandlådan är gränsen, så Workbench godkänner
   // sådana anrop direkt, men bara när policyn har släppt igenom dem och bara när Bash verkligen körs i sandlådan.
-  // Kalibrering (slutrapporten): varje test fälls av en kopia av sessions.ts med raden borttagen eller med en
+  // Kalibrering: varje test fälls av en kopia av sessions.ts med raden borttagen eller med en
   // planterad för bred regel (raden före policyn, utan villkoret sandbox, alla verktyg i sandlådan).
   const HEREDOC = `cat > package.json <<'EOF'\n{"name": "x"}\nEOF`;
   const REASON = 'Contains brace with quote character (expansion obfuscation)';
@@ -552,7 +584,7 @@ describe('Bash i sandlådan (§8.5 punkt 2)', () => {
 
   // 5. Bara verktyget som heter exakt Bash godkänns. Andra skalverktyg (som inte körs genom Bash-sandlådans
   // beslut), gemener och MCP-verktyg med Bash i namnet frågar som förut, även med heuristikernas skäl.
-  // Kalibrering (slutrapporten): fälls av bredare villkor (gemener, startsWith, endsWith, /bash/i, en lista av skalverktyg).
+  // Kalibrering: fälls av bredare villkor (gemener, startsWith, endsWith, /bash/i, en lista av skalverktyg).
   const NEAR: [string, Record<string, unknown>][] = [
     ['bash', { command: 'ls' }],
     ['BashOutput', { bash_id: 'b1' }],
@@ -798,7 +830,37 @@ describe('forget, historik och omstart', () => {
     engine = new ScriptEngine();
     s = createSessionsWith({ config: w.config, paths: w.paths, registry: w.registry, scene: w.scene, hub: w.hub, backends: w.backends, logs: w.logs, shots: w.shots, git: w.git }, engine, { sandbox: true });
     const h = s.history(ID, 10);
-    assert.deepEqual(h.slice(-2).map((e) => (e.k === 'turn' ? `turn:${e.phase}:${e.interrupted}` : `${e.k}:${'decision' in e ? e.decision : ''}`)), ['ask-done:cancelled', 'turn:end:true']);
+    const shown = (e: ChatEvent) => (e.k === 'turn' ? `turn:${e.phase}:${e.interrupted}` : e.k === 'note' ? `note:${e.text}` : `${e.k}:${'decision' in e ? e.decision : ''}`);
+    assert.deepEqual(h.slice(-3).map(shown), ['ask-done:cancelled', 'turn:end:true', 'note:Avbröts']);
+  });
+
+  test('servern stängs under §8.6 steg 1–3: turslutet sparas direkt, så att nästa start inte lagar en färdig tur som avbruten', async () => {
+    const restart = () => {
+      s = createSessionsWith({ config: w.config, paths: w.paths, registry: w.registry, scene: w.scene, hub: w.hub, backends: w.backends, logs: w.logs, shots: w.shots, git: w.git }, engine, { sandbox: true });
+    };
+    const saved = () => readChat(w, ID).map((e) => (e.k === 'turn' ? (e.phase === 'end' ? `turn:end:${e.ok}:${e.interrupted}` : 'turn:start') : e.k === 'note' ? `note:${e.text}` : e.k));
+    setup({}, { gitDelayMs: 300 });
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'ett', 'text');
+    await until(() => w.rec.calls.some((c) => c.startsWith('commit:')));
+    await s.closeAll();
+    restart();
+    assert.deepEqual(saved(), ['user', 'turn:start', 'text', 'turn:end:true:false'], 'en färdig tur, ingen "Avbröts"');
+    await s.closeAll();
+    w.cleanup();
+    // En stoppad tur får "Avbröts" en gång (commitens resultat är okänt, så utan "ändringarna finns kvar").
+    setup({}, { gitDelayMs: 300 });
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => pp.emit(sdk.init('s'), sdk.delta('Jag bygger'));
+      p.onInterrupt = (pp) => pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' }));
+    };
+    s.send(ID, 'en klocka', 'text');
+    await until(() => chat().some((e) => e.k === 'delta'));
+    await s.stop(ID);
+    await until(() => w.rec.calls.some((c) => c.startsWith('commit:')));
+    await s.closeAll();
+    restart();
+    assert.deepEqual(saved(), ['user', 'turn:start', 'text', 'turn:end:false:true', 'note:Avbröts']);
   });
 
   test('historiken för en okänd eller ogiltig app är tom', () => {
@@ -946,7 +1008,8 @@ describe('stopp gäller hela kedjan', () => {
   test('ett nytt meddelande strax efter stoppet körs som vanligt, i en egen kedja', async () => {
     await newAfterStop();
     assert.ok(chat().some((e) => e.k === 'text' && e.text === 'Två klar.'), 'det nya meddelandet kördes inte färdigt');
-    assert.equal(chat().some((e) => e.k === 'note'), false, JSON.stringify(chat().filter((e) => e.k === 'note')));
+    // Bara den stoppade turen får en not (§8.6), det nya meddelandet ingen "Stoppad".
+    assert.deepEqual(chat().filter((e) => e.k === 'note').map((e) => (e as { text: string }).text), ['Avbröts – ändringarna finns kvar']);
     assert.equal(proc().interrupts, 1);
     assert.deepEqual(lastTurnEnd(), { ...lastTurnEnd(), ok: true, interrupted: false });
     assert.deepEqual(w.git.commits.map((c) => c.message), ['en anteckningsapp', 'två']);
@@ -1169,5 +1232,464 @@ describe('taket på fyra processer', () => {
     await sleep(50);
     const live = (id: string) => engine.procs.some((p) => String(p.options.cwd).includes(id) && !p.closed && !p.inputEnded);
     for (const id of ids.slice(0, 3)) assert.ok(live(id), `${id} har öppen HUD och lever`);
+  });
+});
+
+/* ---------- fel som användaren ser blir noter (§8.2) ---------- */
+
+describe('fel som användaren ser blir noter (§8.2)', () => {
+  const notes = () => chat().filter((e): e is Extract<ChatEvent, { k: 'note' }> => e.k === 'note');
+
+  test('en commit som misslyckas: en not efter turslutet om att Ångra nu tar två ändringar, och loggraden som förut', async () => {
+    setup();
+    w.git.commitAll = async (appId, message) => {
+      w.rec.calls.push(`commit:${appId}:${message}`);
+      throw new Error('index.lock finns redan');
+    };
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'Gör en klocka', 'text');
+    await turnDone();
+    const evs = chat();
+    const end = evs.findIndex((e) => e.k === 'turn' && e.phase === 'end');
+    const at = evs.findIndex((e) => e.k === 'note');
+    assert.ok(at > end && end > 0, `noten ska komma efter turslutet: ${kinds(evs).join(' ')}`);
+    assert.equal((evs[at] as { text: string }).text, 'Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.');
+    assert.ok(readChat(w, ID).some((e) => e.k === 'note' && e.text.startsWith('Ändringen kunde inte sparas')), 'noten sparas i chat.jsonl');
+    assert.ok(w.logs.tail(ID).some((l) => l.includes('commit misslyckades: index.lock finns redan')), 'loggraden för Claude finns kvar');
+    assert.equal(status(), 'idle');
+  });
+
+  test('sessionen går inte att återuppta: en not om att Claude börjar om utan minne', async () => {
+    setup();
+    fs.writeFileSync(path.join(w.paths.appDataDir(ID), 'session.json'), JSON.stringify({ sessionId: 'borta' }));
+    engine.failNext = 1;
+    engine.onProc = (p) => autoReply(p, 'ny-session');
+    s.open(ID);
+    await until(() => engine.procs.length === 1, 3000, 'den nya processen');
+    await until(() => notes().length > 0, 3000, 'noten');
+    assert.deepEqual(notes().map((n) => n.text), ['Claude kunde inte fortsätta det tidigare samtalet och börjar om utan minne av det.']);
+    assert.ok(w.logs.tail(ID).some((l) => l.includes('kunde inte återupptas')), 'loggraden finns kvar');
+    assert.ok(readChat(w, ID).some((e) => e.k === 'note'), 'noten sparas');
+  });
+
+  test('självtestet: minnesfiler och främmande MCP-servrar blir noter; saknade verktyg bara varningar', async () => {
+    setup();
+    engine.onProc = (p) => {
+      p.statusReply = [{ name: 'workbench', status: 'connected' }, { name: 'gmail', status: 'connected' }];
+      p.memoryReply = [{ path: '/Users/x/.claude/CLAUDE.md' }, { path: '/Users/x/.claude/projects/y/memory/MEMORY.md' }];
+      p.onMessage = (_t, pp) => pp.emit(sdk.init('s', ['Bash']), sdk.result());
+    };
+    s.open(ID);
+    await until(() => notes().length >= 2, 3000, 'noterna');
+    await sleep(30);
+    assert.deepEqual(notes().map((n) => n.text).sort(), [
+      'Claude fick tillgång till MCP-servrar utanför appen: gmail. Det de når kan hamna i appen.',
+      'Claude läste in minnesfiler utanför appen: /Users/x/.claude/CLAUDE.md, /Users/x/.claude/projects/y/memory/MEMORY.md. Det som står där kan hamna i appen.',
+    ]);
+    // Verktygen som saknas i system/init (bara Bash) är en varning i loggen, ingen not.
+    s.send(ID, 'x', 'text');
+    await turnDone();
+    assert.ok(w.logs.tail(ID).some((l) => l.includes('verktyg saknas i system/init')));
+    assert.equal(notes().length, 2);
+  });
+
+  test('självtestet: samma läcka ger en not en gång, även i nästa process och efter en omstart; en annan läcka ger en ny', async () => {
+    setup({ idleCloseMs: 20 });
+    let files = ['/Users/x/.claude/CLAUDE.md'];
+    engine.onProc = (p) => {
+      p.memoryReply = files.map((f) => ({ path: f }));
+    };
+    // Självtestet loggar varningen och sänder noten i samma steg: när varningen finns är noten avgjord.
+    const tested = (n: number) => until(() => w.logs.tail(ID, 1000).filter((l) => l.includes('självtest: minnesfiler')).length >= n, 3000, `självtest ${n}`);
+    const reopen = async (n: number) => {
+      s.close(ID);
+      await until(() => engine.alive === 0, 3000, 'processen stängd');
+      s.open(ID);
+      await tested(n);
+    };
+    s.open(ID);
+    await tested(1);
+    assert.equal(notes().length, 1);
+    // HUD:en stängs och öppnas igen: en ny process med samma läcka.
+    await reopen(2);
+    assert.equal(notes().length, 1, 'samma not upprepas inte i nästa process');
+    // En omstart av servern: nya sessioner, samma chat.jsonl.
+    await s.closeAll();
+    s = createSessionsWith({ config: w.config, paths: w.paths, registry: w.registry, scene: w.scene, hub: w.hub, backends: w.backends, logs: w.logs, shots: w.shots, git: w.git }, engine, { sandbox: true });
+    s.open(ID);
+    await tested(3);
+    assert.equal(notes().length, 1, 'samma not upprepas inte efter en omstart');
+    // En annan läcka (en fil till) är ny information.
+    files = [...files, '/Users/x/.claude/projects/y/memory/MEMORY.md'];
+    await reopen(4);
+    assert.deepEqual(notes().map((n) => n.text), [
+      'Claude läste in minnesfiler utanför appen: /Users/x/.claude/CLAUDE.md. Det som står där kan hamna i appen.',
+      'Claude läste in minnesfiler utanför appen: /Users/x/.claude/CLAUDE.md, /Users/x/.claude/projects/y/memory/MEMORY.md. Det som står där kan hamna i appen.',
+    ]);
+    assert.equal(w.logs.tail(ID, 1000).filter((l) => l.includes('självtest: minnesfiler')).length, 4, 'varningen loggas varje gång');
+  });
+
+  test('kalibrering: ett rent självtest ger ingen not', async () => {
+    setup();
+    engine.onProc = (p) => autoReply(p);
+    s.open(ID);
+    s.send(ID, 'x', 'text');
+    await turnDone();
+    await sleep(50);
+    assert.deepEqual(notes(), []);
+  });
+});
+
+/* ---------- Stopp lämnar ett spår (§8.3, §8.6) ---------- */
+
+describe('Stopp lämnar ett spår (§8.3, §8.6)', () => {
+  /** En tur som strömmar text och väntar; stopp avbryter den med ett result som Claude Code. */
+  function streaming(deltas: string[], after: (pp: ScriptProc) => void = () => {}): void {
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => {
+        pp.emit(sdk.init('s'), ...deltas.map((d) => sdk.delta(d)));
+        after(pp);
+      };
+      p.onInterrupt = (pp) => pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' }));
+    };
+  }
+
+  test('stopp mitt i strömmen: det delvisa svaret blir en sista text, och en not efter turslutet säger att ändringarna finns kvar', async () => {
+    setup();
+    streaming(['Jag bygger ', 'en klocka']);
+    s.send(ID, 'en klocka', 'text');
+    await until(() => chat().filter((e) => e.k === 'delta').length === 2);
+    await s.stop(ID);
+    await turnDone();
+    assert.deepEqual(kinds(chat()), ['user', 'turn:start', 'delta', 'delta', 'text', 'turn:end', 'note']);
+    const text = chat().find((e) => e.k === 'text') as Extract<ChatEvent, { k: 'text' }>;
+    assert.equal(text.text, 'Jag bygger en klocka');
+    assert.equal((chat().at(-1) as { text: string }).text, 'Avbröts – ändringarna finns kvar');
+    // Båda sparas, så att de står kvar när HUD:en öppnas igen.
+    assert.deepEqual(readChat(w, ID).filter((e) => e.k === 'text' || e.k === 'note').map((e) => (e as { text: string }).text), ['Jag bygger en klocka', 'Avbröts – ändringarna finns kvar']);
+    assert.equal(status(), 'idle');
+  });
+
+  test('inget att committa: noten säger bara Avbröts', async () => {
+    setup();
+    w.git.commitAll = async () => false;
+    streaming(['Jag ']);
+    s.send(ID, 'x', 'text');
+    await until(() => chat().some((e) => e.k === 'delta'));
+    await s.stop(ID);
+    await turnDone();
+    assert.equal((chat().at(-1) as { text: string }).text, 'Avbröts');
+  });
+
+  test('en text som redan kommit efter strömmen sänds inte igen; bara text som strömmat in efter den', async () => {
+    setup();
+    streaming(['Jag börjar.'], (pp) => pp.emit(sdk.text('Jag börjar.'), sdk.delta('Nu skriver ')));
+    s.send(ID, 'x', 'text');
+    await until(() => chat().filter((e) => e.k === 'delta').length === 2);
+    await s.stop(ID);
+    await turnDone();
+    assert.deepEqual(chat().filter((e) => e.k === 'text').map((e) => (e as { text: string }).text), ['Jag börjar.', 'Nu skriver ']);
+  });
+
+  test('stopp med ett köat meddelande: det delvisa svaret hör till den första turen, och den köade turens början visas inte', async () => {
+    setup();
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => {
+        if (pp.received.length === 1) pp.emit(sdk.init('s'), sdk.delta('Jag bygger '), sdk.delta('anteckningar'));
+      };
+      p.onInterrupt = (pp) => {
+        if (pp.interrupts > 1) return;
+        pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming', queued: 1 }));
+        // Den köade turen börjar strömma innan avbrottet når den (som Claude Code mellan turerna).
+        setTimeout(() => pp.emit(sdk.init('s'), sdk.delta('Klockan '), sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' })), 10);
+      };
+    };
+    s.send(ID, 'en anteckningsapp', 'text');
+    await until(() => chat().filter((e) => e.k === 'delta').length === 2);
+    s.send(ID, 'en klocka', 'text');
+    await until(() => proc()?.received.length === 2);
+    await s.stop(ID);
+    await turnDone();
+    await sleep(30);
+    assert.deepEqual(chat().filter((e) => e.k === 'text').map((e) => (e as { text: string }).text), ['Jag bygger anteckningar']);
+    const shown = chat().filter((e) => e.k !== 'delta').map((e) => (e.k === 'turn' ? `turn:${e.phase}` : e.k === 'user' || e.k === 'text' || e.k === 'note' ? `${e.k}:${e.text}` : e.k));
+    assert.deepEqual(shown, [
+      'user:en anteckningsapp', 'turn:start', 'user:en klocka', 'note:Stoppad – ”en klocka” avbröts', 'text:Jag bygger anteckningar', 'turn:end', 'note:Avbröts – ändringarna finns kvar',
+    ]);
+  });
+
+  test('stopp under en köad tur som redan börjat: den får ingen "Stoppad"-not, och dess delvisa svar står kvar', async () => {
+    setup();
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => {
+        if (pp.received.length === 1) pp.emit(sdk.init('s'), sdk.text('Anteckningarna är klara.'), sdk.result({ queued: 1 }), sdk.init('s'), sdk.delta('Jag lägger till '));
+      };
+      p.onInterrupt = (pp) => pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' }));
+    };
+    s.send(ID, 'en anteckningsapp', 'text');
+    s.send(ID, 'och en rubrik', 'text');
+    await until(() => chat().some((e) => e.k === 'delta' && e.text === 'Jag lägger till '));
+    await s.stop(ID);
+    await turnDone();
+    assert.deepEqual(chat().filter((e) => e.k === 'note').map((e) => (e as { text: string }).text), ['Avbröts – ändringarna finns kvar']);
+    assert.deepEqual(chat().filter((e) => e.k === 'text').map((e) => (e as { text: string }).text), ['Anteckningarna är klara.', 'Jag lägger till ']);
+  });
+
+  test('en tur som inte avbröts får ingen extra text och ingen not', async () => {
+    setup();
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'x', 'text');
+    await turnDone();
+    assert.deepEqual(kinds(chat()), ['user', 'turn:start', 'delta', 'text', 'turn:end']);
+  });
+
+  test('noterna för meddelanden som aldrig kördes pekar ut användarens rad (dropped)', async () => {
+    setup();
+    engine.startDelayMs = 80;
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' }));
+    };
+    s.send(ID, 'ett', 'text');
+    s.send(ID, 'två', 'text');
+    await s.stop(ID);
+    await turnDone();
+    const two = chat().find((e) => e.k === 'user' && e.text === 'två') as Extract<ChatEvent, { k: 'user' }>;
+    const note = chat().find((e) => e.k === 'note' && e.text === 'Stoppad – ”två” skickades inte') as Extract<ChatEvent, { k: 'note' }>;
+    assert.ok(two && note, JSON.stringify(chat()));
+    assert.equal(note.dropped, two.id);
+    const saved = readChat(w, ID).find((e) => e.k === 'note' && e.text.startsWith('Stoppad')) as Extract<ChatEvent, { k: 'note' }> | undefined;
+    assert.equal(saved?.dropped, two.id, 'dropped sparas i chat.jsonl');
+    // Noten för själva turen pekar inte ut någon rad: det första meddelandet kördes.
+    assert.equal((chat().find((e) => e.k === 'note' && e.text.startsWith('Avbröts')) as { dropped?: string } | undefined)?.dropped, undefined);
+  });
+
+  test('turslutet sänds först efter backendens omstart (§8.6 steg 3), så att en GET direkt efter turslutet når den nya backenden', async () => {
+    setup();
+    const send = w.hub.broadcast;
+    w.hub.broadcast = (m) => {
+      if (m.t === 'chat' && m.ev.k === 'turn') w.rec.calls.push(`turn:${m.ev.phase}`);
+      send(m);
+    };
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'Lägg till /api/tid', 'text');
+    await turnDone();
+    assert.deepEqual(w.rec.calls, [
+      'turn:start', `setStatus:${ID}:building`, `commit:${ID}:Lägg till /api/tid`, `refresh:${ID}`, `restart:${ID}`, 'turn:end', `bumpRev:${ID}`, `setStatus:${ID}:idle`,
+    ]);
+  });
+
+  test('i HUD:en med serverns ordning står turens not ovanför meddelandet efter Stopp eller under §8.6, och rösten väntar på sin tur (§12, §13)', async () => {
+    const view = () => M.messages(chat()).map((m) => `${m.kind}:${m.text}`);
+    // Stopp, och ett nytt meddelande innan den stoppade turen har slutat.
+    setup();
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => {
+        if (pp.received.length === 1) pp.emit(sdk.init('s'), sdk.delta('Jag bygger '), sdk.delta('en klocka'));
+        else pp.emit(sdk.init('s'), sdk.text('Klart. Väckarklockan finns.'), sdk.result());
+      };
+      p.onInterrupt = (pp) => setTimeout(() => pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' })), 50);
+    };
+    s.send(ID, 'en klocka', 'text');
+    await until(() => chat().filter((e) => e.k === 'delta').length === 2);
+    await s.stop(ID);
+    s.send(ID, 'gör en väckarklocka i stället', 'text');
+    await turnDone(2);
+    assert.deepEqual(view(), [
+      'user:en klocka', 'reply:Jag bygger en klocka', 'note:Avbröts – ändringarna finns kvar', 'user:gör en väckarklocka i stället', 'reply:Klart. Väckarklockan finns.',
+    ]);
+    await s.closeAll();
+    w.cleanup();
+    // Ett köat meddelande vars tur hann börja (ett verktyg, ingen text) när Stopp kom: noten hör till den turen.
+    setup();
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => {
+        if (pp.received.length === 1) {
+          pp.emit(sdk.init('s'), sdk.text('Klart. Anteckningar.'), sdk.result({ queued: 1 }), sdk.init('s'), sdk.toolUse('toolu_q', 'Edit', { file_path: 'index.html' }));
+        }
+      };
+      p.onInterrupt = (pp) => pp.emit(sdk.result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_tools' }));
+    };
+    s.send(ID, 'en anteckningsapp', 'text');
+    s.send(ID, 'och en rubrik', 'text');
+    await until(() => chat().some((e) => e.k === 'tool'));
+    await s.stop(ID);
+    await turnDone();
+    assert.deepEqual(view(), ['user:en anteckningsapp', 'reply:Klart. Anteckningar.', 'user:och en rubrik', 'note:Avbröts – ändringarna finns kvar']);
+    await s.closeAll();
+    w.cleanup();
+    // Ett röstmeddelande under §8.6, och en commit som misslyckas första gången.
+    setup();
+    let commits = 0;
+    w.git.commitAll = async (appId, message) => {
+      w.rec.calls.push(`commit:${appId}:${message}`);
+      await sleep(150);
+      if (++commits === 1) throw new Error('index.lock finns redan');
+      return true;
+    };
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => pp.emit(sdk.init('s'), sdk.text(pp.received.length === 1 ? 'Klart. Klockan går.' : 'Klart. Den är större.'), sdk.result());
+    };
+    s.send(ID, 'en klocka', 'text');
+    await until(() => w.rec.calls.some((c) => c.startsWith('commit:')));
+    s.send(ID, 'gör den större', 'voice');
+    await turnDone(2);
+    assert.deepEqual(view(), [
+      'user:en klocka', 'reply:Klart. Klockan går.', 'note:Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.',
+      'user:gör den större', 'reply:Klart. Den är större.',
+    ]);
+    const ends = chat().flatMap((e, i) => (e.k === 'turn' && e.phase === 'end' ? [i] : []));
+    assert.equal(M.spokenReply(chat().slice(0, ends[0] + 1)), 'wait', 'den första turen svarade inte på röstmeddelandet');
+    assert.deepEqual(M.spokenReply(chat().slice(0, ends[1] + 1)), { via: 'voice', text: 'Klart. Den är större.' });
+  });
+});
+
+/* ---------- gravstenen efter forget (§8.1) ---------- */
+
+describe('gravstenen efter forget (§8.1)', () => {
+  test('forget → open startar ingen process (gravsten, inte borttagen session)', async () => {
+    setup();
+    engine.onProc = (p) => autoReply(p);
+    s.open(ID);
+    await until(() => engine.procs.length === 1);
+    await s.forget(ID);
+    // Ett chat.open (och ett meddelande) mellan forget och registry.remove, som i en DELETE mitt i en öppning.
+    s.open(ID);
+    s.send(ID, 'x', 'text');
+    await sleep(100);
+    assert.equal(engine.startOptions.length, 1, 'ingen ny process startades');
+    assert.equal(engine.alive, 0);
+    s.noteUndo(ID);
+    s.note(ID, 'Backenden har kraschat.');
+    assert.deepEqual(chat(), [], 'inget skrevs');
+  });
+
+  test('forget på en app som aldrig öppnats → open startar ingen process', async () => {
+    setup();
+    await s.forget(ID);
+    s.open(ID);
+    s.send(ID, 'x', 'text');
+    await sleep(100);
+    assert.equal(engine.startOptions.length, 0, 'ingen process startades');
+    assert.deepEqual(chat(), []);
+  });
+});
+
+/* ---------- noter från andra moduler och tömning vid avslut (§8.1, §7) ---------- */
+
+describe('sessions.note och tömningen', () => {
+  test('sessions.note: utanför en tur sänds och sparas noten; under en tur tas den inte med', async () => {
+    setup();
+    s.note(ID, 'Backenden kraschade 4 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.');
+    assert.deepEqual(chat().map((e) => `${e.k}:${(e as { text?: string }).text}`), ['note:Backenden kraschade 4 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.']);
+    assert.equal(readChat(w, ID).length, 1, 'sparas');
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => pp.emit(sdk.init('s'));
+    };
+    s.send(ID, 'x', 'text');
+    await until(() => proc()?.received.length === 1);
+    s.note(ID, 'under turen');
+    assert.equal(chat().some((e) => e.k === 'note' && e.text === 'under turen'), false, 'Claude ser kraschen själv under turen');
+  });
+
+  test('sessions.note under §8.6 (backendens omstart i steg 3) väntar till efter turslutet', async () => {
+    setup({}, { gitDelayMs: 150 });
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'ett', 'text');
+    await until(() => w.rec.calls.some((c) => c.startsWith('commit:')));
+    const text = 'Backenden kan inte startas: backend.entry finns inte: "server.mjs".';
+    s.note(ID, text);
+    assert.equal(chat().some((e) => e.k === 'note'), false, 'inte medan §8.6 pågår');
+    await turnDone();
+    const evs = chat();
+    const end = evs.findIndex((e) => e.k === 'turn' && e.phase === 'end');
+    const at = evs.findIndex((e) => e.k === 'note' && e.text === text);
+    assert.ok(end > 0 && at > end, `noten ska komma efter turslutet: ${kinds(evs).join(' ')}`);
+    assert.ok(readChat(w, ID).some((e) => e.k === 'note' && e.text === text), 'sparas');
+  });
+
+  test('drain: ingen ny tur startar, ett meddelande får en not, och en pågående tur går klart', async () => {
+    setup();
+    w.addApp('aapp002');
+    const release: (() => void)[] = [];
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => {
+        pp.emit(sdk.init('s'));
+        release.push(() => pp.emit(sdk.text('Klart.'), sdk.result()));
+      };
+    };
+    s.send(ID, 'en klocka', 'text');
+    await until(() => release.length === 1);
+    s.drain();
+    assert.equal(s.busy(ID), true);
+    s.send('aapp002', 'en kalender', 'text');
+    s.send(ID, 'och en väckarklocka', 'text');
+    s.open('aapp002');
+    await sleep(60);
+    assert.equal(engine.startOptions.length, 1, 'ingen ny process');
+    assert.equal(proc().received.length, 1, 'inget lades i kön');
+    const noteFor = (appId: string, text: string) => {
+      const u = w.hub.chat(appId).find((e) => e.k === 'user' && e.text === text) as Extract<ChatEvent, { k: 'user' }> | undefined;
+      const n = w.hub.chat(appId).find((e) => e.k === 'note' && e.text === `Servern startar om – ”${text}” skickades inte`) as Extract<ChatEvent, { k: 'note' }> | undefined;
+      return { user: !!u, note: !!n, dropped: !!u && n?.dropped === u.id };
+    };
+    assert.deepEqual(noteFor('aapp002', 'en kalender'), { user: true, note: true, dropped: true });
+    assert.deepEqual(noteFor(ID, 'och en väckarklocka'), { user: true, note: true, dropped: true });
+    assert.equal(s.busy('aapp002'), false);
+    release[0]();
+    await until(() => !s.busy(ID), 3000, 'den pågående turen');
+    assert.deepEqual(lastTurnEnd(), { ...lastTurnEnd(), ok: true });
+    assert.deepEqual(w.git.commits.map((c) => c.message), ['en klocka']);
+  });
+
+  test('drain: meddelanden som hålls under §8.6 körs inte', async () => {
+    setup({}, { gitDelayMs: 150 });
+    engine.onProc = (p) => autoReply(p);
+    s.send(ID, 'ett', 'text');
+    await until(() => w.rec.calls.some((c) => c.startsWith('commit:')));
+    s.send(ID, 'två', 'text');
+    s.drain();
+    await until(() => !s.busy(ID), 3000);
+    await sleep(50);
+    assert.equal(proc().received.length, 1);
+    assert.ok(chat().some((e) => e.k === 'note' && e.text === 'Servern startar om – ”två” skickades inte'), JSON.stringify(chat().filter((e) => e.k === 'note')));
+    assert.equal(w.git.commits.length, 1);
+  });
+
+  test('drain: ett kort i den pågående turen kan fortfarande besvaras med text', async () => {
+    setup();
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => pp.emit(sdk.init('s'));
+    };
+    s.send(ID, 'x', 'text');
+    await until(() => proc()?.received.length === 1);
+    const pending = cut(proc())('WebFetch', { url: 'https://example.com' }, { signal: sig(), toolUseID: 't', requestId: 'r' });
+    await until(() => !!askOf());
+    s.drain();
+    s.send(ID, 'nej, använd en lokal lista', 'text');
+    assert.deepEqual(await pending, { behavior: 'deny', message: 'The user said no and wrote instead: "nej, använd en lokal lista"' });
+    assert.equal(chat().some((e) => e.k === 'note'), false);
+  });
+});
+
+describe('reload_app i en ny session (§8.7)', () => {
+  test('första omladdningen tar inte med konsolfel från före sessionen (loggen fylls från logs.txt efter en omstart); nya fel kommer med', async () => {
+    setup();
+    // Rader som fanns innan sessionen startade, till exempel gårdagens rader som lästs in igen ur logs.txt.
+    w.logs.append(ID, 'console', 'error: fel från igår');
+    engine.onProc = (p) => {
+      p.onMessage = (_t, pp) => pp.emit(sdk.init('s', ['mcp__workbench__reload_app']));
+    };
+    s.send(ID, 'x', 'text');
+    await until(() => proc()?.received.length === 1);
+    const reload = proc().tools.find((t) => t.name === 'reload_app')!;
+    const textOf = (r: unknown) => ((r as { content: { type: string; text?: string }[] }).content).map((c) => c.text ?? '').join('\n');
+    w.logs.append(ID, 'console', 'error: nytt fel');
+    const first = textOf(await reload.handler({}, {} as never));
+    assert.match(first, /error: nytt fel/);
+    assert.doesNotMatch(first, /fel från igår/, 'gamla rader räknas som nya fel');
+    w.logs.append(ID, 'console', 'error: ännu ett fel');
+    const second = textOf(await reload.handler({}, {} as never));
+    assert.match(second, /ännu ett fel/);
+    assert.doesNotMatch(second, /nytt fel\b/);
   });
 });

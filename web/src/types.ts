@@ -68,4 +68,6 @@ export interface ParentBridgeOptions {
   onFocus?(w: BridgeWindow): void;
   /** Appen ber om att en viss sida vrids fram (wb.face.show). */
   onFaceRequest?(w: BridgeWindow, faceId: string): void;
+  /** Appens märke bredvid pricken (wb.badge, §10.5): redan tvättat, högst 3 kodpunkter; null tar bort det. */
+  onBadge?(w: BridgeWindow, text: string | null): void;
 }

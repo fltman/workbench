@@ -140,6 +140,39 @@ test('rotation vid 1 MB: logs.txt blir logs.txt.1, bara en gammal fil sparas, in
   assert.equal(firstNow, lastBefore + 1, 'logs.txt.1 slutar raden före logs.txt börjar');
 });
 
+test('efter en omstart läser tail de senaste posterna ur logs.txt, också flerradiga, och nya poster kommer efter dem (Visa loggen var tom efter varje omstart)', async () => {
+  const paths = setup();
+  const before = createAppLogs(paths);
+  before.append(ID, 'console', 'error: Uncaught Error: före omstarten');
+  before.append(ID, 'backend', 'TypeError: x\n    at server.mjs:3\n\n    at y');
+  before.append(ID, 'workbench', 'Backenden startades om');
+  const lines = before.tail(ID, 100);
+  await before.flush();
+  // En ny process: samma rader, i samma format och lokal tid.
+  const after = createAppLogs(paths);
+  assert.deepEqual(after.tail(ID, 100), lines);
+  assert.deepEqual(after.tail(ID, 1), lines.slice(-1));
+  after.append(ID, 'console', 'error: efter omstarten');
+  const now = after.tail(ID, 100);
+  assert.deepEqual(now.slice(0, 3), lines);
+  assert.match(now[3], /\[console\] error: efter omstarten$/);
+  // En app som aldrig loggat, och ett ogiltigt id: inget att läsa, inget undantag.
+  assert.deepEqual(after.tail('a999999'), []);
+  assert.deepEqual(after.tail('../x'), []);
+});
+
+test('efter en omstart: logs.txt.1 fyller på när logs.txt har färre poster än det som efterfrågas; clear läser inte in filen igen', async () => {
+  const paths = setup();
+  const file = path.join(paths.appDataDir(ID), 'logs.txt');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(`${file}.1`, '2026-10-16 23:59:58 [backend] rad 1\n2026-10-16 23:59:59 [backend] rad 2\n');
+  fs.writeFileSync(file, '2026-10-17 00:00:01 [console] rad 3\nmed fortsättning\n2026-10-17 07:39:09 [workbench] rad 4\n');
+  const logs = createAppLogs(paths);
+  assert.deepEqual(logs.tail(ID, 10), ['23:59:58 [backend] rad 1', '23:59:59 [backend] rad 2', '00:00:01 [console] rad 3\nmed fortsättning', '07:39:09 [workbench] rad 4']);
+  logs.clear(ID);
+  assert.deepEqual(logs.tail(ID), [], 'en borttagen app får inte tillbaka loggen ur filen');
+});
+
 test('clear tömmer minnet; en borttagen app får ingen ny katalog', async () => {
   const paths = setup();
   const logs = createAppLogs(paths);

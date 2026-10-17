@@ -8,10 +8,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import type { AppInfo, OpenItem, RouteResponse } from '../../shared/protocol.ts';
 import { itemValue, normalizeItem } from '../../shared/open.ts';
 import type { AppRegistry, Config, Paths } from '../types.ts';
-import { claudeEnv } from './options.ts';
+import { oneShotOptions } from './options.ts';
 
 export interface RouteDeps {
   config: Config;
@@ -99,6 +100,11 @@ export function fakeRoute(apps: AppInfo[], text: string, known: OpenItem | null)
   return { action: 'build', name: 'Ny app', prompt: text };
 }
 
+/** Frågans options: en engångsfråga i data/route, utan app och därför utan deny-regler för hemligheter (oneShotOptions). */
+export function routeQueryOptions(cwd: string, appsDir: string): Options {
+  return { ...oneShotOptions({ cwd, appsDir }), systemPrompt: SYSTEM, outputFormat: { type: 'json_schema', schema: SCHEMA }, model: ROUTE_MODEL };
+}
+
 export function createRoute(deps: RouteDeps): (text: string, known: OpenItem | null) => Promise<RouteResponse> {
   async function ask(prompt: string): Promise<unknown> {
     if (deps.ask) return deps.ask(SYSTEM, prompt);
@@ -109,28 +115,7 @@ export function createRoute(deps: RouteDeps): (text: string, known: OpenItem | n
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
     try {
-      const q = query({
-        prompt,
-        options: {
-          cwd,
-          env: claudeEnv(cwd, deps.paths.appsDir),
-          settingSources: [],
-          strictMcpConfig: true,
-          mcpServers: {},
-          settings: { crossSessionInbound: 'refuse', disableAllHooks: true },
-          tools: [],
-          allowedTools: [],
-          canUseTool: async () => ({ behavior: 'deny', message: 'Inga verktyg här.' }),
-          permissionMode: 'default',
-          persistSession: false,
-          systemPrompt: SYSTEM,
-          outputFormat: { type: 'json_schema', schema: SCHEMA },
-          model: ROUTE_MODEL,
-          maxTurns: 3,
-          abortController: ac,
-          stderr: () => {},
-        },
-      });
+      const q = query({ prompt, options: { ...routeQueryOptions(cwd, deps.paths.appsDir), abortController: ac } });
       let out: unknown = null;
       for await (const m of q) {
         if (m.type !== 'result') continue;

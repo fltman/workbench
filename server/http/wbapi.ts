@@ -22,13 +22,15 @@ export const LOG_RATE_PER_S = 100;
 export const LOG_BURST = 150;
 const LOG_BODY_MAX = 1024 * 1024;
 const LEVELS = new Set(['error', 'warn', 'log']);
+/** x-wb-rev: appens rev (ett heltal i ms) som sidan fick från app.json. */
+const REV_RE = /^\d{1,16}$/;
 
 const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
 
 export interface WbApiDeps {
   config: Pick<Config, 'root'>;
   paths: Paths;
-  registry: Pick<AppRegistry, 'get'>;
+  registry: Pick<AppRegistry, 'get' | 'noteLog'>;
   logs: Pick<AppLogs, 'append'>;
   /** Klocka för hastighetsgränsen (tester). */
   now?: () => number;
@@ -178,9 +180,17 @@ export function createWbApi(deps: WbApiDeps): WbApi {
       }
     }
     // Högst 100 poster per sekund och app (tokenhink med marginal för buntning); resten släpps.
+    // Registret ser varje post, med versionen sidan laddade (x-wb-rev), och avgör om den är ett fel efter turen
+    // (felsignalen, §7.2).
     const list = entries as { level: string; text: string }[];
     const k = takeTokens(appId, list.length);
-    for (const e of list.slice(0, k)) logs.append(appId, 'console', logLine(e.level, e.text));
+    const revHeader = req.headers['x-wb-rev'];
+    const rev = typeof revHeader === 'string' && REV_RE.test(revHeader) ? Number(revHeader) : undefined;
+    for (const e of list.slice(0, k)) {
+      const line = logLine(e.level, e.text);
+      logs.append(appId, 'console', line);
+      registry.noteLog(appId, 'console', line, rev);
+    }
     sendEmpty(res, 204);
   }
 
@@ -246,7 +256,8 @@ export function createWbApi(deps: WbApiDeps): WbApi {
         if (method !== 'GET' && method !== 'HEAD') throw methodNotAllowed('GET, HEAD');
         const app = registry.get(appId);
         if (!app) throw new HttpError(404, 'appen saknas');
-        return sendJson(res, 200, { id: app.id, name: app.name, faces: app.faces });
+        // Versionen sidan laddar (felsignalen, §7.2): wb.js skickar tillbaka den med varje loggbunt.
+        return sendJson(res, 200, { id: app.id, name: app.name, faces: app.faces }, { 'x-wb-rev': String(app.rev) });
       }
       if (rawPath === '/__wb/log') {
         if (method !== 'POST') throw methodNotAllowed('POST');

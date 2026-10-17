@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Bryggan får aldrig lösa sina adresser mot <base>: då skulle store och loggar hamna någon annanstans. -->
+    <base href="https://example.invalid/" />
+    <title>Lång</title>
+    <style>
+      body { margin: 0; }
+      #tall { height: 3000px; background: linear-gradient(#fff, #cfd8ff); }
+    </style>
+  </head>
+  <body>
+    <div id="tall">Lång sida</div>
+    <script>
+      'use strict';
+      window.__seen = { wheel: [] };
+      addEventListener('wheel', (e) => window.__seen.wheel.push({ dy: e.deltaY, prevented: e.defaultPrevented }), { passive: true });
+    </script>
+  </body>
+</html>

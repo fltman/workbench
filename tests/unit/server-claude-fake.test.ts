@@ -11,6 +11,7 @@ import { fakeVariant, stripWorkbenchBlock } from '../../server/claude/fake.ts';
 import { childEnv } from '../../server/config.ts';
 import type { Sessions } from '../../server/types.ts';
 import type { ChatEvent } from '../../shared/protocol.ts';
+import { testPort } from '../ports.ts';
 import { makeWorld, sleep, until } from './server-claude-kit.ts';
 import type { World } from './server-claude-kit.ts';
 
@@ -27,7 +28,7 @@ function setup(speed = 25, over: Record<string, unknown> = {}): void {
 afterEach(async () => {
   await s?.closeAll();
   w?.cleanup();
-});
+}, { timeout: 30_000 });
 
 const chat = () => w.hub.chat(ID);
 const ends = () => chat().filter((e) => e.k === 'turn' && e.phase === 'end').length;
@@ -101,12 +102,13 @@ describe('låtsas-Claude', () => {
     assert.deepEqual(m.backend, { entry: 'server.mjs' });
     assert.ok(w.rec.calls.includes(`restart:${ID}`), 'backenden startades om i §8.6');
     assert.match(file('index.html'), /fetch\('\/api\/tid'/);
-    // starta backenden på riktigt (port 8244 hör till server-claude)
-    const child = spawn(process.execPath, ['--', 'server.mjs'], { cwd: w.paths.appDir(ID), env: childEnv({ PORT: '8244', HOST: '127.0.0.1' }), stdio: 'ignore' });
+    // starta backenden på riktigt, på en ledig port
+    const port = await testPort();
+    const child = spawn(process.execPath, ['--', 'server.mjs'], { cwd: w.paths.appDir(ID), env: childEnv({ PORT: String(port), HOST: '127.0.0.1' }), stdio: 'ignore' });
     let res: { status: number; body: string } | null = null;
     for (let i = 0; i < 100 && !res; i++) {
       res = await new Promise((resolve) => {
-        const req = http.get({ host: '127.0.0.1', port: 8244, path: '/api/tid' }, (r) => {
+        const req = http.get({ host: '127.0.0.1', port, path: '/api/tid' }, (r) => {
           let b = '';
           r.on('data', (c) => (b += c));
           r.on('end', () => resolve({ status: r.statusCode ?? 0, body: b }));
@@ -206,7 +208,12 @@ describe('manusets hjälpare', () => {
     assert.equal(fakeVariant('flera sidor'), 'kub');
     assert.equal(fakeVariant('en klocka'), 'klocka');
     assert.equal(fakeVariant('med backend'), 'backend');
+    assert.equal(fakeVariant('rätta backenden'), 'backend');
     assert.equal(fakeVariant('mejl'), 'anteckningar');
+    // Fältets fråga till en app som passar (§10.9) ber inte om en backend: "En egen backend-route räcker inte." Förut
+    // byggde låtsas-Claude då backendappen och startade en sandlådad backend (QA 17 oktober).
+    const ask = 'Öppna https://dn.se/ här, och gör så att adresser från Workbench-fältet öppnas direkt nästa gång: lägg till url i opens i app.json och ta emot dem med wb.onOpen. En egen backend-route räcker inte.';
+    assert.equal(fakeVariant(ask), 'anteckningar');
   });
   test('användarens text efter blocket', () => {
     assert.equal(stripWorkbenchBlock('<workbench>\nWindow: x\n</workbench>\nhej\nhopp'), 'hej\nhopp');

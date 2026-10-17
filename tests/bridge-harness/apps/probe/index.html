@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="utf-8" />
+    <title>Sond</title>
+    <style>
+      html, body { margin: 0; height: 100%; font: 14px var(--wb-font); }
+      #plain { position: absolute; left: 0; top: 0; width: 300px; height: 200px; background: #eef1ff; }
+      #list { position: absolute; left: 320px; top: 0; width: 200px; height: 200px; overflow-y: auto; }
+      #chat { position: absolute; left: 0; top: 220px; width: 300px; height: 150px; overflow-y: auto; display: flex; flex-direction: column-reverse; }
+      #rtl { position: absolute; left: 320px; top: 220px; width: 200px; height: 60px; overflow-x: auto; direction: rtl; white-space: nowrap; }
+      #ltr { position: absolute; left: 320px; top: 290px; width: 200px; height: 60px; overflow-x: auto; white-space: nowrap; }
+      #list div, #chat div { height: 40px; flex: none; }
+      .wide { display: inline-block; width: 1000px; height: 40px; background: linear-gradient(90deg, #fff, #ccd); }
+      #field { position: absolute; left: 320px; top: 370px; width: 180px; }
+    </style>
+  </head>
+  <body>
+    <div id="plain">Yta</div>
+    <div id="list"></div>
+    <div id="chat"></div>
+    <div id="rtl"><span class="wide">rtl</span></div>
+    <div id="ltr"><span class="wide">ltr</span></div>
+    <input id="field" />
+    <dialog id="dlg"><p>Dialog</p></dialog>
+    <script src="probe.js"></script>
+  </body>
+</html>

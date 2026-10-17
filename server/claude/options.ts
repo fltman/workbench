@@ -81,6 +81,30 @@ export function claudeEnv(appReal: string, appsDir: string): Record<string, stri
   });
 }
 
+/**
+ * Det som är gemensamt för engångsfrågorna (förslagen §8.12, fältet §8.13): samma isolering som appens session, utan
+ * verktyg, MCP-servrar och transkript, och canUseTool nekar allt. Körs frågan i en apps mapp (appReal) gäller också
+ * deny-reglerna för hemligheterna, eftersom canUseTool aldrig tillfrågas om läsningar inne i cwd (§8.5). Inget
+ * sandlådeblock: det gäller bara Bash, som frågorna inte har.
+ */
+export function oneShotOptions(o: { cwd: string; appsDir: string; appReal?: string }): Options {
+  return {
+    cwd: o.cwd,
+    env: claudeEnv(o.cwd, o.appsDir),
+    settingSources: [],
+    strictMcpConfig: true,
+    mcpServers: {},
+    settings: { crossSessionInbound: 'refuse', disableAllHooks: true, ...(o.appReal ? { permissions: { deny: secretDenyRules(o.appReal) } } : {}) },
+    tools: [],
+    allowedTools: [],
+    canUseTool: async () => ({ behavior: 'deny', message: 'Inga verktyg här.' }),
+    permissionMode: 'default',
+    persistSession: false,
+    maxTurns: 3,
+    stderr: () => {},
+  };
+}
+
 export function buildOptions(o: OptionsInput): Options {
   const nodePrefix = nodePrefixUnderHome();
   const allowRead = [o.appReal, ...(nodePrefix ? [nodePrefix] : [])];

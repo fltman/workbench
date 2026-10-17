@@ -25,10 +25,12 @@ function rig(over: { fake?: boolean; answers?: unknown[] } = {}) {
   const asked: Array<{ system: string; prompt: string }> = [];
   const answers = [...(over.answers ?? [{ ideas: ['Visa veckonummer', 'Lägg till händelser'] }])];
   const history: ChatEvent[] = [{ k: 'user', id: 'u1', text: 'Jag vill ha en kalender', via: 'text', at: 1 }];
+  /** Felraderna sedan senaste turslut (registry.troubles, §7.2). */
+  const troubles: string[] = [];
   const ideas = createIdeas({
     config: { fakeClaude: !!over.fake } as Config,
     paths: { appsDir: path.join(home, 'apps'), appDir: (a) => path.join(home, 'apps', a), appDataDir: (a) => path.join(home, 'data', 'apps', a) },
-    registry: { get: (a) => (a === id ? app : undefined) },
+    registry: { get: (a) => (a === id ? app : undefined), troubles: (a) => (a === id ? [...troubles] : []) },
     history: () => history,
     ask: over.fake
       ? undefined
@@ -38,7 +40,7 @@ function rig(over: { fake?: boolean; answers?: unknown[] } = {}) {
           return answers.length > 1 ? answers.shift() : answers[0];
         },
   });
-  return { id, app, home, asked, ideas };
+  return { id, app, home, asked, ideas, troubles };
 }
 
 test('cleanIdeas: trimmade strängar, inga dubbletter (oavsett skiftläge), avkortade, högst IDEAS_MAX', () => {
@@ -58,6 +60,21 @@ test('prompten: appens filer och önskemål som data mellan <app> och </app>, ut
   assert.ok(p.startsWith('<app>') && p.includes('</app>'));
   assert.ok(p.includes('<h1>Månad</h1>') && p.includes('En kalender med svenska röda dagar.') && p.includes('- Jag vill ha en kalender'));
   assert.ok(!p.includes('node_modules'), 'beroenden listas inte');
+});
+
+test('prompten: felen sedan senaste turslut står med som data; nya fel ger ingen ny fråga för samma rev', async () => {
+  const r = rig();
+  const dir = path.join(r.home, 'apps', r.id);
+  assert.ok(!ideasPrompt(dir, 'Kalender', r.app.faces, []).includes('Errors'), 'utan fel ingen rad om fel');
+  const p = ideasPrompt(dir, 'Kalender', r.app.faces, [], ["Uncaught TypeError: Cannot read properties of null (reading 'x')", 'Error: ENOENT']);
+  assert.ok(p.includes("- Uncaught TypeError: Cannot read properties of null (reading 'x')\n- Error: ENOENT"), p);
+  assert.ok(p.indexOf('Error: ENOENT') < p.indexOf('</app>'), 'felen är data inne i <app>');
+  r.troubles.push('Uncaught TypeError: x är odefinierad');
+  await r.ideas(r.id);
+  assert.ok(r.asked[0].prompt.includes('- Uncaught TypeError: x är odefinierad'), 'createIdeas tar felen ur registret');
+  r.troubles.push('Error: ett nytt fel');
+  await r.ideas(r.id);
+  assert.equal(r.asked.length, 1, 'en fråga per version, även när fler fel kommit');
 });
 
 test('en fråga per rev: sparas i data/apps/<id>/ideas.json, och en ny rev frågar igen', async () => {

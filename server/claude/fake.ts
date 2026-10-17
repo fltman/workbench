@@ -24,7 +24,8 @@ export function fakeVariant(userText: string): Variant {
   const t = userText.toLowerCase();
   if (t.includes('kub') || t.includes('sidor')) return 'kub';
   if (t.includes('klocka')) return 'klocka';
-  if (t.includes('backend')) return 'backend';
+  // Inte i ett ord med bindestreck: fältets fråga säger "En egen backend-route räcker inte" (§10.9).
+  if (/backend(?!-)/.test(t)) return 'backend';
   return 'anteckningar';
 }
 

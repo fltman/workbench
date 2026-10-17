@@ -1,18 +1,23 @@
-// menu.ts — HUD:ens diskreta ⋯-meny (CONTRACT §13): ångra senaste ändringen, öppna i egen flik, minimera (eller
-// ta fram) och ta bort appen (bekräftas i menyn med Ta bort/Avbryt). Esc stänger menyn först via pushEscape.
+// menu.ts — HUD:ens diskreta ⋯-meny (CONTRACT §13): ångra senaste ändringen, gör om (bara efter ett ångra), öppna i egen flik,
+// visa loggen, minimera (eller ta fram) och ta bort appen (bekräftas i menyn med Ta bort/Avbryt). Esc stänger menyn först via pushEscape.
 import { pushEscape } from '../escape.ts';
 import { button, el } from './asks.ts';
 import { reducedMotion } from './motion.ts';
 
 export interface MenuActions {
   canUndo(): boolean;
+  /** Bara efter ett ångra (§13): ingen avstängd rad när inget finns att göra om. */
+  canRedo(): boolean;
   canOpenTab(): boolean;
   undo(): void;
+  redo(): void;
   openTab(): void;
   /** Om appens fönster är minimerat (§10.7); null när appen saknar fönster. */
   minimized(): boolean | null;
   toggleMinimize(): void;
   remove(): void;
+  /** Appens senaste loggrader som text i en egen flik (§13). */
+  openLog(): void;
   /** Menyn stängdes; fokus kan gå tillbaka till inmatningen. */
   closed(restoreFocus: boolean): void;
 }
@@ -58,6 +63,14 @@ export function createMenu(anchor: HTMLButtonElement, host: HTMLElement, a: Menu
         }),
       );
     }
+    if (a.canRedo()) {
+      items.push(
+        item('Gör om', () => {
+          close(true);
+          a.redo();
+        }),
+      );
+    }
     if (a.canOpenTab()) {
       items.push(
         item('Öppna i egen flik', () => {
@@ -66,6 +79,12 @@ export function createMenu(anchor: HTMLButtonElement, host: HTMLElement, a: Menu
         }),
       );
     }
+    items.push(
+      item('Visa loggen', () => {
+        close(true);
+        a.openLog();
+      }),
+    );
     const mini = a.minimized();
     if (mini !== null) {
       items.push(

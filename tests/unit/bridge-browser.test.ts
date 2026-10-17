@@ -6,7 +6,7 @@
 // fel avsändare avvisas, inget skickas på toppnivå …) körs också mot en planterad läcka (leaks.ts) och
 // måste då fällas.
 //
-// Uppmätt (se .scratch/bridge/probe): ingen automatiserad indata når en app-iframe som nyp.
+// Uppmätt: ingen automatiserad indata når en app-iframe som nyp.
 // Input.synthesizePinchGesture går till toppramen både headless och headful, även från iframens egen
 // CDP-session, och ctrl+hjul via CDP zoomar aldrig sidan på macOS, inte ens oförhindrat. visualViewport.scale
 // går därför inte att kalibrera över en iframe. Det kalibrerade måttet är hjulets standardåtgärd: oförhindrat
@@ -18,8 +18,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser, type BrowserContext, type Frame, type Page } from 'playwright-core';
 import { startHarness, type Harness } from '../bridge-harness/server.ts';
+import { testPort } from '../ports.ts';
 
-const PORT = Number(process.env.BRIDGE_HARNESS_PORT ?? 8242);
+const PORT = await testPort('BRIDGE_HARNESS_PORT');
 const EVIDENCE = process.env.BRIDGE_EVIDENCE ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..', process.env.BRIDGE_EVIDENCE) : null;
 
 interface Placement {
@@ -50,6 +51,7 @@ interface TW {
     setReplyFace(f: string | null): void;
     sendFace(i: number, current: string): void;
     selfPost(msg: unknown): void;
+    addFrame(p: Placement): void;
     unsubscribe(): void;
   };
   __seen: {
@@ -73,21 +75,34 @@ interface TW {
       set(k: unknown, v: unknown): Promise<void>;
       delete(k: unknown): Promise<void>;
       all(): Promise<Record<string, unknown>>;
+      onChange(fn: (c: { key: string }) => void): () => void;
     };
+    badge(text?: unknown): void;
+    faces: { post(msg: unknown): void; onMessage(fn: (msg: unknown) => void): () => void };
   };
 }
 
 let h: Harness;
-let browser: Browser;
 const evidence: Record<string, unknown> = {};
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-before(async () => {
-  h = await startHarness(PORT, !process.env.BRIDGE_HARNESS_PORT); // 8242, eller en ledig port om en annan körning har den
-  evidence.port = h.port;
+// Saknas Chrome hoppas hela filen över (som tests/e2e/shell-flow.test.ts). Alla andra fel vid start får testet att falla.
+let browser: Browser;
+let noChrome: string | false = false;
+try {
   browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--force-device-scale-factor=2'] });
+} catch (err) {
+  const msg = String((err as Error)?.message ?? err);
+  if (/distribution 'chrome' is not (found|supported)|doesn't exist|ENOENT/i.test(msg)) noChrome = 'Chrome saknas';
+  else throw err;
+}
+
+before(async () => {
+  if (noChrome) return;
+  h = await startHarness(PORT, !process.env.BRIDGE_HARNESS_PORT); // en annan ledig port om någon hann ta den
+  evidence.port = h.port;
   evidence.chrome = browser.version();
-});
+}, { timeout: 30_000 });
 
 after(async () => {
   await browser?.close();
@@ -96,7 +111,7 @@ after(async () => {
     fs.mkdirSync(path.dirname(EVIDENCE), { recursive: true });
     fs.writeFileSync(EVIDENCE, JSON.stringify(evidence, null, 1));
   }
-});
+}, { timeout: 30_000 });
 
 const PROBE: Placement = { appId: 'probe', page: 'index.html', face: 'main', x: 101.3, y: 83.7, s: 1.5, w: 660, h: 440, registered: true };
 
@@ -186,7 +201,7 @@ const scrollOf = (f: Frame, id: string) =>
 
 /* ------------------------------------------------------------------ */
 
-describe('bryggan i Chrome: hjulet', () => {
+describe('bryggan i Chrome: hjulet', { skip: noChrome }, () => {
   /** ctrl+hjul över en lista som kan scrolla: standardåtgärden (scroll) är det kalibrerade måttet. */
   async function ctrlWheelOverList(leak?: string) {
     const o = await open([{ ...PROBE, page: `index.html${leak ? `?leak=${leak}` : ''}` }]);
@@ -486,7 +501,7 @@ describe('bryggan i Chrome: hjulet', () => {
   });
 });
 
-describe('bryggan i Chrome: tangenter, fokus och sidor', () => {
+describe('bryggan i Chrome: tangenter, fokus och sidor', { skip: noChrome }, () => {
   const CHORDS = ['Meta+KeyK', 'Meta+Digit0', 'Control+Alt+ArrowLeft', 'Control+Alt+ArrowRight'];
 
   async function chords(leak?: string) {
@@ -722,7 +737,7 @@ describe('bryggan i Chrome: tangenter, fokus och sidor', () => {
   });
 });
 
-describe('bryggan i Chrome: avsändare och hastighet', () => {
+describe('bryggan i Chrome: avsändare och hastighet', { skip: noChrome }, () => {
   const KEY = { wb: 1, type: 'key', code: 'KeyK', meta: true, ctrl: false, alt: false, shift: false };
 
   /** En iframe som världen inte känner (men med en känd apps origin) skickar välformade meddelanden. */
@@ -835,7 +850,7 @@ describe('bryggan i Chrome: avsändare och hastighet', () => {
   });
 });
 
-describe('bryggan i Chrome: wb.store och loggar', () => {
+describe('bryggan i Chrome: wb.store och loggar', { skip: noChrome }, () => {
   it('wb.store: sparar, läser, listar och tar bort; ogiltiga nycklar kastar tydligt', async () => {
     const o = await open([PROBE]);
     try {
@@ -1081,7 +1096,7 @@ describe('bryggan i Chrome: wb.store och loggar', () => {
   });
 });
 
-describe('bryggan i Chrome: toppnivå (skärmbild, egen flik)', () => {
+describe('bryggan i Chrome: toppnivå (skärmbild, egen flik)', { skip: noChrome }, () => {
   async function topLevel(leak?: string) {
     const context = await browser.newContext({ viewport: { width: 900, height: 600 }, deviceScaleFactor: 2 });
     try {
@@ -1095,6 +1110,7 @@ describe('bryggan i Chrome: toppnivå (skärmbild, egen flik)', () => {
         await w.wb.store.set('topp', [1, 2, 3]);
         const stored = await w.wb.store.get('topp');
         w.wb.face.show('back');
+        w.wb.badge('1');
         console.error('fel på toppnivå');
         return { css, stored, ready: w.__seen.ready, current: w.wb.face.current, parentIsSelf: window.parent === window };
       });
@@ -1169,5 +1185,158 @@ describe('bryggan i Chrome: toppnivå (skärmbild, egen flik)', () => {
     const m = await topLevel('toplevel');
     evidence.topLevel_leak = { posts: m.posts };
     assert.ok(m.posts > 0, 'testet ska fälla den planterade läckan');
+  });
+});
+
+describe('bryggan i Chrome: märket och kanalen mellan sidorna (§10.5, §11)', { skip: noChrome }, () => {
+  it('wb.badge: en sträng, ett tal eller null går till skalet, tvättad och klämd; annat kastar', async () => {
+    const o = await open([PROBE]);
+    try {
+      await o.clear();
+      const thrown = await o.frames[0].evaluate((shell) => {
+        const wb = (window as unknown as TW).wb;
+        wb.badge('3');
+        wb.badge(12);
+        wb.badge(' 12345 ');
+        wb.badge('a\u0007b');
+        wb.badge(null);
+        wb.badge();
+        const errs: string[] = [];
+        for (const bad of [{}, true, Number.NaN, () => 1]) {
+          try {
+            wb.badge(bad);
+            errs.push('inget fel');
+          } catch (e) {
+            errs.push(`${(e as Error).name}: ${(e as Error).message}`);
+          }
+        }
+        // Ett rått meddelande med ett tal når aldrig hanteraren: skalet kontrollerar igen (bridge.ts).
+        parent.postMessage({ wb: 1, type: 'badge', text: 5 }, shell);
+        return errs;
+      }, h.shell);
+      await sleep(300);
+      const calls = await o.calls('badge');
+      evidence.badge = { calls: calls.map((c) => c.args[0]), thrown };
+      assert.deepEqual(
+        calls.map((c) => [c.appId, c.face, c.args[0]]),
+        [['probe', 'main', '3'], ['probe', 'main', '12'], ['probe', 'main', '123'], ['probe', 'main', 'ab'], ['probe', 'main', null], ['probe', 'main', null]],
+      );
+      assert.equal(thrown.length, 4);
+      for (const t of thrown) assert.match(t, /^TypeError: wb\.badge: /);
+    } finally {
+      await o.close();
+    }
+  });
+
+  // Två sidor av samma app (samma origin) i samma skal. Playwright stänger av lagringspartitioneringen, men
+  // iframes under samma toppsida hamnar i samma partition med eller utan den, så kanalen beter sig likadant.
+  async function twoFaces(leak?: string) {
+    const q = leak ? `?leak=${leak}` : '';
+    const o = await open([{ ...PROBE, page: `index.html${q}` }, { ...PROBE, page: `back.html${q}`, face: 'back', x: 800, y: 40, s: 0.5 }]);
+    await listen(o.frames[0]);
+    await listen(o.frames[1]);
+    return o;
+  }
+  /** Lyssnar på kanalen i en sida; varje onChange läser också värdet med get. */
+  const listen = (f: Frame) =>
+    f.evaluate(() => {
+      const got = { changes: [] as unknown[], values: [] as unknown[], msgs: [] as unknown[] };
+      Object.assign(window, { __chan: got });
+      const wb = (window as unknown as TW).wb;
+      wb.store.onChange((c) => {
+        got.changes.push(c);
+        void wb.store.get(c.key).then((v) => got.values.push(v === undefined ? '(saknas)' : v));
+      });
+      wb.faces.onMessage((m) => got.msgs.push(m));
+    });
+  const chan = (f: Frame) => f.evaluate(() => (window as unknown as { __chan: { changes: unknown[]; values: unknown[]; msgs: unknown[] } }).__chan);
+
+  /**
+   * set och delete i första sidan, sedan ett meddelande: vad hör sidorna? Skrivningarna når servern först efter
+   * 300 ms, så att en onChange som kommer för tidigt läser det gamla värdet med get.
+   */
+  async function talk(leak?: string) {
+    const o = await twoFaces(leak);
+    try {
+      await o.page.route('**/__wb/store/kanal.v1', async (route) => {
+        if (route.request().method() !== 'GET') await sleep(300);
+        await route.continue();
+      });
+      const [main, back] = o.frames;
+      const t0 = Date.now();
+      await main.evaluate(() => (window as unknown as TW).wb.store.set('kanal.v1', { n: 1 }));
+      const setMs = Date.now() - t0;
+      await settle(() => chan(back), (c) => c.values.length >= 1);
+      await main.evaluate(() => (window as unknown as TW).wb.store.delete('kanal.v1'));
+      await settle(() => chan(back), (c) => c.values.length >= 2);
+      await main.evaluate(() => (window as unknown as TW).wb.faces.post({ typ: 'fokus', dag: '2026-10-20' }));
+      await settle(() => chan(back), (c) => c.msgs.length >= 1);
+      await sleep(300);
+      return { main: await chan(main), back: await chan(back), setMs };
+    } finally {
+      await o.close();
+    }
+  }
+
+  it('wb.store.onChange och wb.faces: den andra sidan hör set, delete och post, efter att skrivningen gått igenom; avsändaren hör inget', async () => {
+    const m = await talk();
+    evidence.channel = m;
+    assert.ok(m.setMs >= 280, `skrivningen ska ha fördröjts i iframen (${m.setMs} ms)`);
+    assert.deepEqual(m.back.changes, [{ key: 'kanal.v1' }, { key: 'kanal.v1' }]);
+    assert.deepEqual(m.back.values, [{ n: 1 }, '(saknas)'], 'onChange kommer först när servern har värdet');
+    assert.deepEqual(m.back.msgs, [{ typ: 'fokus', dag: '2026-10-20' }]);
+    assert.deepEqual(m.main, { changes: [], values: [], msgs: [] }, 'avsändaren får inte sina egna');
+  });
+
+  it('kalibrering: en kanal som också lämnar till avsändaren fälls', async () => {
+    const m = await talk('channel-self');
+    evidence.channel_leak = m.main;
+    assert.ok(m.main.changes.length > 0 && m.main.msgs.length > 0, `testet ska fälla den planterade läckan (${JSON.stringify(m.main)})`);
+  });
+
+  it('kalibrering: en onChange som sänds innan skrivningen gått igenom fälls', async () => {
+    const m = await talk('channel-early');
+    evidence.channel_early = m.back;
+    assert.equal(m.back.values[0], '(saknas)', `testet ska fälla den planterade läckan (${JSON.stringify(m.back)})`);
+  });
+
+  /** Första sidan sätter ett värde, sedan kommer en tredje sida: vad läser den, och vad hör den före och efter nästa ändring? */
+  async function late(leak?: string) {
+    const o = await twoFaces(leak);
+    try {
+      const [main] = o.frames;
+      await main.evaluate(() => (window as unknown as TW).wb.store.set('sen.v1', 'före'));
+      const page = `back.html${leak ? `?leak=${leak}` : ''}`;
+      await o.page.evaluate((p) => (window as unknown as TW).__harness.addFrame(p), { ...PROBE, page, face: 'back', x: 800, y: 330, s: 0.5 });
+      await o.page.waitForFunction(() => document.querySelectorAll('iframe').length === 3);
+      const f = await (await o.page.$$('iframe'))[2].contentFrame();
+      assert.ok(f, 'den sena sidan saknar ram');
+      await f.waitForFunction(() => typeof (window as unknown as TW).wb === 'object');
+      await listen(f);
+      const read = await f.evaluate(() => (window as unknown as TW).wb.store.get('sen.v1'));
+      await sleep(300);
+      const before = await chan(f);
+      // Kontroll i samma körning: den sena sidans lyssnare fungerar, för nästa ändring når den.
+      await main.evaluate(() => (window as unknown as TW).wb.store.set('sen.v1', 'efter'));
+      const after = await settle(() => chan(f), (c) => c.values.length >= 1);
+      return { read, before, after };
+    } finally {
+      await o.close();
+    }
+  }
+
+  it('en sida som kommer senare läser värdet med get, inte via onChange (ingen historik); nästa ändring når den', async () => {
+    const { read, before, after } = await late();
+    evidence.channelLate = { read, before, after };
+    assert.equal(read, 'före');
+    assert.deepEqual(before.changes, [], 'ingen historik: ändringen före sidan hörs aldrig');
+    assert.deepEqual(after.changes, [{ key: 'sen.v1' }]);
+    assert.deepEqual(after.values, ['efter']);
+  });
+
+  it('kalibrering: en kanal med historik (den senaste ändringen spelas upp för en ny lyssnare) fälls', async () => {
+    const { before } = await late('channel-replay');
+    evidence.channelLate_leak = before;
+    assert.ok(before.changes.length > 0, `testet ska fälla den planterade läckan (${JSON.stringify(before)})`);
   });
 });

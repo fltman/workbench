@@ -1,14 +1,16 @@
 // tests/e2e/shell-flow.test.ts — skalet med riktig indata i riktig Chrome mot låtsas-Claude (CONTRACT §10, §13, §15).
-// Egen server på 8270/8279 (WB_E2E_PORT, HMR = porten + 9) med WORKBENCH_FAKE_CLAUDE=1 och ett tillfälligt
+// Egen server på lediga portar (eller WB_E2E_PORT, HMR = porten + 9) med WORKBENCH_FAKE_CLAUDE=1 och ett tillfälligt
 // WORKBENCH_HOME under .scratch/integrator3 (WB_E2E_DIR) som tas bort efteråt. Hoppas över om Chrome saknas.
 // Ett ordnat flöde, steg för steg (faller ett steg hoppas resten över):
 //   tom yta → rita (Esc tar bort en orörd fyrkant, och ett nytt drag på samma ställe direkt efteråt ritar) →
 //   inmatningen har fokus < 600 ms efter släppet → skriv och Enter → bygget (pricken pulserar, ljusbandet sveper) →
 //   klart: ett svar i HUD:en och appens sida i iframen → tryck på tom yta stänger HUD:en och fönstret står kvar →
 //   pricken öppnar igen → omladdning (fönstret, HUD:en och utkastet finns kvar) → omladdning medan pekaren vilar
-//   över appen (ett nyp där zoomar) → ⋯ Ångra ger ångra-raden → ⌘0 visar allt → en tresidig app ritas medan den
+//   över appen (ett nyp där zoomar) → ⋯ Ångra ger ångra-raden → ⋯ Gör om ger appen tillbaka → ⌘0 visar allt → en tresidig app ritas medan den
 //   första appens HUD är öppen (båda öppna utan att överlappa, den nya aktiv; ett tryck stänger bara den) och vrids
-//   med ⌃⌥→ och är platt i vila → Ta bort i ⋯-menyn med bekräftelse → fönstret är borta och servern har inte appen.
+//   med ⌃⌥→ och är platt i vila → två byggen i rad från fältet hamnar inte på varandra, och i en full vy döljer nästa
+//   bygge inget äldre fönster → Ta bort i ⋯-menyn med
+//   bekräftelse → fönstret är borta och servern har inte appen.
 // Varje kontroll av att något *inte* händer fälls först i samma körning (kalibrering), och tidsmåttet provas mot
 // en känd fördröjning innan det används. WB_SHELL_PLANT=k1 planterar K1-felet (ett fönster som löses upp fångar
 // pekaren), och då ska steget med Esc falla.
@@ -22,10 +24,11 @@ import type { TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import type { Browser, Page } from 'playwright-core';
+import { testPort } from '../ports.ts';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const PORT = Number(process.env.WB_E2E_PORT) || 8270;
-const HMR = PORT + 9;
+const PORT = await testPort('WB_E2E_PORT');
+const HMR = process.env.WB_E2E_PORT ? PORT + 9 : await testPort();
 const BASE = `http://localhost:${PORT}`;
 const SCRATCH = process.env.WB_E2E_DIR ? path.resolve(process.env.WB_E2E_DIR) : path.join(ROOT, '.scratch', 'integrator3');
 const VW = 1440;
@@ -157,6 +160,11 @@ function hudRect(id: string): Promise<{ x: number; y: number; w: number; h: numb
     const r = el.getBoundingClientRect();
     return { x: r.x, y: r.y, w: r.width, h: r.height };
   }, id);
+}
+
+/** Raderna i appens öppna ⋯-meny. */
+function menuItems(id: string): Promise<string[]> {
+  return page.evaluate((id) => [...document.querySelectorAll(`.wbh[data-app="${id}"] .wbh-menu-item`)].map((e) => e.textContent ?? ''), id);
 }
 
 /** Ryms fönstret helt i vyn? */
@@ -347,7 +355,7 @@ describe('shell-flow (riktig indata, låtsas-Claude)', { skip: noChrome, timeout
     });
     await page.goto(`${BASE}/`, { waitUntil: 'load' });
     await page.waitForFunction(() => (window as any).__wb?.store?.connected === true, null, { timeout: 45_000 });
-  });
+  }, { timeout: 120_000 });
 
   after(async () => {
     if (broken && home) {
@@ -360,7 +368,7 @@ describe('shell-flow (riktig indata, låtsas-Claude)', { skip: noChrome, timeout
     await browser?.close().catch(() => {});
     await stopServer();
     if (home) fs.rmSync(home, { recursive: true, force: true });
-  });
+  }, { timeout: 30_000 });
 
   step('kalibrering: konsolfel fångas och tidsmåttet stämmer mot känd fördröjning', async (t) => {
     await page.evaluate(() => console.error('planterat fel (kalibrering)'));
@@ -596,10 +604,29 @@ describe('shell-flow (riktig indata, låtsas-Claude)', { skip: noChrome, timeout
     const notes = () => page.evaluate((id) => [...document.querySelectorAll(`.wbh[data-app="${id}"] .wbh-note`)].filter((e) => e.textContent === 'Ångrade senaste ändringen.').length, app);
     assert.equal(await notes(), 0, 'ångra-raden fanns redan');
     await page.locator(`.wbh[data-app="${app}"] .wbh-more`).click();
+    // Kalibrering för nästa steg: före ångra finns ingen Gör om-rad.
+    assert.ok(!(await menuItems(app)).includes('Gör om'), 'Gör om fanns före ångra');
     await page.locator(`.wbh[data-app="${app}"] .wbh-menu-item`, { hasText: 'Ångra senaste ändringen' }).click();
     await page.waitForFunction((id) => [...document.querySelectorAll(`.wbh[data-app="${id}"] .wbh-note`)].some((e) => e.textContent === 'Ångrade senaste ändringen.'), app, { timeout: 5000 });
     assert.equal(await notes(), 1);
     await page.waitForFunction((id) => (window as any).__wb.store.apps.get(id)?.built === false, app, { timeout: 5000 });
+  });
+
+  step('⋯-menyn: Gör om finns bara efter ett ångra och ger appen tillbaka; sedan finns ingen Gör om (§13)', async () => {
+    // Skalet läser canRedo ur svaret på ångra, som kan komma efter ångra-raden.
+    await page.waitForFunction((id) => (window as any).__wb.store.canRedo?.(id) === true, app, { timeout: 5000 });
+    await page.locator(`.wbh[data-app="${app}"] .wbh-more`).click();
+    const items = await menuItems(app);
+    assert.equal(items.indexOf('Gör om'), items.indexOf('Ångra senaste ändringen') + 1, `Gör om direkt efter Ångra: ${JSON.stringify(items)}`);
+    await page.locator(`.wbh[data-app="${app}"] .wbh-menu-item`, { hasText: 'Gör om' }).click();
+    await page.waitForFunction((id) => [...document.querySelectorAll(`.wbh[data-app="${id}"] .wbh-note`)].some((e) => e.textContent === 'Gjorde om ändringen.'), app, { timeout: 5000 });
+    await page.waitForFunction((id) => (window as any).__wb.store.apps.get(id)?.built === true, app, { timeout: 5000 });
+    const frame = page.frameLocator(`.wb-win[data-app="${app}"] iframe`).first();
+    await frame.locator('textarea[aria-label="Ny anteckning"]').waitFor({ state: 'visible', timeout: 8000 });
+    await page.waitForFunction((id) => (window as any).__wb.store.canRedo(id) === false, app, { timeout: 5000 });
+    await page.locator(`.wbh[data-app="${app}"] .wbh-more`).click();
+    assert.ok(!(await menuItems(app)).includes('Gör om'), 'Gör om finns kvar vid toppen');
+    await page.keyboard.press('Escape');
   });
 
   step('⌘0 visar allt', async () => {
@@ -864,6 +891,99 @@ describe('shell-flow (riktig indata, låtsas-Claude)', { skip: noChrome, timeout
     assert.equal(await fieldOpen(), false, 'Avbryt stängde inte fältet');
     await sleep(300);
     assert.equal(await page.evaluate(() => (window as any).__wb.store.apps.size), apps0, 'Avbryt byggde en app');
+  });
+
+  step('fältet: två byggen i rad hamnar inte på varandra och står minst 24 px från vyns kanter (kalibrerat: med dagens plats mitt i vyn låg den andra över den första, och med HUD:ens 12 px marginal stod den första 12 px från kanten)', async (t) => {
+    type R = { x: number; y: number; w: number; h: number };
+    const overlap = (p: R, q: R) => Math.min(p.x + p.w, q.x + q.w) - Math.max(p.x, q.x) > 0.5 && Math.min(p.y + p.h, q.y + q.h) - Math.max(p.y, q.y) > 0.5;
+    const closeHuds = async () => {
+      await page.evaluate(() => { const w = (window as any).__wb; for (const id of w.world.debug.huds().open) w.bus.emit('hud:close', { appId: id }); });
+      await page.waitForFunction(() => (window as any).__wb.world.debug.huds().open.length === 0, null, { timeout: 3000 });
+      await sleep(500);
+    };
+    const ids = () => page.evaluate(() => [...(window as any).__wb.store.apps.keys()] as string[]);
+    // Fältet öppnas bara utan öppen HUD (§10.9), så den förra appens HUD stängs före nästa bygge.
+    const build = async (text: string): Promise<{ id: string; r: R }> => {
+      await closeHuds();
+      const before = await ids();
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur?.());
+      await page.keyboard.type(text);
+      await page.keyboard.press('Enter');
+      await page.locator('.wbf-card .wbh-btn', { hasText: 'Bygg' }).click();
+      await page.waitForFunction((b) => [...(window as any).__wb.store.apps.keys()].some((k: string) => !b.includes(k)), before, { timeout: 5000 });
+      const id = (await ids()).find((k) => !before.includes(k))!;
+      await page.waitForFunction((a) => (window as any).__wb.world.debug.hudApp() === a, id, { timeout: 3000 });
+      return { id, r: (await fits(id)).r! };
+    };
+    const a1 = await build('en timer för tevatten');
+    const a2 = await build('ett schema för tvätten');
+    // Kalibrering: kontrollen ser ett överlapp. Dagens plats var mitten för båda, alltså samma rektangel två gånger.
+    assert.equal(overlap(a1.r, a1.r), true, 'kalibrering: en rektangel överlappar sig själv');
+    assert.equal(overlap(a1.r, a2.r), false, `det andra bygget ligger över det första: ${JSON.stringify({ a1: a1.r, a2: a2.r })}`);
+    // Som en ritad fyrkant (§10.4): pricken och greppet under fönstret syns.
+    for (const [k, r] of [['a1', a1.r], ['a2', a2.r]] as const) {
+      assert.ok(r.x >= 23.5 && r.y >= 23.5 && r.x + r.w <= VW - 23.5 && r.y + r.h <= VH - 23.5, `${k} närmare vyns kant än 24 px: ${JSON.stringify(r)}`);
+    }
+    const older = { app: (await fits(app)).r!, cube: (await fits(cube)).r! };
+    t.diagnostic(`fältbyggen ${JSON.stringify({ a1: a1.r, a2: a2.r })}; över de äldre: ${JSON.stringify(Object.fromEntries(Object.entries(older).map(([k, r]) => [k, [overlap(a1.r, r), overlap(a2.r, r)]])))}`);
+    // Städa: låt byggena bli klara och ta bort de två apparna, så att resten av flödet börjar som förut.
+    await page.waitForFunction((xs) => xs.every((x: string) => { const a = (window as any).__wb.store.apps.get(x); return a?.status === 'idle' && a.built === true; }), [a1.id, a2.id], { timeout: 30_000 });
+    await closeHuds();
+    await page.evaluate(async (xs) => { for (const x of xs) await (window as any).__wb.store.deleteApp(x); }, [a1.id, a2.id]);
+    await page.waitForFunction((xs) => xs.every((x: string) => !document.querySelector(`.wb-win[data-app="${x}"]`)), [a1.id, a2.id], { timeout: 5000 });
+    assert.ok(kept(await winState(app), await serverHas(app)) && kept(await winState(cube), await serverHas(cube)), 'de äldre apparna försvann');
+  });
+
+  step('fältet: när vyn är full hamnar nästa bygge ett trappsteg upp åt vänster, så att det äldre fönstrets prick och grepp syns (kalibrerat: före trappsteget fick det fjärde bygget det första fönstrets rektangel)', async (t) => {
+    type R = { x: number; y: number; w: number; h: number };
+    // Syns det äldre fönstret o bredvid r? Pricken (4 px in från det övre högra hörnet) eller greppet (12,5 px under
+    // nederkanten) ligger inte under r, och greppet inte heller under r:s eget grepp (72 × 24 px).
+    const seen = (r: R, o: R): boolean => {
+      const under = (x: number, y: number) => x > r.x && x < r.x + r.w && y > r.y && y < r.y + r.h;
+      if (!under(o.x + o.w - 4, o.y + 4)) return true;
+      const g = { x: o.x + o.w / 2, y: o.y + o.h + 12.5 };
+      return !under(g.x, g.y) && !(Math.abs(r.x + r.w / 2 - g.x) < 72 && Math.abs(r.y + r.h + 12.5 - g.y) < 24);
+    };
+    const closeHuds = async () => {
+      await page.evaluate(() => { const w = (window as any).__wb; for (const id of w.world.debug.huds().open) w.bus.emit('hud:close', { appId: id }); });
+      await page.waitForFunction(() => (window as any).__wb.world.debug.huds().open.length === 0, null, { timeout: 3000 });
+      await sleep(500);
+    };
+    const ids = () => page.evaluate(() => [...(window as any).__wb.store.apps.keys()] as string[]);
+    const build = async (text: string): Promise<string> => {
+      await closeHuds();
+      const before = await ids();
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur?.());
+      await page.keyboard.type(text);
+      await page.keyboard.press('Enter');
+      await page.locator('.wbf-card .wbh-btn', { hasText: 'Bygg' }).click();
+      await page.waitForFunction((b) => [...(window as any).__wb.store.apps.keys()].some((k: string) => !b.includes(k)), before, { timeout: 5000 });
+      const id = (await ids()).find((k) => !before.includes(k))!;
+      await page.waitForFunction((a) => (window as any).__wb.world.debug.hudApp() === a, id, { timeout: 3000 });
+      return id;
+    };
+    // Som QA:s körning: tom yta i zoom 1, och fyra byggen i rad.
+    const cam0 = await page.evaluate(() => (window as any).__wb.world.debug.camera());
+    await page.evaluate(() => (window as any).__wb.world.debug.setCamera({ cx: 60_000, cy: 60_000, zoom: 1 }));
+    await sleep(300);
+    const built: string[] = [];
+    for (const text of ['en timer för tevatten', 'ett schema för tvätten', 'en lista över böcker', 'en inköpslista']) built.push(await build(text));
+    await closeHuds();
+    const rects = await Promise.all(built.map(async (id) => (await fits(id)).r!));
+    t.diagnostic(`fältbyggen i full vy ${JSON.stringify(rects)}`);
+    // Kalibrering: kontrollen fäller samma rektangel två gånger, som förut.
+    assert.equal(seen(rects[0], rects[0]), false, 'kalibrering: ett fönster på samma plats döljer det äldre');
+    for (let i = 1; i < rects.length; i++) {
+      for (let j = 0; j < i; j++) assert.ok(seen(rects[i], rects[j]), `bygge ${i + 1} döljer bygge ${j + 1}: ${JSON.stringify(rects)}`);
+    }
+    // Städa: låt byggena bli klara, ta bort apparna och ställ tillbaka kameran.
+    await page.waitForFunction((xs) => xs.every((x: string) => { const a = (window as any).__wb.store.apps.get(x); return a?.status === 'idle' && a.built === true; }), built, { timeout: 30_000 });
+    await closeHuds();
+    await page.evaluate(async (xs) => { for (const x of xs) await (window as any).__wb.store.deleteApp(x); }, built);
+    await page.waitForFunction((xs) => xs.every((x: string) => !document.querySelector(`.wb-win[data-app="${x}"]`)), built, { timeout: 5000 });
+    await page.evaluate((c) => (window as any).__wb.world.debug.setCamera(c), cam0);
+    await sleep(300);
+    assert.ok(kept(await winState(app), await serverHas(app)) && kept(await winState(cube), await serverHas(cube)), 'de äldre apparna försvann');
   });
 
   step('Ta bort i ⋯-menyn med bekräftelse: fönstret är borta och servern har inte appen', async () => {

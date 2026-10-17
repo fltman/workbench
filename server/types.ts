@@ -83,6 +83,14 @@ export interface AppRegistry {
   bumpRev(appId: string): void;
   /** Läs om app.json och kontrollera om första sidan finns; sänder 'app' om något ändrats. */
   refresh(appId: string): void;
+  /**
+   * En loggrad från appen (CONTRACT §7.2): 'console' från sidorna via /__wb/log, med versionen sidan laddade (rev, ur
+   * x-wb-rev; en annan än appens nuvarande räknas inte), och 'stderr': sista felraden från en backend som kraschat.
+   * Registret avgör om den är ett fel efter turen och sätter i så fall AppInfo.trouble (sänder 'app' en gång).
+   */
+  noteLog(appId: string, source: 'console' | 'stderr', line: string, rev?: number): void;
+  /** Felraderna sedan senaste turslut eller nya version, högst 5 och olika (för förslagen, §8.12). */
+  troubles(appId: string): string[];
 }
 
 /** Loggar per app: konsolen (via bryggan och skärmbilderna), backendens utdata och workbenchens egna notiser. */
@@ -102,6 +110,8 @@ export interface AppGit {
   init(appId: string): Promise<void>;                         // init + första commit "Ny app"
   commitAll(appId: string, message: string): Promise<boolean>; // false om inget att committa
   undo(appId: string): Promise<boolean>;                      // reset --hard HEAD~1; false om bara första commit finns
+  redo(appId: string): Promise<boolean>;                      // ett steg fram mot refs/wb/redo (§6); false om inget att göra om
+  canRedo(appId: string): Promise<boolean>;                   // refs/wb/redo finns och HEAD är en äkta förfader till den
 }
 
 /** App-backends: en nodeprocess per app med backend, bakom proxyn på /api/*. */
@@ -135,11 +145,17 @@ export interface Sessions {
   history(appId: string, limit?: number): ChatEvent[];
   /** Efter ett lyckat ångra: sänder och sparar note "Ångrade senaste ändringen." och lägger en rad i nästa <workbench>-block. */
   noteUndo(appId: string): void;
+  /** Efter ett lyckat gör om: note "Gjorde om ändringen." och raden i nästa block räknas netto (§8.4). */
+  noteRedo(appId: string): void;
   /** Om appen just nu har en pågående tur eller obesvarad fråga. */
   busy(appId: string): boolean;
   /** Avsluta sessionen helt (appen tas bort). */
   forget(appId: string): Promise<void>;
   closeAll(): Promise<void>;
+  /** En not från en annan modul (en backend som getts upp, §9): sänds och sparas, utom medan en tur pågår. */
+  note(appId: string, text: string): void;
+  /** Vid avslut (§7): ingen ny tur startar; meddelanden som kommer under tiden körs inte och får en not. */
+  drain(): void;
 }
 
 /* ---------------------------- fabriker ---------------------------- */

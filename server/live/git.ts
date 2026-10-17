@@ -28,11 +28,18 @@ const SAFE_CONFIG = [
 const FIRST_COMMIT = 'Ny app';
 /**
  * Låsfiler som en hårt avbruten git-process lämnar kvar (index.lock enligt §6, plus HEAD- och grenlåset som
- * en commit tar). Anrop för samma app körs i tur och ordning och tar 10–50 ms, så ett lås som är äldre än
- * 10 s hålls inte av någon: utan det här skulle appen aldrig kunna committas eller ångras igen.
+ * en commit tar, och låsen för gör om-referensen och packed-refs som update-ref tar). Anrop för samma app körs
+ * i tur och ordning och tar 10–50 ms, så ett lås som är äldre än 10 s hålls inte av någon: utan det här skulle
+ * appen aldrig kunna committas eller ångras igen.
  */
 const STALE_LOCK_MS = 10_000;
-const LOCK_FILES = ['index.lock', 'HEAD.lock', path.join('refs', 'heads', 'main.lock')];
+const LOCK_FILES = ['index.lock', 'HEAD.lock', path.join('refs', 'heads', 'main.lock'), path.join('refs', 'wb', 'redo.lock'), 'packed-refs.lock'];
+/**
+ * Gör om (§6): den senast ångrade commiten. Ångra sätter den, gör om går ett steg i taget fram mot den, och den tas
+ * bort när HEAD når den eller när en ny commit hamnar utanför vägen dit. Den ligger i appens git-katalog, som Claude
+ * inte når, så bara ångra kan sätta den.
+ */
+const REDO_REF = 'refs/wb/redo';
 const FALLBACK_MESSAGE = 'Ändring';
 const MAX_MESSAGE = 72;
 
@@ -46,7 +53,7 @@ const MAX_MESSAGE = 72;
 const ADD_ALL = ['add', '-A', '--', '.', ':(exclude,glob,icase)[d]ata/**', ':(exclude,glob,icase)**/node_modules/**'];
 
 /**
- * Arbetsträd som git själv skriver om just nu (ångra = reset --hard), med när det senast slutade.
+ * Arbetsträd som git själv skriver om just nu (ångra och gör om = reset --hard), med när det senast slutade.
  * Bevakaren (watcher.ts) läser det: git:s egna ändringar är inga manuella ändringar (§7.3), och ångra-flödet
  * laddar om appen själv (§7.4), efter en eventuell omstart av backenden. Nyckeln är arbetsträdets sökväg.
  */
@@ -125,6 +132,36 @@ function runGit(gitDir: string, workTree: string, args: string[], okCodes: numbe
   });
 }
 
+/*
+ * Revisioner till kommandon som också tar sökvägar (rev-list, reset) följs av "--": git körs med arbetsträdet som cwd,
+ * och en fil där som heter HEAD eller HEAD~1 gjorde annars argumentet tvetydigt ("both revision and filename"), så att
+ * ångra misslyckades (uppmätt). merge-base och update-ref tar bara revisioner.
+ */
+
+/**
+ * Commitarna från HEAD (utan den) fram till gör om-referensen, nyast först: referensen först och barnet till HEAD
+ * sist. Tom när referensen saknas, när HEAD redan är framme och när historien har gått isär.
+ */
+async function redoPath(gitDir: string, workTree: string): Promise<string[]> {
+  const r = await runGit(gitDir, workTree, ['rev-list', '--topo-order', '--ancestry-path', `HEAD..${REDO_REF}`, '--'], [0, 128]);
+  return r.code === 0 ? r.stdout.split('\n').filter(Boolean) : []; // 128: referensen finns inte
+}
+
+/** Ligger HEAD på vägen till gör om-referensen (förfader eller samma)? none: referensen finns inte. */
+async function redoState(gitDir: string, workTree: string): Promise<'on' | 'off' | 'none'> {
+  const r = await runGit(gitDir, workTree, ['merge-base', '--is-ancestor', 'HEAD', REDO_REF], [0, 1, 128]);
+  return r.code === 0 ? 'on' : r.code === 1 ? 'off' : 'none';
+}
+
+/** Tar bort gör om-referensen. Misslyckas det står den kvar där den inte skadar (canRedo prövar vägen varje gång). */
+async function dropRedo(gitDir: string, workTree: string): Promise<void> {
+  try {
+    await runGit(gitDir, workTree, ['update-ref', '-d', REDO_REF]);
+  } catch (err) {
+    console.warn(`[git] kunde inte ta bort ${REDO_REF} i ${gitDir}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
 /** Tar bort kvarlämnade lås (äldre än 10 s) i git-katalogen. Returnerar de borttagna. */
 export async function removeStaleLocks(gitDir: string, now = Date.now()): Promise<string[]> {
   const removed: string[] = [];
@@ -196,6 +233,9 @@ export function createAppGit(paths: Paths): AppGit {
         const diff = await runGit(gitDir, workTree, ['diff', '--cached', '--quiet'], [0, 1]);
         if (diff.code === 0) return false;
         await runGit(gitDir, workTree, ['commit', '-q', '--no-verify', '-m', msg]);
+        // En ny commit utanför vägen till gör om-referensen: historien har gått isär, och gör om finns inte längre.
+        // Bara städning (canRedo prövar vägen ändå), så den får aldrig fälla en commit som gått igenom.
+        if ((await redoState(gitDir, workTree).catch(() => 'none' as const)) === 'off') await dropRedo(gitDir, workTree);
         return true;
       });
     },
@@ -204,12 +244,35 @@ export function createAppGit(paths: Paths): AppGit {
       const { gitDir, workTree } = dirs(appId);
       return serial(appId, async () => {
         if (!fs.existsSync(path.join(gitDir, 'HEAD'))) return false;
-        const count = await runGit(gitDir, workTree, ['rev-list', '--count', 'HEAD'], [0, 128]);
+        const count = await runGit(gitDir, workTree, ['rev-list', '--count', 'HEAD', '--'], [0, 128]);
         if (count.code !== 0 || Number(count.stdout.trim()) <= 1) return false;
         await removeStaleLocks(gitDir);
-        await asRewrite(workTree, () => runGit(gitDir, workTree, ['reset', '-q', '--hard', 'HEAD~1']));
+        // Den ångrade commiten sparas för gör om, före återställningen, men bara när HEAD inte redan ligger på vägen
+        // till referensen: annars skulle ett andra ångra i rad skriva över den översta commiten med den under.
+        if ((await redoState(gitDir, workTree)) !== 'on') await runGit(gitDir, workTree, ['update-ref', REDO_REF, 'HEAD']);
+        await asRewrite(workTree, () => runGit(gitDir, workTree, ['reset', '-q', '--hard', 'HEAD~1', '--']));
         return true;
       });
+    },
+
+    async redo(appId) {
+      const { gitDir, workTree } = dirs(appId);
+      return serial(appId, async () => {
+        if (!fs.existsSync(path.join(gitDir, 'HEAD'))) return false;
+        const steps = await redoPath(gitDir, workTree);
+        const next = steps.at(-1);
+        if (!next) return false;
+        await removeStaleLocks(gitDir);
+        await asRewrite(workTree, () => runGit(gitDir, workTree, ['reset', '-q', '--hard', next, '--']));
+        // Framme vid den senast ångrade commiten: inget mer att göra om.
+        if (steps.length === 1) await dropRedo(gitDir, workTree);
+        return true;
+      });
+    },
+
+    async canRedo(appId) {
+      const { gitDir, workTree } = dirs(appId);
+      return serial(appId, async () => fs.existsSync(path.join(gitDir, 'HEAD')) && (await redoPath(gitDir, workTree)).length > 0);
     },
   };
 }

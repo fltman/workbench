@@ -1,14 +1,15 @@
 # Projektets Obsidian-valv följer aldrig med i repot
-vault/
+/vault/
 .obsidian/
 
 node_modules/
 dist/
 .DS_Store
 
-# Användarens appar (varsitt git-repo) och workbenchens körtidsdata
-apps/
-data/
+# Användarens appar (varsitt git-repo) och workbenchens körtidsdata. Förankrade, så att
+# testriggens appar (tests/bridge-harness/apps/) följer med.
+/apps/
+/data/
 
 # Byggarnas och testernas tillfälliga kataloger
 .scratch/

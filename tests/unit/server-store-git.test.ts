@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { commitMessage, createAppGit } from '../../server/live/git.ts';
+import { commitMessage, createAppGit, removeStaleLocks } from '../../server/live/git.ts';
 import { makePaths } from '../../server/paths.ts';
 import type { Config, Paths } from '../../server/types.ts';
 
@@ -172,6 +172,139 @@ test('undo: false med bara första commit; annars reset --hard HEAD~1, data/ or�
   assert.equal(look(a, 'log', '--format=%s'), 'Ny app');
 });
 
+/** Finns gör om-referensen? (rev-parse --verify -q fäller look() när den saknas.) */
+function hasRedoRef(a: App): boolean {
+  try {
+    look(a, 'rev-parse', '-q', '--verify', 'refs/wb/redo^{commit}');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test('gör om: tre commits, två ångra och två gör om ger filerna byte för byte; data/ orörd (§6)', async () => {
+  const a = newApp();
+  const git = createAppGit(a.paths);
+  await git.init(a.id);
+  const index = path.join(a.appDir, 'index.html');
+  const extra = path.join(a.appDir, 'ny.js');
+  const snap = () => ({ index: fs.readFileSync(index), extra: fs.existsSync(extra) ? fs.readFileSync(extra) : null });
+  // Byte som inte är ren text (NUL, 0xff, CRLF, flerbytestecken), så att jämförelsen verkligen gäller byten.
+  fs.writeFileSync(index, Buffer.from('<p>A</p>\n'));
+  assert.equal(await git.commitAll(a.id, 'A'), true);
+  const sA = snap();
+  fs.writeFileSync(index, Buffer.from([0x3c, 0x70, 0x3e, 0xc3, 0xa5, 0x00, 0xff, 0x0d, 0x0a]));
+  fs.writeFileSync(extra, 'export const b = 1;\n');
+  assert.equal(await git.commitAll(a.id, 'B'), true);
+  const sB = snap();
+  fs.writeFileSync(index, Buffer.from('<p>C – åäö</p>\r\n'));
+  fs.rmSync(extra);
+  assert.equal(await git.commitAll(a.id, 'C'), true);
+  const sC = snap();
+  const top = look(a, 'rev-parse', 'HEAD');
+  // Appens data ändras efter sista commiten: varken ångra eller gör om rör den.
+  fs.mkdirSync(path.join(a.appDir, 'data'));
+  fs.writeFileSync(path.join(a.appDir, 'data', 'store.json'), '{"form":3}');
+
+  assert.equal(await git.canRedo(a.id), false, 'inget är ångrat än');
+  assert.equal(await git.redo(a.id), false);
+  assert.equal(await git.undo(a.id), true);
+  assert.equal(await git.canRedo(a.id), true);
+  assert.equal(await git.undo(a.id), true);
+  assert.deepEqual(snap(), sA, 'två ångra: filerna som efter A');
+  assert.equal(look(a, 'rev-parse', 'refs/wb/redo'), top, 'referensen pekar fortfarande på den översta commiten');
+
+  assert.equal(await git.redo(a.id), true);
+  assert.deepEqual(snap(), sB, 'ett gör om: B byte för byte, ny.js tillbaka');
+  assert.equal(await git.canRedo(a.id), true);
+  assert.equal(await git.redo(a.id), true);
+  assert.deepEqual(snap(), sC, 'två gör om: C byte för byte, ny.js borta igen');
+  assert.equal(look(a, 'rev-parse', 'HEAD'), top);
+  assert.equal(look(a, 'log', '--format=%s'), 'C\nB\nA\nNy app');
+  assert.equal(await git.canRedo(a.id), false, 'framme: inget mer att göra om');
+  assert.equal(await git.redo(a.id), false);
+  assert.equal(hasRedoRef(a), false, 'referensen tas bort när HEAD når den');
+  assert.equal(fs.readFileSync(path.join(a.appDir, 'data', 'store.json'), 'utf8'), '{"form":3}', 'data/ orörd genom alla steg');
+});
+
+test('gör om försvinner när historien går isär; en tur utan commit behåller det (§6)', async () => {
+  const a = newApp();
+  const git = createAppGit(a.paths);
+  await git.init(a.id);
+  const index = path.join(a.appDir, 'index.html');
+  fs.writeFileSync(index, 'B');
+  assert.equal(await git.commitAll(a.id, 'B'), true);
+  fs.writeFileSync(index, 'C');
+  assert.equal(await git.commitAll(a.id, 'C'), true);
+  assert.equal(await git.undo(a.id), true);
+  assert.equal(await git.canRedo(a.id), true, 'kalibrering: efter ångra går det att göra om');
+
+  fs.writeFileSync(index, 'D');
+  assert.equal(await git.commitAll(a.id, 'D'), true);
+  assert.equal(await git.canRedo(a.id), false);
+  assert.equal(await git.redo(a.id), false);
+  assert.equal(fs.readFileSync(index, 'utf8'), 'D', 'gör om rör inte filerna');
+  assert.equal(look(a, 'log', '--format=%s'), 'D\nB\nNy app');
+  assert.equal(hasRedoRef(a), false, 'den nya commiten tog bort referensen');
+
+  assert.equal(await git.undo(a.id), true);
+  assert.equal(await git.commitAll(a.id, 'inget att committa'), false);
+  assert.equal(await git.canRedo(a.id), true, 'en tur utan commit behåller gör om');
+  assert.equal(await git.redo(a.id), true);
+  assert.equal(fs.readFileSync(index, 'utf8'), 'D');
+});
+
+test('en gör om-referens som inte kunde tas bort efter en ny commit ger varken canRedo eller gör om (kalibrerat)', async () => {
+  const a = newApp();
+  const git = createAppGit(a.paths);
+  await git.init(a.id);
+  const index = path.join(a.appDir, 'index.html');
+  fs.writeFileSync(index, 'B');
+  assert.equal(await git.commitAll(a.id, 'B'), true);
+  fs.writeFileSync(index, 'C');
+  assert.equal(await git.commitAll(a.id, 'C'), true);
+  assert.equal(await git.undo(a.id), true);
+  // Ett färskt lås på referensen: committen går igenom, men städningen (update-ref -d) misslyckas.
+  const lock = path.join(a.gitDir, 'refs', 'wb', 'redo.lock');
+  fs.writeFileSync(lock, '');
+  fs.writeFileSync(index, 'D');
+  assert.equal(await git.commitAll(a.id, 'D'), true, 'städningen fäller aldrig en commit som gått igenom');
+  const d = look(a, 'rev-parse', 'HEAD');
+  fs.rmSync(lock);
+  assert.equal(hasRedoRef(a), true, 'kalibrering: referensen till C står kvar');
+
+  // Vägen prövas varje gång: D ligger inte på vägen till C, så gör om skulle annars ta bort D ur historien.
+  assert.equal(await git.canRedo(a.id), false, 'canRedo prövar vägen, inte bara referensen');
+  assert.equal(await git.redo(a.id), false, 'gör om går aldrig över till den gamla grenen');
+  assert.equal(fs.readFileSync(index, 'utf8'), 'D');
+  assert.equal(look(a, 'log', '--format=%s'), 'D\nB\nNy app');
+  // Nästa ångra sparar D i referensen, så gör om tar tillbaka D och inte C.
+  assert.equal(await git.undo(a.id), true);
+  assert.equal(look(a, 'rev-parse', 'refs/wb/redo'), d, 'referensen pekar på D');
+  assert.equal(await git.redo(a.id), true);
+  assert.equal(fs.readFileSync(index, 'utf8'), 'D');
+  assert.equal(hasRedoRef(a), false);
+});
+
+test('filer som heter HEAD och HEAD~1 i appen stoppar varken ångra eller gör om (kalibrerat mot anropen utan --)', async () => {
+  const a = newApp();
+  const git = createAppGit(a.paths);
+  await git.init(a.id);
+  fs.writeFileSync(path.join(a.appDir, 'index.html'), 'v1');
+  assert.equal(await git.commitAll(a.id, 'ett'), true);
+  for (const f of ['HEAD', 'HEAD~1']) fs.writeFileSync(path.join(a.appDir, f), f);
+  assert.equal(await git.commitAll(a.id, 'två'), true);
+  const ambiguous = (e: unknown) => /ambiguous argument/.test(String((e as { stderr?: unknown }).stderr));
+  assert.throws(() => look(a, 'rev-list', '--count', 'HEAD'), ambiguous, 'kalibrering: utan -- är HEAD tvetydigt');
+  assert.throws(() => look(a, 'reset', '-q', '--hard', 'HEAD~1'), ambiguous, 'kalibrering: utan -- är HEAD~1 tvetydigt');
+
+  assert.equal(await git.undo(a.id), true);
+  assert.equal(fs.existsSync(path.join(a.appDir, 'HEAD')), false);
+  assert.equal(await git.canRedo(a.id), true);
+  assert.equal(await git.redo(a.id), true);
+  assert.equal(fs.readFileSync(path.join(a.appDir, 'HEAD~1'), 'utf8'), 'HEAD~1');
+});
+
 test('data/ och node_modules/ versioneras aldrig, inte ens när Claude tagit bort dem ur .gitignore — kalibrerat', async () => {
   const files = ['data/store.json', 'node_modules/p/i.js', 'sub/node_modules/q/j.js', 'sub/data/kod.js', 'data.json', 'index.html'];
   const plant = (dir: string) => {
@@ -232,6 +365,8 @@ test('ogiltiga id avvisas som löften och rör ingenting', async () => {
     await assert.rejects(git.init(bad));
     await assert.rejects(git.commitAll(bad, 'x'));
     await assert.rejects(git.undo(bad));
+    await assert.rejects(git.redo(bad));
+    await assert.rejects(git.canRedo(bad));
   }
   assert.deepEqual(fs.readdirSync(path.join(a.home, 'data', 'apps')), [a.id]);
 });
@@ -294,6 +429,31 @@ test('en kvarlämnad index.lock (äldre än 10 s) tas bort före nästa commit o
   fs.utimesSync(refLock, old, old);
   assert.equal(await git.commitAll(a.id, 'grenlåset'), true);
   assert.equal(fs.existsSync(refLock), false);
+});
+
+test('ett kvarlämnat refs/wb/redo.lock stoppar inte ångra; ett färskt rörs inte (kalibrerat)', async () => {
+  const a = newApp();
+  const git = createAppGit(a.paths);
+  await git.init(a.id);
+  fs.writeFileSync(path.join(a.appDir, 'index.html'), 'x');
+  assert.equal(await git.commitAll(a.id, 'tur'), true);
+  const lock = path.join(a.gitDir, 'refs', 'wb', 'redo.lock');
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  fs.writeFileSync(lock, '');
+  // Kalibrering: låset stoppar verkligen referensen som ångra sparar.
+  await assert.rejects(git.undo(a.id), /redo\.lock/);
+  assert.ok(fs.existsSync(lock), 'ett färskt lås tas aldrig bort');
+  assert.ok(fs.existsSync(path.join(a.appDir, 'index.html')), 'inget återställdes');
+  const old = (Date.now() - 20_000) / 1000;
+  fs.utimesSync(lock, old, old);
+  assert.equal(await git.undo(a.id), true);
+  assert.equal(fs.existsSync(lock), false);
+  assert.equal(await git.redo(a.id), true);
+  // packed-refs.lock tas som de andra låsen (update-ref -d tar det en kort stund).
+  const packed = path.join(a.gitDir, 'packed-refs.lock');
+  fs.writeFileSync(packed, '');
+  fs.utimesSync(packed, old, old);
+  assert.deepEqual(await removeStaleLocks(a.gitDir), ['packed-refs.lock']);
 });
 
 /* ------------------------------ skalinjektion (§15) ------------------------------ */
@@ -371,6 +531,7 @@ test('en ond .git i arbetsträdet (krokar, core.hooksPath) körs aldrig — kali
   fs.writeFileSync(path.join(a.appDir, 'index.html'), '<p>Hej igen</p>');
   assert.equal(await git.commitAll(a.id, 'en till'), true);
   assert.equal(await git.undo(a.id), true);
+  assert.equal(await git.redo(a.id), true);
   assert.deepEqual(fs.readdirSync(markers), [], 'ingen krok kördes');
   assert.ok(!look(a, 'ls-files').split('\n').some((f) => f.startsWith('.git/')), 'arbetsträdets .git committas aldrig');
 });
@@ -405,6 +566,7 @@ test('krokar, core.hooksPath och core.fsmonitor i appens egen git-katalog körs 
   fs.writeFileSync(path.join(a.appDir, 'index.html'), '<p>Hej</p>');
   assert.equal(await git.commitAll(a.id, 'med manipulerad config'), true);
   assert.equal(await git.undo(a.id), true);
+  assert.equal(await git.redo(a.id), true);
   const left = fs.readdirSync(markers).filter((f) => fs.statSync(path.join(markers, f)).isFile());
   assert.deepEqual(left, [], 'varken krok, hooksPath eller fsmonitor kördes');
 });
@@ -443,6 +605,7 @@ test('användarens globala git-konfig (HOME/.gitconfig, ~/.config/git/*) läses 
     fs.writeFileSync(path.join(a.appDir, 'index.html'), '<p>Hej</p>');
     assert.equal(await git.commitAll(a.id, 'med ond HOME'), true);
     assert.equal(await git.undo(a.id), true);
+    assert.equal(await git.redo(a.id), true);
   } finally {
     process.env.HOME = savedHome;
   }

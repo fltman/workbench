@@ -2,6 +2,8 @@
 // kantmarkörer (§10.5) och träffytor. Ingen DOM, enhetstestad.
 import type { Camera, CreateAppRequest, WindowState } from '../../../shared/protocol.ts';
 import type { ScreenRect } from '../types.ts';
+import type { Size } from '../hud/placement.ts';
+import { candidate, choosePlacement, coversOwn, GAP, GAP_BELOW, HUD_WEIGHT, MARGIN, overlapArea } from '../hud/placement.ts';
 import { screenToWorld, xform } from './camera.ts';
 import { clamp } from './math.ts';
 
@@ -82,6 +84,19 @@ export function edgeMarker(r: ScreenRect, vw: number, vh: number, inset = 14): {
   if (hw <= 0 || hh <= 0) return null;
   const t = Math.min(dx ? hw / Math.abs(dx) : Infinity, dy ? hh / Math.abs(dy) : Infinity);
   return { x: cx + dx * t, y: cy + dy * t };
+}
+
+/**
+ * Fönstret med kromen runt det på skärmen: prickens sken utanför det övre högra hörnet (6 px) och greppets rad under
+ * nederkanten (26 px). En kantmarkör som når in här ritas inte (§10.5), för den låg annars ovanpå appen eller vid greppet.
+ */
+export function withChrome(r: ScreenRect): ScreenRect {
+  return { x: r.x - 6, y: r.y - 6, w: r.w + 12, h: r.h + 6 + 26 };
+}
+
+/** Rektangeln utvidgad med m px åt alla håll. */
+export function grow(r: ScreenRect, m: number): ScreenRect {
+  return { x: r.x - m, y: r.y - m, w: r.w + 2 * m, h: r.h + 2 * m };
 }
 
 export function inRect(r: ScreenRect, x: number, y: number): boolean {
@@ -192,4 +207,103 @@ export function freeStrip(z: ScreenRect, covers: readonly ScreenRect[], axis: 'x
   if (a1 > cur && (!best || a1 - cur > best[1] - best[0])) best = [cur, a1];
   if (!best || best[1] - best[0] < min) return null;
   return axis === 'x' ? { x: best[0], y: z.y, w: best[1] - best[0], h: z.h } : { x: z.x, y: best[0], w: z.w, h: best[1] - best[0] };
+}
+
+/* ------------------------------ en ny app från fältet (§10.9) ------------------------------ */
+
+/** Minsta storlek (skärm-px) för en app från fältet. */
+export const FIELD_MIN: Size = { w: 320, h: 220 };
+
+/** Trappsteget (skärm-px) när en app från fältet annars skulle begrava ett annat fönster. */
+export const CASCADE = 32;
+
+/**
+ * Begraver en app på r fönstret o? Då ligger o:s prick (några px in från det övre högra hörnet, §14) under appen, och
+ * o:s grepp (12,5 px under nederkanten, mitt under fönstret) ligger också under den eller under appens eget grepp
+ * (träffytan 72 × 24 px). Kvar syns bara en kant av o, utan något att ta i.
+ */
+export function buries(r: ScreenRect, o: ScreenRect): boolean {
+  if (!coveredPoint(o.x + o.w - 4, o.y + 4, [r])) return false;
+  const gx = o.x + o.w / 2;
+  const gy = o.y + o.h + 12.5;
+  return coveredPoint(gx, gy, [r]) || (Math.abs(r.x + r.w / 2 - gx) < 72 && Math.abs(r.y + r.h + 12.5 - gy) < 24);
+}
+
+/**
+ * Begraver r något av fönstren flyttas den ett trappsteg (CASCADE) i taget: först upp åt vänster, för pricken sitter
+ * uppe till höger och greppet under fönstret, så att båda syns bredvid den nya appen; sedan ned åt vänster, ned åt
+ * höger och upp åt höger (då syns pricken, men greppet hamnar under appen). Den första platsen i vyn (MARGIN in) som inte
+ * begraver något och inte överlappar mer än mitten vinner; annars mitten om den inte begraver något, annars den första
+ * platsen som inte begraver något. Finns ingen står r kvar.
+ */
+function cascade(r: ScreenRect, wins: readonly ScreenRect[], view: Size, cost: (q: ScreenRect) => number, centre: ScreenRect): ScreenRect {
+  const free = (q: ScreenRect): boolean => !wins.some((o) => buries(q, o));
+  if (free(r)) return r;
+  const bound = cost(centre);
+  let dear: ScreenRect | null = null;
+  const steps = Math.ceil(Math.max(view.w, view.h) / CASCADE);
+  for (let k = 1; k <= steps; k++) {
+    for (const [dx, dy] of [[-1, -1], [-1, 1], [1, 1], [1, -1]] as const) {
+      const q = { x: r.x + dx * k * CASCADE, y: r.y + dy * k * CASCADE, w: r.w, h: r.h };
+      if (q.x < MARGIN || q.y < MARGIN || q.x > view.w - q.w - MARGIN || q.y > view.h - q.h - MARGIN || !free(q)) continue;
+      if (cost(q) <= bound) return q;
+      dear ??= q;
+    }
+  }
+  if (free(centre)) return centre;
+  return dear ?? r;
+}
+
+/**
+ * Var en ny app från fältet hamnar (skärm-px): mitt i vyn om mitten är fri. Annars bredvid ett fönster med HUD:ens
+ * kandidater (§13: höger, vänster, under, över), först appen i fokus (utan fokus fönstret som täcker mest av mitten,
+ * eller täcker inget fönster mitten, det närmast den), sedan de andra, närmast först: i full storlek där det är fritt,
+ * annars krympt till platsen bredvid (bredden till höger och vänster, höjden under och över), ned till FIELD_MIN. Är det
+ * fullt överallt blir det den sida bredvid appen i fokus som överlappar minst, eller mitten om den överlappar mindre
+ * (och alltid mitten utan fönster), och begraver den ett fönster (buries) ett trappsteg upp åt vänster (cascade). Som
+ * en ritad fyrkant (§10.4) står appen minst DRAW_INSET från vyns kanter, så att pricken och greppet syns. Kameran
+ * flyttas aldrig.
+ * focused: fönstret i fokus om det syns; others: andra fönster på skärmen; obstacles: öppna HUD:ar och miniatyrerna i
+ * raden, som undviks (HUD:ar väger dubbelt, som i §13) men inte är något att stå bredvid.
+ */
+export function fieldRect(size: Size, view: Size, focused: ScreenRect | null, others: ScreenRect[], obstacles: ScreenRect[] = []): ScreenRect {
+  // HUD:ens kandidater kläms MARGIN in i vyn. I en vy som är DRAW_INSET − MARGIN mindre runt om hamnar de DRAW_INSET in
+  // i den riktiga, och mitten blir densamma.
+  const d = DRAW_INSET - MARGIN;
+  const by = (r: ScreenRect, k: number): ScreenRect => ({ x: r.x + k, y: r.y + k, w: r.w, h: r.h });
+  const inner = { w: view.w - 2 * d, h: view.h - 2 * d };
+  return by(placeField(size, inner, focused && by(focused, -d), others.map((o) => by(o, -d)), obstacles.map((o) => by(o, -d))), d);
+}
+
+function placeField(size: Size, view: Size, focused: ScreenRect | null, others: ScreenRect[], obstacles: ScreenRect[]): ScreenRect {
+  const centre = { x: (view.w - size.w) / 2, y: (view.h - size.h) / 2 + 30, w: size.w, h: size.h };
+  const wins = focused ? [focused, ...others] : others;
+  const cost = (r: ScreenRect, skip: ScreenRect | null): number =>
+    wins.reduce((c, o) => (o === skip ? c : c + overlapArea(r, o)), 0) + obstacles.reduce((c, o) => c + HUD_WEIGHT * overlapArea(r, o), 0);
+  if (cost(centre, null) === 0) return centre;
+  const far = (r: ScreenRect, p: ScreenRect): number => Math.hypot(r.x + r.w / 2 - (p.x + p.w / 2), r.y + r.h / 2 - (p.y + p.h / 2));
+  // Utan fokus kan mitten vara upptagen av bara en HUD eller en miniatyr; då står appen bredvid fönstret närmast mitten.
+  const own = focused ?? [...others].sort((a, b) => overlapArea(centre, b) - overlapArea(centre, a) || far(a, centre) - far(b, centre))[0];
+  if (!own) return centre;
+  const anchors = [own, ...wins.filter((o) => o !== own).sort((a, b) => far(a, own) - far(b, own))];
+  const at = (p: { x: number; y: number }, s: Size): ScreenRect => ({ x: p.x, y: p.y, w: s.w, h: s.h });
+  for (const a of anchors) {
+    const p = choosePlacement(a, wins.filter((o) => o !== a), size, view, obstacles);
+    if (p.side !== 'overlay' && cost(at(p, size), a) === 0) return at(p, size);
+  }
+  for (const a of anchors) {
+    const room = { right: view.w - MARGIN - (a.x + a.w + GAP), left: a.x - GAP - MARGIN, below: view.h - MARGIN - (a.y + a.h + GAP_BELOW), above: a.y - GAP - MARGIN };
+    for (const side of ['right', 'left', 'below', 'above'] as const) {
+      const fit = Math.floor(room[side]);
+      const s = side === 'right' || side === 'left' ? { w: Math.min(size.w, fit), h: size.h } : { w: size.w, h: Math.min(size.h, fit) };
+      if (s.w < FIELD_MIN.w || s.h < FIELD_MIN.h) continue;
+      const p = candidate(side, a, s, view);
+      if (!coversOwn(p, s, a) && cost(at(p, s), a) === 0) return at(p, s);
+    }
+  }
+  const p = choosePlacement(own, wins.filter((o) => o !== own), size, view, obstacles);
+  const least = p.side !== 'overlay' ? at(p, size) : centre;
+  // Aldrig mer överlapp än mitten, där appen alltid hamnade förut. Men aldrig exakt över ett annat fönster: med samma
+  // storlek blir mitten eller sidan bredvid appen i fokus ofta just ett äldre fältbygges rektangel (QA 17 oktober).
+  return cascade(cost(least, null) <= cost(centre, null) ? least : centre, wins, view, (q) => cost(q, null), centre);
 }

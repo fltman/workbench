@@ -3,7 +3,7 @@
 // ljusaste och mörkaste punkt. Glaset släpper igenom bakgrunden, så varje term i --wb-hud-blur som ändrar färgen
 // (saturate(), brightness()) läggs på bakgrunden i CSS-ordning innan tonen läggs ovanpå; blur() ändrar inte en
 // jämn yta. Formeln kalibreras mot kända par och brightness() mot pixlar uppmätta i Chrome. Två planterade läckor
-// måste fällas: den första, ljusare gradienten och dagens ton utan brightness().
+// måste fällas: den första, ljusare gradienten och dagens ton utan brightness(). Sist kantmarkörerna, som ligger på ytan.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -144,7 +144,7 @@ test('kalibrering: WCAG-formeln ger de kända värdena', () => {
   assert.throws(() => colourFilters('blur(28px) contrast(1.2)'), /contrast/, 'en omodellerad färgterm ska fälla testet');
 });
 
-// Uppmätt i riktig Chrome (playwright-core, channel 'chrome', DSF 2; .scratch/w6-glass/final/measure.mjs): HUD:en
+// Uppmätt i riktig Chrome (playwright-core, channel 'chrome', DSF 2): HUD:en
 // öppen över en app, all text genomskinlig, medianen av 12 × 12 enhetspixlar i panelens mitt (t = 0,5 på
 // gradientlinjen). Tokens står med eftersom kalibreringen gäller funktionerna, inte dagens tokens.
 const CHROME = {
@@ -174,6 +174,42 @@ test('all HUD-text har minst 4,5:1 över grå yta, vit app och mörk app (tokens
   assert.deepEqual(failing, [], JSON.stringify(failing, null, 1));
   const worst = all.reduce((a, b) => (b.ratio < a.ratio ? b : a));
   assert.ok(worst.ratio >= 4.5, `${worst.name} ${worst.ratio}`);
+});
+
+/* Användarens rad för ett meddelande som aldrig kördes (§13, §14): dämpad, men den ska fortfarande läsas. Minst 4,5:1
+   över grå yta och mörk app, och minst 3:1 över en vit app (WCAG:s golv för stor text och kontroller), även i en lugn HUD. */
+
+/** Den dämpade radens kontrast för en given färg: värsta fallet över vit app, och utan vit app. */
+function droppedRatios(c: RGBA): { white: number; others: number } {
+  let white = Infinity;
+  let others = Infinity;
+  for (const [bname, back] of Object.entries(BACKDROPS)) {
+    for (const t of [0, 1]) {
+      for (const bg of [glass(back, t, HUD_BG, HUD_BLUR), calmGlass(back, t)]) {
+        const r = ratio(over(c, bg), bg);
+        if (bname === 'vit app') white = Math.min(white, r);
+        else others = Math.min(others, r);
+      }
+    }
+  }
+  return { white, others };
+}
+
+/** Läsbar men synligt dämpad: minst 3:1 respektive 4,5:1, och minst 0,12 svagare än användarens vanliga rader. */
+function droppedOk(c: RGBA): boolean {
+  const r = droppedRatios(c);
+  return r.white >= 3 && r.others >= 4.5 && color(cssVar(tokensCss, '--wb-hud-user'))[3] - c[3] >= 0.12;
+}
+
+test('en användarrad som aldrig kördes är dämpad men läsbar: minst 3:1 över en vit app, 4,5:1 annars (kalibrerat åt båda hållen)', () => {
+  const dropped = color(cssVar(hudCss, '--wbh-dropped'));
+  assert.match(hudCss, /\.wbh-user\.is-dropped\s*\{[^}]*color:\s*var\(--wbh-dropped\)/, 'raden använder färgen');
+  const r = droppedRatios(dropped);
+  assert.ok(droppedOk(dropped), `vit app ${r.white.toFixed(2)}, annars ${r.others.toFixed(2)}`);
+  // Kalibrering: för svag (45 % vitt) fälls av läsbarheten, och odämpad (radernas egen färg) av dämpningen.
+  assert.ok(!droppedOk([255, 255, 255, 0.45]), 'för svag ska fällas');
+  assert.ok(droppedRatios([255, 255, 255, 0.45]).white < 3);
+  assert.ok(!droppedOk(color(cssVar(tokensCss, '--wb-hud-user'))), 'en odämpad rad ska fällas');
 });
 
 test('text på vitt (primärknappar, valda alternativ, Ta bort) har minst 4,5:1', () => {
@@ -312,4 +348,101 @@ test('en HUD som inte är aktiv: mikrofonen och stoppknappen i vila har minst 3:
     );
   assert.ok(worst(alpha) >= 3, `vilofärgen ${alpha} gav ${worst(alpha).toFixed(2)}`);
   assert.ok(worst(0.42) < 3, 'kalibrering: den förra ⋯-färgen 0,42 fälls');
+});
+
+/* Kantmarkörerna (§14) ligger direkt på ytan vid vyns kant. De är kontroller, så WCAG 1.4.11 kräver minst 3:1 mot ytan
+   där de kan sitta. Ytan räknas som shadern i bg.ts gör den: ett gaussiskt ljusfall från --wb-canvas-center (50 %/36 %)
+   mot --wb-canvas-edge, blandat i sRGB. Modellen kalibreras mot pixlar från Chrome, och två planterade fel ska fällas:
+   den förra färgen --wb-grip (som prickgridden, bara större) och ren --wb-accent (blå, men lika ljus som ytan). */
+
+const baseCss = fs.readFileSync(path.join(root, 'web/src/styles/base.css'), 'utf8');
+
+/** Ytan i skärmpunkten (x, y) i en vy vw × vh, som shadern i bg.ts (utan dither och prickgrid). */
+function surface(x: number, y: number, vw: number, vh: number): RGB {
+  const c = color(cssVar(tokensCss, '--wb-canvas-center'));
+  const e = color(cssVar(tokensCss, '--wb-canvas-edge'));
+  const d = Math.hypot(vw, vh);
+  const qx = (x - 0.5 * vw) / d;
+  const qy = (y - 0.36 * vh) / d;
+  const light = Math.exp(-(qx * qx + qy * qy) * 3.4);
+  return [0, 1, 2].map((i) => e[i] + (c[i] - e[i]) * light) as RGB;
+}
+
+/** Ett CSS-färgvärde: en färg, var(--token) eller color-mix(in srgb, <färg> N%, <färg>). Annat fäller testet. */
+function cssColour(v: string): RGBA {
+  v = v.trim();
+  const ref = /^var\((--[\w-]+)\)$/.exec(v);
+  if (ref) return cssColour(cssVar(tokensCss, ref[1]));
+  const mix = /^color-mix\(in srgb,\s*(.+?)\s+(\d+(?:\.\d+)?)%,\s*(.+)\)$/.exec(v);
+  if (mix) {
+    const named = (s: string): RGBA => (s === 'black' ? [0, 0, 0, 1] : s === 'white' ? [255, 255, 255, 1] : cssColour(s));
+    const [a, k, b] = [named(mix[1]), Number(mix[2]) / 100, named(mix[3])];
+    assert.ok(a[3] === 1 && b[3] === 1, `color-mix med genomskinliga färger modelleras inte: ${v}`);
+    return [0, 1, 2].map((i) => a[i] * k + b[i] * (1 - k)).concat(1) as RGBA;
+  }
+  return color(v);
+}
+
+/** Kantmarkörens fyllning i base.css (regeln .wb-marker i). */
+function markerFill(css: string): string {
+  const m = /\.wb-marker i \{[^}]*?\n\s*background:\s*([^;]+);/.exec(css);
+  if (!m) throw new Error('saknar kantmarkörens färg i base.css');
+  return m[1];
+}
+
+/** Sämsta kontrasten mot ytan för en fyllning, längs hela vyns kant (14 px in, där layout.edgeMarker sätter dem). */
+function worstAtEdge(fill: RGBA, vw: number, vh: number): { ratio: number; x: number; y: number } {
+  let worst = { ratio: Infinity, x: 0, y: 0 };
+  const inset = 14;
+  const pts: Array<[number, number]> = [];
+  for (let x = inset; x <= vw - inset; x += 8) pts.push([x, inset], [x, vh - inset]);
+  for (let y = inset; y <= vh - inset; y += 8) pts.push([inset, y], [vw - inset, y]);
+  pts.push([vw - inset, vh - inset]);
+  for (const [x, y] of pts) {
+    const back = surface(x, y, vw, vh);
+    const r = ratio(over(fill, back), back);
+    if (r < worst.ratio) worst = { ratio: r, x, y };
+  }
+  return worst;
+}
+
+const VIEWS: Array<[number, number]> = [[1440, 900], [1280, 800], [1920, 1080], [2560, 1440], [1024, 700], [3440, 1440], [800, 1280]];
+
+// Uppmätt i riktig Chrome (playwright-core, channel 'chrome', DSF 2, 1440 × 900, låtsas-Claude, tom yta; medianen av
+// 12 × 12 enhetspixlar, som tar bort prickgridden och dithern). Kantmarkören i 55 % mörkad accent mättes till (26, 59, 140).
+const SURFACE_SAMPLES: Array<{ at: [number, number]; px: RGB }> = [
+  { at: [720, 324], px: [176, 179, 184] },
+  { at: [720, 20], px: [172, 175, 180] },
+  { at: [20, 450], px: [157, 160, 165] },
+  { at: [1420, 450], px: [157, 160, 165] },
+  { at: [720, 880], px: [163, 166, 171] },
+  { at: [20, 20], px: [155, 158, 163] },
+  { at: [1420, 880], px: [150, 153, 158] },
+  { at: [300, 700], px: [163, 166, 171] },
+];
+
+test('kalibrering: ytan räknas som i Chrome (uppmätta pixlar), och color-mix som Chrome blandar den', () => {
+  for (const s of SURFACE_SAMPLES) {
+    const model = surface(s.at[0], s.at[1], 1440, 900);
+    const off = Math.max(...model.map((v, i) => Math.abs(v - s.px[i])));
+    assert.ok(off <= 1, `(${s.at}): modellen ${model.map((v) => v.toFixed(1))} mot uppmätt ${s.px}`);
+  }
+  const mixed = cssColour('color-mix(in srgb, var(--wb-accent) 55%, black)');
+  assert.deepEqual(mixed.slice(0, 3).map(Math.round), [26, 59, 140]);
+  assert.throws(() => markerFill('.wb-marker i { color: red; }'), /saknar/);
+});
+
+test('kantmarkörerna har minst 3:1 mot ytan längs hela vyns kant (base.css)', () => {
+  const fill = cssColour(markerFill(baseCss));
+  for (const [vw, vh] of VIEWS) {
+    const w = worstAtEdge(fill, vw, vh);
+    assert.ok(w.ratio >= 3, `${vw}×${vh}: ${w.ratio.toFixed(2)} vid (${w.x}, ${w.y})`);
+  }
+});
+
+test('planterade fel: kantmarkören i --wb-grip (den förra färgen) och i ren --wb-accent fälls', () => {
+  for (const name of ['--wb-grip', '--wb-accent']) {
+    const worst = Math.min(...VIEWS.map(([vw, vh]) => worstAtEdge(cssColour(`var(${name})`), vw, vh).ratio));
+    assert.ok(worst < 2, `${name} ska fällas, gav ${worst.toFixed(2)}`);
+  }
 });

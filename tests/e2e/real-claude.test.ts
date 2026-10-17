@@ -1,6 +1,6 @@
 // tests/e2e/real-claude.test.ts — den första riktiga end-to-end-byggnaden (CONTRACT §15, §8.2).
-// Körs BARA med WORKBENCH_REAL=1 (förbrukar riktig Claude-kvot via nyckelringsinloggningen). Egna portar
-// 8271/8278 och en tillfällig WORKBENCH_HOME under .scratch. Bygger en enkel klocka och verifierar:
+// Körs BARA med WORKBENCH_REAL=1 (förbrukar riktig Claude-kvot via nyckelringsinloggningen). Lediga portar
+// (eller WB_E2E_PORT, HMR = porten + 9) och en tillfällig WORKBENCH_HOME under .scratch. Bygger en enkel klocka och verifierar:
 // index.html + app.json finns, built=true, en commit bortom fröet, tool-händelser med svenska etiketter
 // (bl.a. "Tittar på appen" och "Läser loggarna"), inga oväntade policy-/sandlådeavslag, status idle och att
 // §8.2-självtestet gick igenom. Den sista skärmbilden kopieras till .scratch/integrator/real-claude-clock.png.
@@ -17,10 +17,11 @@ import { WebSocket } from 'ws';
 import { createShots } from '../../server/claude/shots.ts';
 import type { AppInfo, ChatEvent, Scene, ServerMsg, WindowState } from '../../shared/protocol.ts';
 import type { AppRegistry, SceneStore, Shots } from '../../server/types.ts';
+import { testPort } from '../ports.ts';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const PORT = 8271;
-const HMR = 8278;
+const PORT = await testPort('WB_E2E_PORT');
+const HMR = process.env.WB_E2E_PORT ? PORT + 9 : await testPort();
 const SHELL = `http://localhost:${PORT}`;
 const execFileP = promisify(execFile);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36';

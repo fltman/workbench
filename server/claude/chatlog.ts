@@ -68,8 +68,8 @@ export function history(appDataDir: string, limit = 300): ChatEvent[] {
 }
 
 /**
- * §8.10 Omstart mitt i en tur: obesvarad ask → ask-done 'cancelled'; öppen tur → turn slut med interrupted.
- * Returnerar händelserna som lades till.
+ * §8.10 Omstart mitt i en tur: obesvarad ask → ask-done 'cancelled'; öppen tur → turn slut med interrupted och noten
+ * "Avbröts", som efter ett stopp (§8.6), så att användarens rad inte står ensam. Returnerar händelserna som lades till.
  */
 export function repairChat(appDataDir: string, now = Date.now()): ChatEvent[] {
   const events = readEvents(appDataDir);
@@ -86,7 +86,11 @@ export function repairChat(appDataDir: string, now = Date.now()): ChatEvent[] {
   }
   const fixes: ChatEvent[] = [];
   for (const id of openAsks) if (!done.has(id)) fixes.push({ k: 'ask-done', id, decision: 'cancelled' });
-  if (turnOpen) fixes.push({ k: 'turn', phase: 'end', ok: false, interrupted: true, at: Math.max(now, lastAt + 1) });
+  if (turnOpen) {
+    const at = Math.max(now, lastAt + 1);
+    fixes.push({ k: 'turn', phase: 'end', ok: false, interrupted: true, at });
+    fixes.push({ k: 'note', id: `n-${crypto.randomBytes(6).toString('hex')}`, text: 'Avbröts', at: at + 1 });
+  }
   appendEvents(appDataDir, fixes);
   return fixes;
 }

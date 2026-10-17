@@ -9,9 +9,10 @@ export const NOTES_MAX_BYTES = 8 * 1024;
 
 /**
  * Språkraden i varje block. Allt annat Claude läser är engelska, och utan raden kom två av tre
- * slutsvar på engelska i en mätning med riktiga Claude (våg 3, AQ-1).
+ * slutsvar på engelska i en mätning med riktiga Claude (våg 3, AQ-1). Den nämner noterna mellan
+ * verktygsanropen: med "every message to the user" nådde två engelska noter HUD:en (granskningen 17 oktober).
  */
-export const LANGUAGE_LINE = 'Write every message to the user in Swedish.';
+export const LANGUAGE_LINE = 'Write every text block in Swedish, including notes between tool calls: the user reads them all in the HUD.';
 
 /** server/claude/app-rules.md, som läggs till Claude Codes förinställda systemprompt. */
 export function loadAppRules(root: string): string {
@@ -25,8 +26,10 @@ export interface BlockInput {
   faces: FaceDef[];
   backend: BackendState;
   backendPort: number | null;
-  /** Användaren har ångrat Claudes senaste ändring sedan förra meddelandet. */
+  /** Användaren har ångrat (eller gjort om) Claudes ändringar sedan förra meddelandet. */
   undone: boolean;
+  /** Netto sedan förra meddelandet (§8.4): ångrade minus gjorda om. Negativt efter gör om av äldre ångrade; saknas: 1. */
+  steps?: number;
   /** Innehållet i CLAUDE.md, bara i första meddelandet i varje ny process; null = utelämnas. */
   notes: string | null;
 }
@@ -42,8 +45,21 @@ export function backendLine(state: BackendState, port: number | null): string {
     case 'running': return port ? `Back end: running on port ${port}` : 'Back end: running.';
     case 'crashed': return 'Back end: crashed – see get_app_logs';
     case 'starting': return 'Back end: starting.';
-    case 'stopped': return 'Back end: stopped (reload_app starts it).';
+    case 'stopped': return 'Back end: stopped (the next request or call_backend starts it).';
   }
+}
+
+/**
+ * Raden om ångra och gör om (§8.4), netto: den påstår aldrig mer än som hänt. Efter ångra och sedan gör om är
+ * filerna som Claude lämnade dem, och då får raden inte säga att de återställts.
+ */
+function historyLine(steps: number): string {
+  const n = Math.abs(steps);
+  if (steps === 1) return 'Since your last turn: the user undid your last change; files are restored to the previous version.';
+  if (steps > 1) return `Since your last turn: the user undid your last ${n} changes; files are restored to an earlier version.`;
+  if (steps === 0) return 'Since your last turn: the user undid and then redid your changes; the files are as you left them.';
+  if (steps === -1) return 'Since your last turn: the user redid a change that had been undone earlier; the files now include it again.';
+  return `Since your last turn: the user redid ${n} changes that had been undone earlier; the files now include them again.`;
 }
 
 /** Bygger <workbench>-blocket (utan användarens text). */
@@ -58,7 +74,7 @@ export function workbenchBlock(b: BlockInput): string {
     lines.push('Window: none (the app has no window right now).');
   }
   lines.push(backendLine(b.backend, b.backendPort));
-  if (b.undone) lines.push('Since your last turn: the user undid your last change; files are restored to the previous version.');
+  if (b.undone) lines.push(historyLine(b.steps ?? 1));
   lines.push(LANGUAGE_LINE);
   if (b.notes !== null) {
     lines.push('Your notes (CLAUDE.md):');

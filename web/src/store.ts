@@ -40,6 +40,10 @@ class Store {
   #pendingCam: Camera | null = null;
   #firstSnapshot = true;
   #hooked = false;
+  /** Appar där Gör om finns (§13): satt av svaren på ångra och gör om, borta vid appens nästa turn-händelse. */
+  #redo = new Set<string>();
+  /** Antal turn-händelser per app, så att ett svar som kommer efter en tur inte sätter Gör om igen (§13). */
+  #turns = new Map<string, number>();
 
   on<K extends keyof StoreEvents>(type: K, fn: Fn<StoreEvents[K]>): () => void {
     let set = this.#handlers.get(type);
@@ -146,6 +150,7 @@ class Store {
         this.chats.delete(msg.appId);
         this.live.delete(msg.appId);
         this.#historyLoaded.delete(msg.appId);
+        this.#redo.delete(msg.appId);
         this.#emit('app.removed', msg.appId);
         break;
       case 'scene.window': {
@@ -177,6 +182,11 @@ class Store {
       this.live.set(appId, (this.live.get(appId) ?? '') + ev.text);
     } else {
       if (ev.k === 'text' || ev.k === 'turn') this.live.set(appId, '');
+      // En tur (som kan committa och gå isär från det ångrade) tar bort Gör om, som nästa rev från en tur (§13).
+      if (ev.k === 'turn') {
+        this.#redo.delete(appId);
+        this.#turns.set(appId, (this.#turns.get(appId) ?? 0) + 1);
+      }
       let list = this.chats.get(appId);
       if (!list) this.chats.set(appId, (list = []));
       list.push(ev);
@@ -299,8 +309,35 @@ class Store {
 
   /** Ångra Claudes senaste tur. false = inget att ångra. Kastar om Claude arbetar (409). */
   async undo(appId: string): Promise<boolean> {
-    const res = await api<{ ok: boolean }>('POST', `/api/apps/${encodeURIComponent(appId)}/undo`);
+    const turns = this.#turns.get(appId) ?? 0;
+    const res = await api<{ ok: boolean; canRedo?: boolean }>('POST', `/api/apps/${encodeURIComponent(appId)}/undo`);
+    this.#setRedo(appId, res.canRedo === true, turns);
     return res.ok;
+  }
+
+  /** Gör om det senast ångrade (§13). false = 409: Claude arbetar, eller inget finns att göra om. Kastar vid andra fel. */
+  async redo(appId: string): Promise<boolean> {
+    const turns = this.#turns.get(appId) ?? 0;
+    const res = await fetch(`/api/apps/${encodeURIComponent(appId)}/redo`, { method: 'POST' });
+    if (res.status === 409) {
+      this.#redo.delete(appId);
+      return false;
+    }
+    if (!res.ok) throw new Error(`POST /api/apps/${appId}/redo: ${res.status}`);
+    const body = (await res.json()) as { ok: boolean; canRedo?: boolean };
+    this.#setRedo(appId, body.canRedo === true, turns);
+    return body.ok;
+  }
+
+  /** Finns Gör om för appen (§13)? Bara efter ett ångra, till nästa tur eller tills det senast ångrade är tillbaka. */
+  canRedo(appId: string): boolean {
+    return this.#redo.has(appId);
+  }
+
+  /** Gör om ur svarets canRedo, men inte om en turn-händelse kom medan frågan var ute: då räknade servern ut det före turens commit. */
+  #setRedo(appId: string, can: boolean, turnsBefore: number): void {
+    if (can && (this.#turns.get(appId) ?? 0) === turnsBefore) this.#redo.add(appId);
+    else this.#redo.delete(appId);
   }
 
   /** Förslag på förbättringar av appen (§8.12): sparade per rev, annars en fråga till Claude (kan ta några sekunder). */

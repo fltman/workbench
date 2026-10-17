@@ -3,13 +3,16 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { APP_ID_RE } from '../../shared/protocol.ts';
 import type { CreateAppRequest, OpenItem, RouteResponse, SttResponse } from '../../shared/protocol.ts';
 import { normalizeItem } from '../../shared/open.ts';
-import type { AppGit, AppRegistry, Backends, Config, SceneStore, Sessions } from '../types.ts';
-import { HttpError, createLocks, isPlainObject, mediaType, methodNotAllowed, readBody, readJson, sendError, sendJson } from './util.ts';
+import type { AppGit, AppLogs, AppRegistry, Backends, Config, SceneStore, Sessions } from '../types.ts';
+import { HttpError, createLocks, isPlainObject, mediaType, methodNotAllowed, readBody, readJson, sendError, sendJson, splitUrl } from './util.ts';
 
 export const STT_MAX = 10 * 1024 * 1024;
 export const STT_TYPES = new Set(['audio/webm', 'audio/mp4']);
 const JSON_MAX = 64 * 1024;
 const HISTORY_LIMIT = 300;
+/** GET /api/apps/:id/logs (§7.1): rader utan giltigt n, och taket (loggens ring i minnet). */
+const LOGS_DEFAULT = 400;
+const LOGS_MAX = 2000;
 /** Världskoordinater är obegränsade i princip; det här stoppar bara orimliga tal. */
 const COORD_MAX = 1e9;
 
@@ -19,10 +22,10 @@ export interface RestDeps {
   config: Config;
   scene: Pick<SceneStore, 'get'>;
   registry: Pick<AppRegistry, 'list' | 'get' | 'manifest' | 'create' | 'remove' | 'refresh' | 'bumpRev'>;
-  sessions: Pick<Sessions, 'forget' | 'busy' | 'noteUndo' | 'history'>;
+  sessions: Pick<Sessions, 'forget' | 'busy' | 'noteUndo' | 'noteRedo' | 'history'>;
   backends: Pick<Backends, 'stop' | 'restart' | 'state'>;
-  git: Pick<AppGit, 'undo'>;
-  logs: { clear(appId: string): void };
+  git: Pick<AppGit, 'undo' | 'redo' | 'canRedo'>;
+  logs: Pick<AppLogs, 'clear' | 'tail'>;
   transcribe: Transcribe;
   /** Förslag på förbättringar (§8.12). Saknas: 404. */
   ideas?: (appId: string) => Promise<{ rev: number; items: string[] }>;
@@ -56,7 +59,7 @@ export function appIdFrom(raw: string, registry: Pick<AppRegistry, 'get'>): stri
 
 export function createRest(deps: RestDeps): (req: IncomingMessage, res: ServerResponse, rawPath: string) => Promise<void> {
   const { config, scene, registry, sessions, backends, git, logs } = deps;
-  // DELETE och ångra för samma app körs aldrig samtidigt.
+  // DELETE, ångra och gör om för samma app körs aldrig samtidigt.
   const lock = createLocks();
 
   async function createApp(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -81,10 +84,10 @@ export function createRest(deps: RestDeps): (req: IncomingMessage, res: ServerRe
   /**
    * §7.4: 409 under en tur; annars git.undo och vid ok refresh → restart → bumpRev → noteUndo.
    * restart anropas villkorslöst: tog ångrandet bort backenden ur manifestet stoppar den den gamla
-   * processen, sätter 'none' och returnerar null.
+   * processen, sätter 'none' och returnerar null. canRedo säger skalet om Gör om ska finnas i ⋯-menyn.
    */
   async function undo(res: ServerResponse, id: string): Promise<void> {
-    const ok = await lock(id, async () => {
+    const body = await lock(id, async () => {
       if (!registry.get(id)) throw new HttpError(404, 'appen finns inte');
       if (sessions.busy(id)) throw new HttpError(409, 'Claude arbetar');
       const undone = await git.undo(id);
@@ -94,9 +97,34 @@ export function createRest(deps: RestDeps): (req: IncomingMessage, res: ServerRe
         registry.bumpRev(id);
         sessions.noteUndo(id);
       }
-      return undone;
+      return { ok: undone, canRedo: await canRedo(id) };
     });
-    sendJson(res, 200, { ok });
+    sendJson(res, 200, body);
+  }
+
+  /** §7.4: som ångra, men ett steg fram mot den senast ångrade commiten; 409 också när inget finns att göra om. */
+  async function redo(res: ServerResponse, id: string): Promise<void> {
+    const body = await lock(id, async () => {
+      if (!registry.get(id)) throw new HttpError(404, 'appen finns inte');
+      if (sessions.busy(id)) throw new HttpError(409, 'Claude arbetar');
+      if (!(await git.redo(id))) throw new HttpError(409, 'inget att göra om');
+      registry.refresh(id);
+      await backends.restart(id);
+      registry.bumpRev(id);
+      sessions.noteRedo(id);
+      return { ok: true, canRedo: await canRedo(id) };
+    });
+    sendJson(res, 200, body);
+  }
+
+  /** Bara ett besked till skalet: ett fel här får aldrig fälla ett ångra eller gör om som redan gjorts. */
+  async function canRedo(id: string): Promise<boolean> {
+    try {
+      return await git.canRedo(id);
+    } catch (err) {
+      console.warn(`[workbench] gör om för ${id}:`, err instanceof Error ? err.message : err);
+      return false;
+    }
   }
 
   async function stt(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -115,6 +143,26 @@ export function createRest(deps: RestDeps): (req: IncomingMessage, res: ServerRe
     sendJson(res, 200, { text: result.text, provider: result.provider });
   }
 
+  /**
+   * §7.1: appens senaste loggrader som text, för HUD:ens Visa loggen (§13) i en egen flik. n kläms till 1–2000.
+   * text/plain med nosniff: en loggrad med HTML (från appens konsol) blir aldrig en sida.
+   */
+  function logLines(req: IncomingMessage, res: ServerResponse, id: string): void {
+    const raw = new URLSearchParams(splitUrl(req.url).query).get('n');
+    const asked = raw === null || raw.trim() === '' ? NaN : Math.trunc(Number(raw));
+    const n = Number.isFinite(asked) ? Math.min(LOGS_MAX, Math.max(1, asked)) : LOGS_DEFAULT;
+    const lines = logs.tail(id, n);
+    // Utan rader en kort rad i stället för en tom vit flik.
+    const body = Buffer.from(lines.length ? `${lines.join('\n')}\n` : 'Inga loggrader ännu.\n');
+    res.writeHead(200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-length': String(body.length),
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    res.end(req.method === 'HEAD' ? undefined : body);
+  }
+
   return async (req, res, rawPath) => {
     const method = req.method ?? 'GET';
     try {
@@ -130,6 +178,13 @@ export function createRest(deps: RestDeps): (req: IncomingMessage, res: ServerRe
         if (method !== 'POST') throw methodNotAllowed('POST');
         return await stt(req, res);
       }
+      const logsPath = /^\/api\/apps\/([^/]+)\/logs$/.exec(rawPath);
+      if (logsPath) {
+        const id = appIdFrom(logsPath[1], registry);
+        if (!id) throw new HttpError(404, 'appen finns inte');
+        if (method !== 'GET' && method !== 'HEAD') throw methodNotAllowed('GET, HEAD');
+        return logLines(req, res, id);
+      }
       if (rawPath === '/api/route') {
         if (method !== 'POST') throw methodNotAllowed('POST');
         if (!deps.route) throw new HttpError(404, 'okänd sökväg');
@@ -143,6 +198,13 @@ export function createRest(deps: RestDeps): (req: IncomingMessage, res: ServerRe
           console.warn('[workbench] fältet:', err instanceof Error ? err.message : err);
           throw new HttpError(503, 'kunde inte avgöra vart det ska');
         }
+      }
+      const r = /^\/api\/apps\/([^/]+)\/redo$/.exec(rawPath);
+      if (r) {
+        const id = appIdFrom(r[1], registry);
+        if (!id) throw new HttpError(404, 'appen finns inte');
+        if (method !== 'POST') throw methodNotAllowed('POST');
+        return await redo(res, id);
       }
       const m = /^\/api\/apps\/([^/]+)(\/undo|\/chat|\/ideas)?$/.exec(rawPath);
       if (m) {

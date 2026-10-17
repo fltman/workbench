@@ -6,14 +6,18 @@ import type { SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { AskDecision } from '../../shared/protocol.ts';
 import type { AppLogs, AppRegistry, Backends, Paths, Shots } from '../types.ts';
+import { SAMPLE_KINDS } from './samples.ts';
+import type { SampleKind } from './samples.ts';
 import { SECRET_KEY_RE, SecretStoreError, storeSecret } from './secrets.ts';
-import { apiKey, dragProblem } from './shots.ts';
+import { apiKey, dragProblem, openItem } from './shots.ts';
 import type { TryInput, TryShots, TryStep } from './shots.ts';
 
 export const LOG_LINES_DEFAULT = 80;
 export const LOG_LINES_MAX = 400;
 export const BACKEND_TIMEOUT_MS = 15_000;
 export const BACKEND_BODY_MAX = 20 * 1024;
+/** call_backend:s body_base64, avkodad. */
+export const BACKEND_BINARY_MAX = 256 * 1024;
 
 type ToolResult = { content: ({ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string })[]; isError?: boolean };
 
@@ -40,6 +44,14 @@ export interface ToolDeps {
   /** Visar ett lösenordsfält i HUD:en och väntar på svaret. Värdet går bara hit och vidare till secrets.json. */
   askSecret(key: string, label: string, signal?: AbortSignal): Promise<{ decision: AskDecision; value?: string }>;
   reload: ReloadMemory;
+}
+
+/**
+ * Minnet för reload_app i en ny session börjar vid loggens nuvarande slut. Då rapporterar den första omladdningen
+ * bara fel som kommit sedan sessionen startade, inte gamla rader (loggen fylls från logs.txt efter en omstart).
+ */
+export function reloadMemory(logs: AppLogs, appId: string): ReloadMemory {
+  return { prev: logs.tail(appId, LOG_LINES_MAX) };
 }
 
 /** Raderna i cur som kommit efter de rader som fanns i prev (loggens slut jämförs, tidsstämplar gör raderna unika nog). */
@@ -101,6 +113,8 @@ export async function reloadApp(d: ToolDeps): Promise<ToolResult> {
 }
 
 export async function screenshotApp(d: ToolDeps, face: string | undefined): Promise<ToolResult> {
+  // manifest() är en ögonblicksbild till nästa refresh: en sida som lagts till under turen ska gå att se.
+  d.registry.refresh(d.appId);
   try {
     const shot = await d.shots.screenshot(d.appId, face);
     return {
@@ -124,27 +138,33 @@ const HOP_BY_HOP = new Set(['host', 'connection', 'content-length', 'transfer-en
 const TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const;
 
+/** Huvudena som skickas vidare: giltiga namn, inga radbrytningar, inga hopp-för-hopp-huvuden; namnen med gemener. */
+function cleanHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+  const h: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk) || !TOKEN_RE.test(k) || typeof v !== 'string' || /[\r\n\0]/.test(v)) continue;
+    h[lk] = v;
+  }
+  return h;
+}
+
 /** En förfrågan till appens egen backend på 127.0.0.1 med Host 127.0.0.1:<port>, högst 15 s, svaret högst 20 kB. */
 export function requestBackend(
   port: number,
   method: string,
   reqPath: string,
-  body: string | undefined,
+  body: string | Buffer | undefined,
   headers: Record<string, string> | undefined,
   timeoutMs = BACKEND_TIMEOUT_MS,
 ): Promise<ToolResult> {
   return new Promise((resolve) => {
-    const h: Record<string, string> = {};
-    for (const [k, v] of Object.entries(headers ?? {})) {
-      const lk = k.toLowerCase();
-      if (HOP_BY_HOP.has(lk) || !TOKEN_RE.test(k) || typeof v !== 'string' || /[\r\n\0]/.test(v)) continue;
-      h[lk] = v;
-    }
+    const h = cleanHeaders(headers);
     h.host = `127.0.0.1:${port}`;
-    const payload = body !== undefined ? Buffer.from(body, 'utf8') : undefined;
+    const payload = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
     if (payload) {
       h['content-length'] = String(payload.length);
-      if (!h['content-type']) h['content-type'] = /^\s*[[{]/.test(body ?? '') ? 'application/json' : 'text/plain; charset=utf-8';
+      if (!h['content-type']) h['content-type'] = typeof body !== 'string' ? 'application/octet-stream' : /^\s*[[{]/.test(body) ? 'application/json' : 'text/plain; charset=utf-8';
     }
     let settled = false;
     const finish = (r: ToolResult) => {
@@ -186,14 +206,35 @@ export function requestBackend(
   });
 }
 
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** body_base64 avkodad, eller ett fel till Claude: standard-base64, högst 256 kB, och en uttrycklig content-type. */
+export function binaryBody(b64: unknown, headers: Record<string, string> | undefined): Buffer | string {
+  const s = String(b64 ?? '').replace(/\s+/g, '');
+  if (!BASE64_RE.test(s)) return 'body_base64 must be standard base64 (A–Z, a–z, 0–9, + and /, padded with =).';
+  if (s.length > Math.ceil(BACKEND_BINARY_MAX / 3) * 4 + 4) return 'body_base64 is at most 256 kB decoded.';
+  const bytes = Buffer.from(s, 'base64');
+  if (bytes.length > BACKEND_BINARY_MAX) return 'body_base64 is at most 256 kB decoded.';
+  if (!cleanHeaders(headers)['content-type']?.trim()) return 'body_base64 needs an explicit content-type header, for example { "content-type": "image/png" }.';
+  return bytes;
+}
+
 export async function callBackend(
   d: ToolDeps,
-  args: { method: string; path: string; body?: string; headers?: Record<string, string> },
+  args: { method: string; path: string; body?: string; body_base64?: string; headers?: Record<string, string> },
 ): Promise<ToolResult> {
   const method = String(args.method ?? '').toUpperCase();
   if (!(METHODS as readonly string[]).includes(method)) return fail(`Unsupported method ${JSON.stringify(args.method)}. Use one of ${METHODS.join(', ')}.`);
   const p = String(args.path ?? '');
   if (!p.startsWith('/api/') || /[\s\0\\#]/.test(p) || p.length > 2048) return fail('path must start with /api/ and contain no spaces, backslashes or fragments.');
+  let body: string | Buffer | undefined = args.body;
+  if (args.body_base64 !== undefined) {
+    if (args.body !== undefined) return fail('Pass either body or body_base64, not both.');
+    const bin = binaryBody(args.body_base64, args.headers);
+    if (typeof bin === 'string') return fail(bin);
+    body = bin;
+  }
+  d.registry.refresh(d.appId); // en backend som lagts till i app.json under turen
   if (!d.registry.manifest(d.appId).backend) return fail('This app has no back end. Add "backend": { "entry": "server.mjs" } to app.json, then call reload_app.');
   let port: number | null = null;
   try {
@@ -205,7 +246,7 @@ export async function callBackend(
     const tail = backendTail(d.logs, d.appId, 20);
     return fail(`The back end is not running.${tail.length ? `\nLast back end log lines:\n${tail.join('\n')}` : ' See get_app_logs.'}`);
   }
-  return requestBackend(port, method, p, args.body, args.headers);
+  return requestBackend(port, method, p, body, args.headers);
 }
 
 export async function requestSecret(d: ToolDeps, key: string, label: string, signal?: AbortSignal): Promise<ToolResult> {
@@ -232,7 +273,7 @@ export const TRY_MAX_SEED = 64 * 1024;
 export const TRY_MAX_API = 64 * 1024;
 export const TRY_MAX_API_KEYS = 20;
 const TRY_KEY_RE = /^[A-Za-z0-9._-]{1,100}$/;
-const ACTIONS = ['click', 'hover', 'fill', 'type', 'press', 'wait', 'shot', 'drag'] as const;
+const ACTIONS = ['click', 'hover', 'fill', 'type', 'press', 'wait', 'shot', 'drag', 'upload', 'drop', 'paste', 'open'] as const;
 
 type TryArgs = { steps: TryStep[]; store?: TryInput['store']; api?: TryInput['api']; face?: string };
 
@@ -252,8 +293,14 @@ export function checkTryInput(input: TryArgs): string | null {
     const n = i + 1;
     const acts = ACTIONS.filter((a) => (st as Record<string, unknown>)[a] !== undefined && (a !== 'shot' || st.shot === true));
     if (acts.length !== 1) return `Step ${n} must have exactly one of ${ACTIONS.join(', ')}.`;
-    const sel = st.click ?? st.hover ?? st.fill ?? (typeof st.wait === 'string' ? st.wait : undefined);
+    const sel = st.click ?? st.hover ?? st.fill ?? st.upload ?? st.drop ?? st.paste ?? (typeof st.wait === 'string' ? st.wait : undefined);
     if (sel !== undefined && (typeof sel !== 'string' || sel.length === 0 || sel.length > 200)) return `Step ${n}: the selector must be 1–200 characters.`;
+    const filing = st.upload !== undefined || st.drop !== undefined || st.paste !== undefined;
+    if (filing && !SAMPLE_KINDS.includes(st.sample as SampleKind)) return `Step ${n}: sample must be one of ${SAMPLE_KINDS.join(', ')}.`;
+    if (!filing && st.sample !== undefined) return `Step ${n}: sample goes with upload, drop or paste.`;
+    if (st.open !== undefined && !openItem(st.open)) {
+      return `Step ${n}: open must be {"kind":"url","url":"https://…"}, {"kind":"date","date":"YYYY-MM-DD"} or {"kind":"text","text":"…"} (at most 2000 characters).`;
+    }
     if (st.text !== undefined && (typeof st.text !== 'string' || st.text.length > 500)) return `Step ${n}: text is at most 500 characters.`;
     if (st.type !== undefined && (typeof st.type !== 'string' || st.type.length > 500)) return `Step ${n}: type is at most 500 characters.`;
     if (st.press !== undefined && (typeof st.press !== 'string' || st.press.length === 0 || st.press.length > 32)) return `Step ${n}: press is 1–32 characters.`;
@@ -285,6 +332,7 @@ export async function tryApp(d: ToolDeps, input: TryArgs, signal?: AbortSignal):
   if (bad) return fail(bad);
   const run = (d.shots as Partial<TryShots>).tryRun;
   if (typeof run !== 'function') return fail('try_app is not available here.');
+  d.registry.refresh(d.appId); // sidor, opens och behörigheter som ändrats i app.json under turen
   try {
     const r = await run.call(d.shots, d.appId, { steps: input.steps, store: input.store, api: input.api, face: input.face, signal });
     return {
@@ -328,18 +376,22 @@ export function makeWorkbenchTools(d: ToolDeps): SdkMcpToolDefinition<any>[] {
     ),
     tool(
       'call_backend',
-      "Send an HTTP request to this app's own back end (the routes in server.mjs) and return the status, content type and body (at most 20 kB). Starts the back end if needed. path must start with /api/.",
+      "Send an HTTP request to this app's own back end (the routes in server.mjs) and return the status, content type and body (at most 20 kB). Starts the back end if needed. path must start with /api/. A binary body (an image, a file) goes in body_base64.",
       {
         method: z.string().describe('GET, POST, PUT, PATCH, DELETE, HEAD or OPTIONS'),
         path: z.string().describe('Request path, starting with /api/'),
         body: z.string().optional().describe('Request body; JSON is sent as application/json'),
+        body_base64: z
+          .string()
+          .optional()
+          .describe('Binary request body as base64, at most 256 kB decoded, instead of body. Needs a content-type header, e.g. { "content-type": "image/png" }'),
         headers: z.record(z.string(), z.string()).optional().describe('Extra request headers'),
       },
       async (args) => callBackend(d, args),
     ),
     tool(
       'try_app',
-      "Run this app in a hidden browser at its real window size and perform steps, like a user would. It never touches the user's data: wb.store writes go to a throwaway copy (reads see the copy first, then the real store), back-end requests other than GET/HEAD are refused with 409, other sites get only GET, and WebSockets are closed. Note: a back end that changes state on GET is still reached. Pass api to fake GET responses from the app's own back end (for example a mail list without an account): the faked responses never touch the back end, and the result says how often each path was requested. Returns one line per step (ok/FAIL), discarded store writes, faked responses, blocked requests, console errors, the visible text and a final screenshot. Steps run in order and stop at the first failure; at most 5 s per step and 30 s in total.",
+      "Run this app in a hidden browser at its real window size and perform steps, like a user would. It never touches the user's data: wb.store writes go to a throwaway copy (reads see the copy first, then the real store), back-end requests other than GET/HEAD are refused with 409, other sites get only GET, and WebSockets are closed. Note: a back end that changes state on GET is still reached. Pass api to fake GET responses from the app's own back end (for example a mail list without an account): the faked responses never touch the back end, and the result says how often each path was requested. upload, drop and paste use built-in sample files; the camera and the microphone are fake devices, granted when app.json lists the permission; open hands the app something from the Workbench field (wb.onOpen) the way Workbench does. Returns one line per step (ok/FAIL), discarded store writes, faked responses, blocked requests, console errors, the visible text and a final screenshot. Steps run in order and stop at the first failure; at most 5 s per step and 30 s in total.",
       {
         steps: z
           .array(
@@ -356,6 +408,17 @@ export function makeWorkbenchTools(d: ToolDeps): SdkMcpToolDefinition<any>[] {
                 .array(z.array(z.number()))
                 .optional()
                 .describe('2–50 points [x, y] in CSS px of the window, e.g. [[40, 40], [200, 120]]: press at the first, move through the others, release at the last'),
+              upload: z.string().optional().describe('Locator of an <input type="file"> (it may be hidden): choose the sample file in it'),
+              drop: z.string().optional().describe('Locator of a drop zone: drop the sample file on it (dragenter, dragover, drop)'),
+              paste: z.string().optional().describe('Locator to paste the sample file into (a paste event), e.g. "body"'),
+              sample: z
+                .enum(SAMPLE_KINDS)
+                .optional()
+                .describe('Sample file for upload, drop and paste: "png" (sample.png, 64×64), "jpeg" (sample.jpg, 64×64) or "txt" (sample.txt, a short Swedish text)'),
+              open: z
+                .object({ kind: z.enum(['url', 'date', 'text']), url: z.string().optional(), date: z.string().optional(), text: z.string().optional() })
+                .optional()
+                .describe('Hand the app something from the Workbench field, e.g. {"kind":"url","url":"https://example.com/"}, {"kind":"date","date":"2026-10-20"} or {"kind":"text","text":"Köp mjölk"}. The kind must be in "opens" in app.json; it goes to the first face, received by wb.onOpen'),
             }),
           )
           .describe('1–20 steps, each with exactly one action'),

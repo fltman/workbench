@@ -185,15 +185,20 @@ describe('statiska filer: sökvägsreglerna (§4.6)', () => {
     fs.symlinkSync('data', path.join(appDir, 'alias'));
     execFileSync('mkfifo', [path.join(appDir, 'pipe.html')]);
     naive = naiveServer(appDir);
-    await new Promise<void>((r) => naive.listen(0, '127.0.0.1', r));
+    await new Promise<void>((resolve, reject) => {
+      naive.once('error', reject);
+      naive.listen(0, '127.0.0.1', resolve);
+    });
     naivePort = (naive.address() as { port: number }).port;
-  });
+  }, { timeout: 30_000 });
   after(async () => {
-    await s.close();
-    naive.closeAllConnections();
-    await new Promise<void>((r) => naive.close(() => r()));
+    await s?.close();
+    if (naive) {
+      naive.closeAllConnections();
+      await new Promise<void>((r) => naive.close(() => r()));
+    }
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   test('kalibrering: den naiva servern läcker på minst en förfrågan per kanariefågel', async () => {
     const hits = new Set<string>();
@@ -337,11 +342,11 @@ describe('dist/ i produktion', () => {
     fs.writeFileSync(path.join(dist, 'assets', 'main.js'), 'console.log(1)');
     fs.writeFileSync(path.join(dist, '.secret'), 'nej');
     s = await startRouter({ home: path.join(root, 'home'), distDir: dist });
-  });
+  }, { timeout: 30_000 });
   after(async () => {
-    await s.close();
+    await s?.close();
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   test('filer, SPA-fallback, skalets huvuden och ingen injektion', async () => {
     const index = await request(s.port, { path: '/', headers: NAV });

@@ -185,16 +185,16 @@ describe('/ws över en riktig anslutning', () => {
     s = await startRouter({ home: path.join(root, 'real') });
     leaky = await startRouter({ home: path.join(root, 'leaky'), guardFn: leakyGuard });
     for (const x of [s, leaky]) x.registry.add(APP, { name: 'Kanariefågel' });
-  });
+  }, { timeout: 30_000 });
   afterEach(() => {
     for (const c of clients.splice(0)) c.ws.terminate();
     s.calls.length = 0;
   });
   after(async () => {
-    await s.close();
-    await leaky.close();
+    await s?.close();
+    await leaky?.close();
     rmDir(root);
-  });
+  }, { timeout: 30_000 });
 
   async function open(headers: Record<string, string>, server = s): Promise<Client> {
     const c = await connect(server.port, headers);

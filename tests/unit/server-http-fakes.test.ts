@@ -42,6 +42,8 @@ export type FakeRegistry = AppRegistry & {
   apps: Map<string, AppInfo>;
   manifests: Map<string, AppManifest>;
   created: CreateAppRequest[];
+  /** Raderna som lämnats till registry.noteLog (felsignalen, §7.2). */
+  noted: { appId: string; source: 'console' | 'stderr'; line: string; rev?: number }[];
   add(id: string, opts?: { name?: string; backend?: boolean; faces?: AppManifest['faces']; index?: string }): AppInfo;
 };
 
@@ -49,6 +51,7 @@ export function fakeRegistry(paths: Paths, calls: string[]): FakeRegistry {
   const apps = new Map<string, AppInfo>();
   const manifests = new Map<string, AppManifest>();
   const created: CreateAppRequest[] = [];
+  const noted: FakeRegistry['noted'] = [];
   function add(id: string, opts: { name?: string; backend?: boolean; faces?: AppManifest['faces']; index?: string } = {}): AppInfo {
     const dir = paths.appDir(id);
     fs.mkdirSync(dir, { recursive: true });
@@ -63,7 +66,7 @@ export function fakeRegistry(paths: Paths, calls: string[]): FakeRegistry {
     return info;
   }
   return {
-    apps, manifests, created, add,
+    apps, manifests, created, noted, add,
     list: () => [...apps.values()],
     get: (id) => apps.get(id),
     manifest(id) {
@@ -88,6 +91,8 @@ export function fakeRegistry(paths: Paths, calls: string[]): FakeRegistry {
     setBackend: (id, s) => void calls.push(`registry.setBackend ${id} ${s}`),
     bumpRev: (id) => void calls.push(`registry.bumpRev ${id}`),
     refresh: (id) => void calls.push(`registry.refresh ${id}`),
+    noteLog: (appId, source, line, rev) => void noted.push({ appId, source, line, rev }),
+    troubles: () => [],
   };
 }
 
@@ -147,9 +152,12 @@ export function fakeSessions(calls: string[]): FakeSessions {
       return (hist.get(id) ?? []).slice(-limit);
     },
     noteUndo: (id) => void calls.push(`sessions.noteUndo ${id}`),
+    noteRedo: (id) => void calls.push(`sessions.noteRedo ${id}`),
     busy: (id) => busySet.has(id),
     forget: async (id) => void calls.push(`sessions.forget ${id}`),
     closeAll: async () => void calls.push('sessions.closeAll'),
+    note: (id, text) => void calls.push(`sessions.note ${id} ${text}`),
+    drain: () => void calls.push('sessions.drain'),
   };
 }
 
@@ -190,17 +198,25 @@ export function fakeLogs(calls: string[]): FakeLogs {
   };
 }
 
-export type FakeGit = AppGit & { undoResult: boolean };
+export type FakeGit = AppGit & { undoResult: boolean; redoResult: boolean; canRedoResult: boolean };
 
 export function fakeGit(calls: string[]): FakeGit {
   const g: FakeGit = {
     undoResult: true,
+    redoResult: true,
+    canRedoResult: true,
     init: async () => {},
     commitAll: async () => true,
     async undo(id) {
       calls.push(`git.undo ${id}`);
       return g.undoResult;
     },
+    async redo(id) {
+      calls.push(`git.redo ${id}`);
+      return g.redoResult;
+    },
+    // En fråga, inte en ändring: hamnar inte i calls, så att ordningen i flödena syns som förut.
+    canRedo: async () => g.canRedoResult,
   };
   return g;
 }
@@ -260,7 +276,10 @@ export async function startRouter(opts: StartOptions = {}): Promise<Started> {
   const logs = fakeLogs(calls);
   const git = fakeGit(calls);
   const server = http.createServer();
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
   config.port = (server.address() as { port: number }).port;
   const router = createRouter({
     config, paths, hub, scene, registry, logs, git, backends, sessions,

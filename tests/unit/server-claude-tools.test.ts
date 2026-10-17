@@ -9,7 +9,7 @@ import { storeSecret } from '../../server/claude/secrets.ts';
 import { callBackend, checkTryInput, getAppLogs, linesSince, makeWorkbenchTools, reloadApp, requestBackend, requestSecret, screenshotApp, tryApp } from '../../server/claude/tools.ts';
 import type { ToolDeps } from '../../server/claude/tools.ts';
 import type { AskDecision } from '../../shared/protocol.ts';
-import { makeWorld, rmrf, tmpHome } from './server-claude-kit.ts';
+import { makeWorld, rmrf, TINY_PNG, tmpHome } from './server-claude-kit.ts';
 import type { World } from './server-claude-kit.ts';
 
 const ID = 'aapp001';
@@ -137,18 +137,63 @@ describe('screenshot_app och get_app_logs', () => {
   });
 });
 
+// registry.manifest() är en ögonblicksbild till nästa refresh(). En sida som Claude lagt till i app.json under turen
+// gick inte att skärmdumpa eller prova, och en ny backend fanns inte för call_backend (granskningen 17 oktober).
+describe('verktygen läser app.json på nytt först', () => {
+  let w: World;
+  beforeEach(() => {
+    w = makeWorld();
+    w.addApp(ID);
+    fs.writeFileSync(path.join(w.paths.appDir(ID), 'app.json'), JSON.stringify({ name: 'Kort', faces: [{ id: 'main', page: 'index.html' }, { id: 'baksida', page: 'b.html' }] }));
+  });
+  afterEach(() => w.cleanup());
+
+  /** Shots som slår upp sidan i registret, som shots.ts gör. */
+  function lookingShots() {
+    const pick = (face: string | undefined) => {
+      const f = w.registry.manifest(ID).faces.find((x) => x.id === face);
+      if (!f) throw new Error(`No face ${JSON.stringify(face)}.`);
+      return f.id;
+    };
+    return {
+      ...w.shots,
+      async screenshot(_appId: string, face?: string) {
+        return { png: TINY_PNG, w: 640, h: 480, face: pick(face) };
+      },
+      async tryRun(_appId: string, input: { face?: string }) {
+        return { lines: [`ran on ${pick(input.face)}`], pngs: [], w: 640, h: 480, face: pick(input.face) };
+      },
+    };
+  }
+
+  test('screenshot_app: en sida som just lagts till i app.json', async () => {
+    const r = await screenshotApp({ ...deps(w), shots: lookingShots() }, 'baksida');
+    assert.equal(r.isError, undefined, textOf(r));
+    assert.equal(textOf(r), '640×480, face baksida');
+    assert.equal(w.rec.calls[0], `refresh:${ID}`);
+  });
+
+  test('try_app: en sida som just lagts till i app.json', async () => {
+    const r = await tryApp({ ...deps(w), shots: lookingShots() }, { face: 'baksida', steps: [{ shot: true }] });
+    assert.equal(r.isError, undefined, textOf(r));
+    assert.equal(textOf(r), 'ran on baksida');
+    assert.equal(w.rec.calls[0], `refresh:${ID}`);
+  });
+});
+
 describe('call_backend', () => {
   let w: World;
   let srv: http.Server;
   let port: number;
-  const seen: { method?: string; url?: string; host?: string; body: string; ct?: string; extra?: string }[] = [];
+  const seen: { method?: string; url?: string; host?: string; body: string; raw: Buffer; ct?: string; extra?: string }[] = [];
 
   before(async () => {
     srv = http.createServer((req, res) => {
-      let body = '';
-      req.on('data', (c) => (body += c));
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
       req.on('end', () => {
-        seen.push({ method: req.method, url: req.url, host: req.headers.host, body, ct: req.headers['content-type'], extra: req.headers['x-extra'] as string | undefined });
+        const raw = Buffer.concat(chunks);
+        seen.push({ method: req.method, url: req.url, host: req.headers.host, body: raw.toString('utf8'), raw, ct: req.headers['content-type'], extra: req.headers['x-extra'] as string | undefined });
         if (req.url === '/api/stor') {
           res.writeHead(200, { 'content-type': 'text/plain' });
           res.end('å'.repeat(30_000));
@@ -162,13 +207,16 @@ describe('call_backend', () => {
         }
       });
     });
-    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    await new Promise<void>((resolve, reject) => {
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', resolve);
+    });
     port = (srv.address() as AddressInfo).port;
-  });
+  }, { timeout: 30_000 });
   after(async () => {
     srv.closeAllConnections();
     await new Promise<void>((r) => srv.close(() => r()));
-  });
+  }, { timeout: 30_000 });
   beforeEach(() => {
     w = makeWorld();
     w.addApp(ID);
@@ -183,7 +231,7 @@ describe('call_backend', () => {
     assert.equal(textOf(r), 'HTTP 201\ncontent-type: application/json; charset=utf-8\n\n{"tid":"nu","svar":"åäö"}');
     assert.equal(seen[0].host, `127.0.0.1:${port}`);
     assert.equal(seen[0].extra, 'ja');
-    assert.deepEqual(w.rec.calls, [`ensure:${ID}`]);
+    assert.deepEqual(w.rec.calls, [`refresh:${ID}`, `ensure:${ID}`]);
   });
 
   test('POST med JSON-kropp', async () => {
@@ -191,6 +239,40 @@ describe('call_backend', () => {
     assert.equal(seen[0].method, 'POST');
     assert.equal(seen[0].body, '{"a":1}');
     assert.equal(seen[0].ct, 'application/json');
+  });
+
+  // En binär kropp (en bild till en uppladdningsroute) gick inte att skicka: body var bara text (granskningen 17 oktober).
+  test('body_base64: exakt de byten, med den content-type som angetts', async () => {
+    const r = await callBackend(deps(w), { method: 'POST', path: '/api/items?name=prov.png', body_base64: TINY_PNG.toString('base64'), headers: { 'Content-Type': 'image/png' } });
+    assert.match(textOf(r), /^HTTP 201/, textOf(r));
+    assert.equal(seen.length, 1);
+    assert.ok(seen[0].raw.equals(TINY_PNG), `fick ${seen[0].raw.length} byte`);
+    assert.equal(seen[0].ct, 'image/png');
+    // Radbrytningar i base64-texten (som base64-verktyg skriver) godtas.
+    await callBackend(deps(w), { method: 'PUT', path: '/api/fil', body_base64: TINY_PNG.toString('base64').replace(/(.{20})/g, '$1\n'), headers: { 'content-type': 'application/octet-stream' } });
+    assert.ok(seen[1].raw.equals(TINY_PNG));
+  });
+
+  test('body_base64: utan content-type, tillsammans med body, trasig eller över 256 kB vägras före förfrågan', async () => {
+    const png = TINY_PNG.toString('base64');
+    const cases: [Parameters<typeof callBackend>[1], RegExp][] = [
+      [{ method: 'POST', path: '/api/items', body_base64: png }, /content-type/],
+      [{ method: 'POST', path: '/api/items', body_base64: png, headers: { 'content-type': ' ' } }, /content-type/],
+      [{ method: 'POST', path: '/api/items', body: '{}', body_base64: png, headers: { 'content-type': 'image/png' } }, /either body or body_base64/],
+      [{ method: 'POST', path: '/api/items', body_base64: 'inte base64!', headers: { 'content-type': 'image/png' } }, /base64/],
+      [{ method: 'POST', path: '/api/items', body_base64: 'QUJD=', headers: { 'content-type': 'image/png' } }, /base64/],
+      [{ method: 'POST', path: '/api/items', body_base64: Buffer.alloc(256 * 1024 + 1).toString('base64'), headers: { 'content-type': 'image/png' } }, /256 kB/],
+    ];
+    for (const [args, re] of cases) {
+      const r = await callBackend(deps(w), args);
+      assert.equal(r.isError, true, JSON.stringify(args).slice(0, 120));
+      assert.match(textOf(r), re);
+    }
+    assert.equal(seen.length, 0, 'ingen förfrågan ska ha gått iväg');
+    // Exakt 256 kB går.
+    const r = await callBackend(deps(w), { method: 'POST', path: '/api/items', body_base64: Buffer.alloc(256 * 1024, 7).toString('base64'), headers: { 'content-type': 'application/octet-stream' } });
+    assert.match(textOf(r), /^HTTP 201/);
+    assert.equal(seen[0].raw.length, 256 * 1024);
   });
 
   test('sökvägen måste börja med /api/', async () => {
@@ -222,6 +304,15 @@ describe('call_backend', () => {
     const r = await callBackend(deps(w), { method: 'GET', path: '/api/tid' });
     assert.equal(r.isError, true);
     assert.match(textOf(r), /no back end/);
+  });
+
+  test('en backend som just lagts till i app.json nås (refresh först)', async () => {
+    // Ögonblicksbilden saknar backenden; app.json på disken har den.
+    w.registry.manifests.set(ID, {});
+    fs.writeFileSync(path.join(w.paths.appDir(ID), 'app.json'), JSON.stringify({ name: 'Tid', backend: { entry: 'server.mjs' } }));
+    const r = await callBackend(deps(w), { method: 'GET', path: '/api/tid' });
+    assert.match(textOf(r), /^HTTP 201/, textOf(r));
+    assert.deepEqual(w.rec.calls, [`refresh:${ID}`, `ensure:${ID}`]);
   });
 
   test('backenden kom inte upp: orsaken från backend och workbench syns', async () => {
@@ -368,6 +459,35 @@ describe('try_app: indata och gränser (K8)', () => {
     assert.match(checkTryInput({ steps: [{ shot: true }], api: { '/api/big': 'x'.repeat(70_000) } }) ?? '', /at most 65536/);
     for (const bad of [[], 'x', null, 5]) {
       assert.match(checkTryInput({ steps: [{ shot: true }], api: bad as unknown as Record<string, unknown> }) ?? '', /api must be an object/, JSON.stringify(bad));
+    }
+  });
+
+  // Granskningen 17 oktober: try_app kunde inte ladda upp en fil, och wb.onOpen gick inte att prova.
+  test('upload, drop, paste och open: giltiga steg godtas', () => {
+    assert.equal(
+      checkTryInput({
+        steps: [
+          { upload: 'input[type=file]', sample: 'png' },
+          { drop: '#zon', sample: 'jpeg' },
+          { paste: 'body', sample: 'txt' },
+          { open: { kind: 'url', url: 'dn.se' } },
+          { open: { kind: 'date', date: '2026-10-20' } },
+          { open: { kind: 'text', text: 'Köp mjölk' } },
+        ],
+      }),
+      null,
+    );
+  });
+
+  test('upload, drop, paste och open: fel indata fälls före webbläsaren', () => {
+    assert.match(checkTryInput({ steps: [{ upload: '#fil' }] }) ?? '', /Step 1: sample must be one of png, jpeg, txt/);
+    assert.match(checkTryInput({ steps: [{ drop: '#zon', sample: 'gif' as never }] }) ?? '', /sample must be one of png, jpeg, txt/);
+    assert.match(checkTryInput({ steps: [{ click: '#b', sample: 'png' }] }) ?? '', /sample goes with upload, drop or paste/);
+    assert.match(checkTryInput({ steps: [{ upload: 'x'.repeat(201), sample: 'png' }] }) ?? '', /selector/);
+    assert.match(checkTryInput({ steps: [{ paste: '', sample: 'png' }] }) ?? '', /selector/);
+    assert.match(checkTryInput({ steps: [{ upload: '#fil', sample: 'png', click: '#b' }] }) ?? '', /exactly one/);
+    for (const bad of [{ kind: 'url', url: 'javascript:alert(1)' }, { kind: 'url', url: 'ftp://x.se/' }, { kind: 'date', date: '2026-02-30' }, { kind: 'text', text: '' }, { kind: 'mail', url: 'https://x.se/' }, 'dn.se', null]) {
+      assert.match(checkTryInput({ steps: [{ open: bad as never }] }) ?? '', /Step 1: open must be/, JSON.stringify(bad));
     }
   });
 

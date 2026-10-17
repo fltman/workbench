@@ -41,9 +41,11 @@
   --wb-grip-w: 44px;
   --wb-grip-h: 5px;
   --wb-grip: rgba(20, 24, 32, 0.28);
-  --wb-grip-hover: rgba(20, 24, 32, 0.5);
+  --wb-grip-near: rgba(20, 24, 32, 0.6);        /* pekaren inom 96 px från fönstret: greppet och knapparna */
+  --wb-grip-hover: rgba(20, 24, 32, 0.85);      /* mörkare än --wb-grip-near, så att hovringen syns */
   --wb-face-dot: rgba(20, 24, 32, 0.3);
-  --wb-face-dot-on: rgba(20, 24, 32, 0.75);
+  --wb-face-dot-near: rgba(20, 24, 32, 0.45);   /* pekaren nära: ljusare än greppet, så att den främre sidan skiljer sig */
+  --wb-face-dot-on: rgba(20, 24, 32, 0.85);     /* mörkare än --wb-grip-near, så att den främre sidan syns även nära */
 
   /* HUD: blått glas. Det som ligger bakom syns igenom, suddigt, men mörkas i filtret (brightness 0,45) och färgas
      av en tunn blå ton i stället för en ogenomskinlig fyllning. All text ≥ 4,5:1 över grått, vitt och mörkt

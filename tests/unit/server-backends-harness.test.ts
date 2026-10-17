@@ -16,11 +16,15 @@ import { makePaths } from '../../server/paths.ts';
 import type { AppLogs, AppRegistry, Config, Paths } from '../../server/types.ts';
 import { DEFAULT_FACES } from '../../shared/protocol.ts';
 import type { AppManifest, BackendState } from '../../shared/protocol.ts';
+import { testPort } from '../ports.ts';
 
 export const ROOT = path.resolve(import.meta.dirname, '..', '..');
 export const SCRATCH = path.join(ROOT, '.scratch', 'server-backends');
-/** Kanarieporten som står för workbenchens port i flykttesterna. */
-export const CANARY_PORT = 8243;
+/**
+ * Kanarieporten som står för workbenchens port i flykttesterna: ledig på 127.0.0.1 och ::1, och workbenchens port
+ * (Config.port) i varje hem från makeHome, så att sandlådeprofilen nekar just den.
+ */
+export const CANARY_PORT = await testPort();
 
 export interface TestHome {
   config: Config;
@@ -28,7 +32,7 @@ export interface TestHome {
   home: string;
 }
 
-/** En tom WORKBENCH_HOME under $HOME. Porten 8243 står för workbenchens port. */
+/** En tom WORKBENCH_HOME under $HOME. Kanarieporten står för workbenchens port. */
 export function makeHome(name: string, env: Record<string, string> = {}): TestHome {
   // Processens pid i namnet: flera körningar samtidigt (andra agenter) får aldrig radera varandras hem.
   const dir = path.join(SCRATCH, `${name}-${process.pid}`);
@@ -48,14 +52,18 @@ export interface FakeRegistry extends AppRegistry {
   /** Alla setBackend-anrop i ordning. */
   backendLog: { appId: string; state: BackendState; at: number }[];
   statesOf(appId: string): BackendState[];
+  /** Raderna som lämnats till registry.noteLog (felsignalen, §7.2). */
+  noted: { appId: string; source: 'console' | 'stderr'; line: string; rev?: number }[];
 }
 
 export function fakeRegistry(): FakeRegistry {
   const manifests = new Map<string, AppManifest>();
   const backendLog: FakeRegistry['backendLog'] = [];
+  const noted: FakeRegistry['noted'] = [];
   return {
     manifests,
     backendLog,
+    noted,
     statesOf: (appId) => backendLog.filter((b) => b.appId === appId).map((b) => b.state),
     list: () => [],
     get: () => undefined,
@@ -74,6 +82,10 @@ export function fakeRegistry(): FakeRegistry {
     },
     bumpRev() {},
     refresh() {},
+    noteLog(appId, source, line, rev) {
+      noted.push({ appId, source, line, rev });
+    },
+    troubles: () => [],
   };
 }
 
@@ -176,7 +188,10 @@ export async function frontServer(
       onUpgrade(req, socket, head);
     });
   }
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
   const port = (server.address() as AddressInfo).port;
   return {
     server,

@@ -55,6 +55,7 @@ function rig(mod: BridgeModule = real) {
     onKey: (w, k) => calls.push(['key', w.appId, k]),
     onFocus: (w) => calls.push(['focus', w.appId]),
     onFaceRequest: (w, f) => calls.push(['face', w.appId, f]),
+    onBadge: (w, text) => calls.push(['badge', w.appId, text]),
   };
   let t = 0;
   const handle = mod.createBridgeHandler(opts, () => t);
@@ -86,6 +87,7 @@ describe('bridge: vokabulären', () => {
     r.fromA(key({ code: 'KeyK', meta: true, shift: true }));
     r.fromA({ wb: 1, type: 'focus' });
     r.fromA({ wb: 1, type: 'face', show: 'baksida-2' });
+    r.fromA({ wb: 1, type: 'badge', text: '3' });
     assert.deepEqual(r.calls, [
       ['hello', 'aaa111', { face: 'main', w: 640, h: 480 }],
       ['zoom', 'aaa111', -3.5, 1020.5, 541, { alt: true, smart: false, mode: 0 }],
@@ -94,6 +96,7 @@ describe('bridge: vokabulären', () => {
       ['key', 'aaa111', { code: 'KeyK', meta: true, ctrl: false, alt: false, shift: true }],
       ['focus', 'aaa111'],
       ['face', 'aaa111', 'baksida-2'],
+      ['badge', 'aaa111', '3'],
     ]);
   });
 
@@ -207,6 +210,64 @@ describe('bridge: vokabulären', () => {
         [0, 0, 0, false],
       ],
     );
+  });
+
+  it('märket (wb.badge, §10.5): strängar och null; kontroll- och formattecken bort, trimmat, högst tre kodpunkter', () => {
+    const r = rig();
+    const badge = (text: unknown) => r.fromA({ wb: 1, type: 'badge', text });
+    badge('3');
+    badge('12345');
+    badge('  99+  ');
+    badge('a\u0000\u0007b\u001bc\u007fd');
+    badge('‮ab⁦c');
+    badge('😀😀😀😀');
+    badge('1\n\t 2');
+    badge(null);
+    badge('\u0000\u0001');
+    badge('   ');
+    // Formattecken (Unicode Cf) som riktningstecknet U+061C och tecken med noll bredd (granskningen 17 oktober: förut
+    // stod U+061C kvar, och en text av bara U+200B eller U+2060 gav en tom blå kapsel).
+    badge('\u061C12');
+    badge('\u200B');
+    badge('\u2060');
+    badge('1\u200B2\u00AD');
+    assert.deepEqual(r.calls, [
+      ['badge', 'aaa111', '3'],
+      ['badge', 'aaa111', '123'],
+      ['badge', 'aaa111', '99+'],
+      ['badge', 'aaa111', 'abc'],
+      ['badge', 'aaa111', 'abc'],
+      ['badge', 'aaa111', '😀😀😀'],
+      ['badge', 'aaa111', '1 2'],
+      ['badge', 'aaa111', null],
+      ['badge', 'aaa111', null],
+      ['badge', 'aaa111', null],
+      ['badge', 'aaa111', '12'],
+      ['badge', 'aaa111', null],
+      ['badge', 'aaa111', null],
+      ['badge', 'aaa111', '12'],
+    ]);
+  });
+
+  it('märket: allt som inte är en sträng eller null avvisas', () => {
+    const r = rig();
+    for (const text of [3, 0, true, undefined, {}, ['1'], { toString: () => '1' }]) r.fromA({ wb: 1, type: 'badge', text });
+    r.fromA({ wb: 1, type: 'badge' });
+    assert.deepEqual(r.calls, []);
+  });
+
+  it('kalibrering: utan typkontrollen blir ett tal ett märke', async () => {
+    const r = rig(await leaky('badge-type'));
+    r.fromA({ wb: 1, type: 'badge', text: 3 });
+    assert.deepEqual(r.calls, [['badge', 'aaa111', '3']], 'testet ska fälla den planterade läckan');
+  });
+
+  it('kalibrering: utan klämningen och tvätten går hela texten igenom', async () => {
+    const r = rig(await leaky('badge-clamp'));
+    r.fromA({ wb: 1, type: 'badge', text: '12345' });
+    const c = rig(await leaky('badge-control'));
+    c.fromA({ wb: 1, type: 'badge', text: 'a\u0007b' });
+    assert.deepEqual([r.calls[0]?.[2], c.calls[0]?.[2]], ['12345', 'a\u0007b'], 'testet ska fälla de planterade läckorna');
   });
 
   it('⌥+hjul får px även när appen skickar rader eller sidor', () => {
@@ -325,6 +386,15 @@ describe('bridge: hastighetsbegränsning', () => {
     const r = rig(await leaky('rate'));
     flood(r, 2000);
     assert.equal(count(r, 'aaa111'), 2000, 'testet ska fälla den planterade läckan');
+  });
+
+  it('märket delar hinken: en flod av märken kapas också till 400 (kalibrerat utan hinken)', async () => {
+    const badges = (r: ReturnType<typeof rig>) => {
+      for (let i = 0; i < 2000; i++) r.fromA({ wb: 1, type: 'badge', text: String(i % 1000) });
+      return r.calls.filter((c) => c[0] === 'badge').length;
+    };
+    assert.equal(badges(rig()), 400);
+    assert.equal(badges(rig(await leaky('rate'))), 2000, 'testet ska fälla den planterade läckan');
   });
 
   it('meddelanden från okända fönster tar inte av hinken', () => {

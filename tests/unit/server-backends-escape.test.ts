@@ -1,12 +1,12 @@
 // tests/unit/server-backends-escape.test.ts — kalibrerade flykttester för app-backends (CONTRACT §4.5, §9, §15).
 //
 // En riktig backend i en riktig appmapp under $HOME försöker (a) skriva utanför data/, (b) läsa
-// utanför appen, (c) ansluta till workbenchens port (kanariet på 8243), (d) ansluta till
+// utanför appen, (c) ansluta till workbenchens port (kanariet, en ledig port som står för den), (d) ansluta till
 // unix-socketar och (e) lyssna på 0.0.0.0. Samma backend körs först utan sandlåda (planterad läcka:
 // allt ska lyckas, annars kan testet inte se en flykt) och sedan med sandlåda (allt ska nekas med
 // EPERM). Positiva kontroller (data/, TMPDIR, egen port, namnuppslagning) ska fungera i båda.
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
 import fs from 'node:fs';
@@ -17,19 +17,42 @@ import { after, before, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { proxyHttp } from '../../server/backends/proxy.ts';
 import { buildProfile, closedRoots, nodeReadDir } from '../../server/backends/sandbox.ts';
-import { createBackends } from '../../server/backends/supervisor.ts';
+import { DEFAULT_OPTIONS, createBackends } from '../../server/backends/supervisor.ts';
 import type { BackendOptions } from '../../server/backends/supervisor.ts';
 import type { Config } from '../../server/types.ts';
+import { testPortSpan } from '../ports.ts';
 import {
   CANARY_PORT, ROOT, fakeLogs, fakeRegistry, frontServer, isAlive, listeners, makeApp, makeHome, request, sleep, waitFor,
 } from './server-backends-harness.test.ts';
 import type { FakeLogs, FakeRegistry, TestHome } from './server-backends-harness.test.ts';
 
-const OPTIONS: Partial<BackendOptions> = { portBase: 18340, portSpan: 40 };
+const OPTIONS: Partial<BackendOptions> = { portBase: await testPortSpan(40), portSpan: 40 };
 const HAS_SANDBOX = fs.existsSync('/usr/bin/sandbox-exec');
+
+/**
+ * En kort tillfällig katalog under den riktiga hemkatalogen (stängd i profilen, som Dockers och gpg-agents
+ * socketar) för en unix-socket: en socketsökväg får vara högst 104 byte (sun_path), hur djupt repot än ligger.
+ */
+function homeSockDir(): string {
+  return fs.mkdtempSync(path.join(fs.realpathSync.native(os.userInfo().homedir), 'Library', 'Caches', 'wb-sock-'));
+}
+
+/** Lyssnar på en unix-socket som bara stänger varje anslutning. */
+async function sockServer(sockPath: string): Promise<net.Server> {
+  const s = net.createServer((sock) => {
+    sock.on('error', () => {});
+    sock.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    s.once('error', reject);
+    s.listen(sockPath, resolve);
+  });
+  return s;
+}
 
 const PROBE_SERVER = String.raw`
 import dns from 'node:dns';
+import { fork } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -62,7 +85,14 @@ async function probe() {
   r['ok: TMPDIR är appens egen i data/'] = os.tmpdir().startsWith(process.env.DATA_DIR + '/') ? 'ALLOWED' : 'BLOCKED ' + os.tmpdir();
   r['b: läsa en annan apps fil i den delade TMPDIR'] = fsProbe(() => fs.readFileSync(cfg.sharedTmpFile));
   r['a: skriva i den delade TMPDIR'] = fsProbe(() => { const f = path.join(cfg.sharedTmp, 'wbprobe-' + process.pid); fs.writeFileSync(f, 'x'); fs.unlinkSync(f); });
+  // Utanför de stängda rötterna: Node och Homebrew (npm run dev kör samma Node osandlådat), /Users/Shared.
+  for (const [label, dir] of cfg.writeDirs) r['a: skriva i ' + label] = fsProbe(() => { const d = path.join(dir, '.wbprobe-' + process.pid); fs.mkdirSync(d); fs.rmdirSync(d); });
+  // En hård länk i data/ skulle göra filen skrivbar via data/.
+  for (const [label, file] of cfg.linkTargets) r['a: hård länk i data/ till ' + label] = fsProbe(() => { const l = path.join(process.env.DATA_DIR, 'lank-' + process.pid); fs.linkSync(file, l); fs.unlinkSync(l); });
   r['b: läsa en fil i /private/tmp'] = fsProbe(() => fs.readFileSync(cfg.privateTmpFile));
+  // Användarens kataloger bredvid TMPDIR under /private/var/folders/<a>/<b>: andra programs cacher (C) och DARWIN_USER_DIR (0).
+  if (cfg.userCacheFile) r['b: läsa en fil i DARWIN_USER_CACHE_DIR'] = fsProbe(() => fs.readFileSync(cfg.userCacheFile));
+  if (cfg.userDir) r['b: lista DARWIN_USER_DIR'] = fsProbe(() => fs.readdirSync(cfg.userDir));
   r['b: läsa kanariefil utanför appen'] = fsProbe(() => fs.readFileSync(cfg.canary));
   r['b: läsa kanariefil med annat skiftläge'] = fsProbe(() => fs.readFileSync(cfg.canaryUpper));
   r['b: läsa via symbolisk länk i appen'] = fsProbe(() => fs.readFileSync('leak.txt'));
@@ -80,6 +110,14 @@ async function probe() {
   r['d: unix-socket via /tmp/cc-socks…'] = await connect({ path: cfg.ccSock.replace(/^\/private\/tmp\//, '/tmp/') });
   r['d: unix-socket under hemkatalogen'] = await connect({ path: cfg.homeSock });
   if (cfg.dnsName) r['ok: namnuppslagning'] = await new Promise((res) => dns.lookup(cfg.dnsName, (e) => res(e ? 'BLOCKED ' + e.code : 'ALLOWED')));
+  r['ok: fork med IPC'] = await new Promise((res) => {
+    fs.writeFileSync(path.join(process.env.DATA_DIR, 'barn.mjs'), "process.on('message', (m) => { process.send(m); process.exit(0); });");
+    const c = fork(path.join(process.env.DATA_DIR, 'barn.mjs'));
+    const t = setTimeout(() => { c.kill(); res('TIMEOUT'); }, 5000);
+    c.on('message', (m) => { clearTimeout(t); res(m === 'hej' ? 'ALLOWED' : 'BLOCKED ' + m); });
+    c.on('error', (e) => { clearTimeout(t); res('BLOCKED ' + e.code); });
+    c.send('hej');
+  });
   r['e: listen(PORT, "0.0.0.0")'] = server.address().address;
   r['e: listen(0, "0.0.0.0")'] = await listenAddress(0, '0.0.0.0');
   r['e: listen({ port: 0, host: "::" })'] = await listenAddress({ port: 0, host: '::' });
@@ -95,6 +133,15 @@ const server = http.createServer(async (req, res) => {
 server.listen(own, '0.0.0.0'); // (e): guard.mjs ska tvinga 127.0.0.1
 `;
 
+/** getconf DARWIN_USER_DIR och DARWIN_USER_CACHE_DIR (0 och C bredvid TMPDIR), som realpath; null om de inte finns. */
+function darwinDir(name: string): string | null {
+  try {
+    return fs.realpathSync.native(execFileSync('/usr/bin/getconf', [name], { encoding: 'utf8' }).trim().replace(/\/+$/, ''));
+  } catch {
+    return null;
+  }
+}
+
 const OTHER_SERVER = `
 import http from 'node:http';
 http.createServer((req, res) => res.end('annan app')).listen(Number(process.env.PORT));
@@ -104,16 +151,68 @@ interface Env {
   t: TestHome;
   registry: FakeRegistry;
   logs: FakeLogs;
-  canaryServers: net.Server[];
   ccDir: string;
-  homeSockServer: net.Server;
+  /** Katalogen med socketen under hemkatalogen (homeSockDir). */
+  sockDir: string;
   dnsWorks: boolean;
   knownHosts: string | null;
   /** En fil som "en annan app" lämnat i den delade TMPDIR:en (SEC-3). */
   sharedTmpFile: string;
+  /** En fil i /Users/Shared, eller null om katalogen inte är skrivbar. */
+  sharedFile: string | null;
+  /** En fil som "ett annat program" lämnat i DARWIN_USER_CACHE_DIR, eller null. */
+  userCacheFile: string | null;
 }
 
 let env: Env;
+
+/**
+ * Kataloger utanför de stängda rötterna som en backend aldrig får skriva i (§9), bland dem som testanvändaren själv kan
+ * skriva i: annars kan den planterade läckan inte visa något. Node-prefixet också via datavolymens sökväg, eftersom
+ * /opt är en firmlink dit.
+ */
+function writableDirs(): [string, string][] {
+  const prefix = path.dirname(path.dirname(fs.realpathSync.native(process.execPath)));
+  const dirs: [string, string][] = [
+    ['Node-prefixet', prefix],
+    ['Node-prefixet via /System/Volumes/Data', '/System/Volumes/Data' + prefix],
+    ['/opt/homebrew', '/opt/homebrew'],
+    ['/usr/local', '/usr/local'],
+    ['/Users/Shared', '/Users/Shared'],
+    // Skrivbara för admin-gruppen: ett typsnitt i /Library/Fonts laddas av alla program (granskningen 17 oktober).
+    ['/Library/Fonts', '/Library/Fonts'],
+    ['/Library/Caches', '/Library/Caches'],
+    ['/cores', '/cores'],
+  ];
+  const cache = darwinDir('DARWIN_USER_CACHE_DIR');
+  if (cache) dirs.push(['DARWIN_USER_CACHE_DIR', cache]);
+  return dirs.filter(([, d]) => {
+    try {
+      fs.accessSync(d, fs.constants.W_OK);
+      return fs.statSync(d).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Filer att länka till från appens data/: i en stängd rot, i /Users/Shared och Node själv, de som ligger på samma volym
+ * och ägs av testanvändaren (bara en sådan fil blir skrivbar genom länken).
+ */
+function linkTargets(appDir: string): [string, string][] {
+  const dev = fs.statSync(appDir).dev;
+  const files: [string, string | null][] = [
+    ['kanariefilen', path.join(env.t.home, 'canary.txt')],
+    ['en fil i /Users/Shared', env.sharedFile],
+    ['en fil i Node-prefixet', fs.realpathSync.native(process.execPath)],
+  ];
+  return files.filter((f): f is [string, string] => {
+    if (f[1] === null) return false;
+    const st = fs.statSync(f[1]);
+    return st.dev === dev && st.uid === process.getuid?.();
+  });
+}
 
 function writeProbeConfig(appDir: string, extra: Record<string, unknown>): void {
   const home = env.t.home;
@@ -128,11 +227,15 @@ function writeProbeConfig(appDir: string, extra: Record<string, unknown>): void 
       knownHosts: env.knownHosts,
       canaryPort: CANARY_PORT,
       ccSock: path.join(env.ccDir, 'x.sock'),
-      homeSock: path.join(home, 'agent.sock'),
+      homeSock: path.join(env.sockDir, 'agent.sock'),
       dnsName: env.dnsWorks ? 'example.com' : null,
       sharedTmp: fs.realpathSync.native(os.tmpdir()),
       sharedTmpFile: env.sharedTmpFile,
       privateTmpFile: path.join(env.ccDir, 'annan-app.txt'),
+      userCacheFile: env.userCacheFile,
+      userDir: darwinDir('DARWIN_USER_DIR'),
+      writeDirs: writableDirs(),
+      linkTargets: linkTargets(appDir),
       ...extra,
     }),
   );
@@ -173,8 +276,13 @@ function evidence(name: string, data: unknown): void {
 }
 
 describe('flykttester för app-backends', { skip: !HAS_SANDBOX, timeout: 60_000 }, () => {
+  // Det before() hunnit öppna och skapa, så att after() städar även när before() fallerar halvvägs.
+  const servers: net.Server[] = [];
+  const leftovers: string[] = [];
+
   before(async () => {
     const t = makeHome('escape-home');
+    leftovers.push(t.home);
     const registry = fakeRegistry();
     const logs = fakeLogs();
     fs.writeFileSync(path.join(t.home, 'canary.txt'), 'KANARIE-' + crypto.randomBytes(8).toString('hex'));
@@ -184,7 +292,6 @@ describe('flykttester för app-backends', { skip: !HAS_SANDBOX, timeout: 60_000 
     fs.writeFileSync(path.join(t.paths.appDataDir('aprobe1'), 'chat.jsonl'), '{"k":"note"}\n');
 
     // Kanariet: workbenchens port på både 127.0.0.1 och ::1, som servern lyssnar (§3).
-    const canaryServers: net.Server[] = [];
     for (const host of ['127.0.0.1', '::1']) {
       const s = net.createServer((sock) => {
         sock.on('error', () => {});
@@ -194,41 +301,52 @@ describe('flykttester för app-backends', { skip: !HAS_SANDBOX, timeout: 60_000 
         s.once('error', reject);
         s.listen({ port: CANARY_PORT, host, ipv6Only: host === '::1' }, resolve);
       });
-      canaryServers.push(s);
+      servers.push(s);
     }
     // En unix-socket där Claude Code har sina inkorgar, och en under hemkatalogen (som Docker och gpg-agent).
     const ccDir = `/private/tmp/cc-socks-wbtest-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
     fs.mkdirSync(ccDir, { mode: 0o700 });
-    for (const sockPath of [path.join(ccDir, 'x.sock'), path.join(t.home, 'agent.sock')]) {
-      const s = net.createServer((sock) => {
-        sock.on('error', () => {});
-        sock.end();
-      });
-      await new Promise<void>((resolve) => s.listen(sockPath, resolve));
-      canaryServers.push(s);
-    }
-    const homeSockServer = canaryServers[canaryServers.length - 1];
+    leftovers.push(ccDir);
+    const sockDir = homeSockDir();
+    leftovers.push(sockDir);
+    for (const sockPath of [path.join(ccDir, 'x.sock'), path.join(sockDir, 'agent.sock')]) servers.push(await sockServer(sockPath));
     const dnsWorks = await new Promise<boolean>((resolve) => dns.lookup('example.com', (e) => resolve(!e)));
     const kh = path.join(os.userInfo().homedir, '.ssh', 'known_hosts');
     // Det en annan app (eller ett annat program) lämnar i delade tillfälliga kataloger (SEC-3).
     const sharedTmpFile = path.join(fs.realpathSync.native(os.tmpdir()), `wbtest-annan-app-${process.pid}-${crypto.randomBytes(3).toString('hex')}.txt`);
+    leftovers.push(sharedTmpFile);
     fs.writeFileSync(sharedTmpFile, 'FRAN-X');
     fs.writeFileSync(path.join(ccDir, 'annan-app.txt'), 'FRAN-X');
-    env = { t, registry, logs, canaryServers, ccDir, homeSockServer, dnsWorks, knownHosts: fs.existsSync(kh) ? kh : null, sharedTmpFile };
-  });
+    let sharedFile: string | null = path.join('/Users/Shared', `wbtest-${process.pid}-${crypto.randomBytes(3).toString('hex')}.txt`);
+    try {
+      fs.writeFileSync(sharedFile, 'FRAN-X');
+      leftovers.push(sharedFile);
+    } catch {
+      sharedFile = null;
+    }
+    const cacheDir = darwinDir('DARWIN_USER_CACHE_DIR');
+    let userCacheFile: string | null = cacheDir && path.join(cacheDir, `wbtest-annat-program-${process.pid}-${crypto.randomBytes(3).toString('hex')}.txt`);
+    try {
+      if (userCacheFile) fs.writeFileSync(userCacheFile, 'FRAN-X');
+      if (userCacheFile) leftovers.push(userCacheFile);
+    } catch {
+      userCacheFile = null;
+    }
+    env = { t, registry, logs, ccDir, sockDir, dnsWorks, knownHosts: fs.existsSync(kh) ? kh : null, sharedTmpFile, sharedFile, userCacheFile };
+  }, { timeout: 30_000 });
 
   after(async () => {
-    await Promise.all(env.canaryServers.map((s) => new Promise((r) => s.close(r))));
-    fs.rmSync(env.ccDir, { recursive: true, force: true });
-    fs.rmSync(env.sharedTmpFile, { force: true });
-    fs.rmSync(env.t.home, { recursive: true, force: true });
-  });
+    await Promise.all(servers.map((s) => new Promise((r) => s.close(r))));
+    for (const p of leftovers) fs.rmSync(p, { recursive: true, force: true });
+  }, { timeout: 30_000 });
 
   test('utan sandlåda lyckas varje flykt (planterad läcka), och (e) tvingas ändå till loopback', async () => {
     const { results } = await runProbe({ ...env.t.config, sandbox: false });
     evidence('escape-sandbox-off.json', results);
     const escapes = Object.entries(results).filter(([k]) => isEscape(k));
     assert.ok(escapes.length >= 15, `för få flyktförsök: ${escapes.length}`);
+    for (const [label] of writableDirs()) assert.ok(`a: skriva i ${label}` in results, label);
+    for (const [label] of linkTargets(env.t.paths.appDir('aprobe1'))) assert.ok(`a: hård länk i data/ till ${label}` in results, label);
     for (const [key, value] of Object.entries(results)) {
       if (key.startsWith('e: ')) assert.equal(value, '127.0.0.1', key);
       else assert.equal(value, 'ALLOWED', key);
@@ -260,7 +378,7 @@ describe('flykttester för app-backends', { skip: !HAS_SANDBOX, timeout: 60_000 
     const asHmr = await runProbe({ ...env.t.config, port: 18497, hmrPort: CANARY_PORT });
     assert.equal(asHmr.results[`c: ansluta 127.0.0.1:${CANARY_PORT}`], 'BLOCKED EPERM');
     assert.equal(asHmr.results[`c: ansluta ::ffff:127.0.0.1:${CANARY_PORT}`], 'BLOCKED EPERM');
-    // Kontroll: varken port eller hmrPort är 8243, så då är det regeln (och inget annat) som stoppar.
+    // Kontroll: varken port eller hmrPort är kanariet, så då är det regeln (och inget annat) som stoppar.
     const neither = await runProbe({ ...env.t.config, port: 18497, hmrPort: 18496 });
     assert.equal(neither.results[`c: ansluta 127.0.0.1:${CANARY_PORT}`], 'ALLOWED');
     assert.equal(neither.results['a: skriva ../escape.txt'], 'BLOCKED EPERM');
@@ -270,9 +388,9 @@ describe('flykttester för app-backends', { skip: !HAS_SANDBOX, timeout: 60_000 
 /* ---------- avvikelserna från kontraktets profil, mätta mot kontraktets egen form ---------- */
 
 describe('kontraktets regler ordagrant har hål som profilen stänger', { skip: !HAS_SANDBOX, timeout: 60_000 }, () => {
-  const dir = path.join(ROOT, '.scratch', 'server-backends', 'escape-forms');
-  let ccDir = '';
+  const dir = path.join(ROOT, '.scratch', 'server-backends', `escape-forms-${process.pid}`);
   const servers: net.Server[] = [];
+  const leftovers: string[] = [dir];
   let app = '';
   let input: Parameters<typeof buildProfile>[0];
 
@@ -280,9 +398,12 @@ describe('kontraktets regler ordagrant har hål som profilen stänger', { skip: 
     fs.rmSync(dir, { recursive: true, force: true });
     app = path.join(dir, 'apps', 'aforms1');
     fs.mkdirSync(path.join(app, 'data'), { recursive: true });
-    ccDir = `/private/tmp/cc-socks-wbtest-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
+    const ccDir = `/private/tmp/cc-socks-wbtest-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
     fs.mkdirSync(ccDir, { mode: 0o700 });
-    const homeSock = path.join(dir, 'agent.sock');
+    leftovers.push(ccDir);
+    const sockDir = homeSockDir();
+    leftovers.push(sockDir);
+    const homeSock = path.join(sockDir, 'agent.sock');
     fs.writeFileSync(
       path.join(app, 'main.mjs'),
       `import net from 'node:net';
@@ -298,16 +419,12 @@ console.log(JSON.stringify({
       s.on('error', () => {});
       s.end();
     });
-    await new Promise<void>((r) => tcp.listen(CANARY_PORT, '127.0.0.1', r));
+    await new Promise<void>((resolve, reject) => {
+      tcp.once('error', reject);
+      tcp.listen(CANARY_PORT, '127.0.0.1', resolve);
+    });
     servers.push(tcp);
-    for (const p of [homeSock, path.join(ccDir, 'x.sock')]) {
-      const u = net.createServer((s) => {
-        s.on('error', () => {});
-        s.end();
-      });
-      await new Promise<void>((r) => u.listen(p, r));
-      servers.push(u);
-    }
+    for (const p of [homeSock, path.join(ccDir, 'x.sock')]) servers.push(await sockServer(p));
     const home = fs.realpathSync.native(os.userInfo().homedir);
     const wbHome = fs.realpathSync.native(dir);
     input = {
@@ -319,13 +436,12 @@ console.log(JSON.stringify({
       nodeDir: nodeReadDir(process.execPath, closedRoots(home, wbHome)),
       deniedPorts: [CANARY_PORT],
     };
-  });
+  }, { timeout: 30_000 });
 
   after(async () => {
     await Promise.all(servers.map((s) => new Promise((r) => s.close(r))));
-    fs.rmSync(ccDir, { recursive: true, force: true });
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
+    for (const p of leftovers) fs.rmSync(p, { recursive: true, force: true });
+  }, { timeout: 30_000 });
 
   const runWith = (profile: string): Promise<Record<string, string>> => {
     const file = path.join(dir, `p-${crypto.randomBytes(4).toString('hex')}.sb`);
@@ -382,8 +498,8 @@ import { spawn } from 'node:child_process';
 console.log('PID ' + process.pid);
 const mode = fs.readFileSync('mode.txt', 'utf8').trim();
 if (mode === 'child') {
-  // Ett barn utan guard.mjs (som python -m http.server) lyssnar på alla gränssnitt.
-  const child = spawn(process.execPath, ['-e', 'require("net").createServer().listen(0, "0.0.0.0", () => console.log("LYSSNAR"))'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  // Ett barn utan guard.mjs (som python -m http.server) lyssnar på alla gränssnitt. Utan NODE_OPTIONS, annars laddar det vakten.
+  const child = spawn(process.execPath, ['-e', 'require("net").createServer().listen(0, "0.0.0.0", () => console.log("LYSSNAR"))'], { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, NODE_OPTIONS: '' } });
   console.log('BARN ' + child.pid);
   await new Promise((r) => child.stdout.once('data', r));
 } else {
@@ -432,7 +548,8 @@ describe('lsof efter redo: lyssnar något i processgruppen utanför loopback sto
         const notes = logs.lines.slice(before).filter((l) => l.source === 'workbench').map((l) => l.line);
         assert.ok(notes.some((l) => /lyssnade på (\*|0\.0\.0\.0):\d+.*stoppades/.test(l)), notes.join(' | '));
         assert.ok(!isAlive(pidOf('PID ')), 'backenden lever');
-        if (mode === 'child') assert.ok(!isAlive(pidOf('BARN ')), 'barnet lever');
+        // Barnet städas undan av launchd efter gruppens signal; under last (flera körningar samtidigt) tar det en stund.
+        if (mode === 'child') await waitFor(() => !isAlive(pidOf('BARN ')), 3000, 'att barnet dör');
         // ingen automatisk omstart, och ensure() startar inte om den
         await sleep(300);
         assert.equal(await backends.ensure('aleak1'), null);
@@ -442,4 +559,63 @@ describe('lsof efter redo: lyssnar något i processgruppen utanför loopback sto
       }
     });
   }
+});
+
+/* ---------------- lsof under drift: en lyssnare som öppnas senare (planterad läcka) ---------------- */
+
+const LATE_LEAK_SERVER = `
+import http from 'node:http';
+import net from 'node:net';
+console.log('PID ' + process.pid);
+http.createServer((req, res) => res.end('ok')).listen(Number(process.env.PORT), () => {
+  // En stund efter redo: ett handtag förbi den lappade listen(), som ett barn utan vakten.
+  setTimeout(() => { net.createServer()._listen2('0.0.0.0', 0, 4, 511); console.log('LÄCKER'); }, 400);
+});
+`;
+
+describe('lsof under drift: en lyssnare utanför loopback som öppnas senare stoppar också backenden', { skip: !HAS_SANDBOX, timeout: 60_000 }, () => {
+  let t: TestHome;
+  let registry: FakeRegistry;
+  let logs: FakeLogs;
+  before(() => {
+    t = makeHome('escape-late');
+    registry = fakeRegistry();
+    logs = fakeLogs();
+    makeApp(t, registry, 'asen1', { 'server.mjs': LATE_LEAK_SERVER });
+  });
+  after(() => fs.rmSync(t.home, { recursive: true, force: true }));
+  const pid = (): number => Number(logs.of('asen1', 'backend').filter((l) => l.startsWith('PID ')).at(-1)?.slice(4));
+
+  test('kalibrering: utan upprepad kontroll lyssnar backenden kvar på alla gränssnitt', async () => {
+    const backends = createBackends({ config: t.config, paths: t.paths, registry, logs }, { ...OPTIONS, listenCheckMs: 0 });
+    try {
+      assert.ok(await backends.ensure('asen1'));
+      await waitFor(() => logs.of('asen1', 'backend').includes('LÄCKER'), 4000, 'läckan');
+      await sleep(600);
+      assert.equal(backends.state('asen1'), 'running');
+      const rows = await listeners({ pgid: pid() });
+      assert.ok(rows.some((r) => !r.name.startsWith('127.')), `läckan syns inte: ${JSON.stringify(rows)}`);
+    } finally {
+      await backends.stopAll();
+    }
+  });
+
+  test('kontrollen körs om medan backenden kör (standard var 30:e sekund): crashed tills restart', async () => {
+    const backends = createBackends({ config: t.config, paths: t.paths, registry, logs }, { ...OPTIONS, listenCheckMs: 200 });
+    try {
+      const before = logs.lines.length;
+      assert.ok(await backends.ensure('asen1'));
+      assert.equal(backends.state('asen1'), 'running');
+      await waitFor(() => backends.state('asen1') === 'crashed', 4000, 'att backenden stoppas');
+      const notes = logs.lines.slice(before).filter((l) => l.source === 'workbench').map((l) => l.line);
+      assert.ok(notes.some((l) => /lyssnade på (\*|0\.0\.0\.0):\d+.*stoppades/.test(l)), notes.join(' | '));
+      await waitFor(() => !isAlive(pid()), 3000, 'att backenden dör');
+      await sleep(300);
+      assert.equal(await backends.ensure('asen1'), null);
+      assert.ok(!logs.lines.slice(before).some((l) => l.line.startsWith('Startar om')));
+    } finally {
+      await backends.stopAll();
+    }
+    assert.equal(DEFAULT_OPTIONS.listenCheckMs, 30_000);
+  });
 });

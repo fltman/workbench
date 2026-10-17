@@ -18,7 +18,7 @@ import { reducedMotion } from './tokens.ts';
 /** §4.4. Utan top-navigation kan en app aldrig navigera bort skalet. */
 export const IFRAME_SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads';
 
-/** Om sandbox-attributet sätts (beslutet och mätningen står i vault/Arkitektur.md, "Mätning: sandbox och skärpa"). */
+/** Om sandbox-attributet sätts. Det behålls: med och utan är apparna lika skarpa i riktig Chrome (uppmätt, §4.4). */
 export const USE_SANDBOX = true;
 
 const FEATURE: Record<AppPermission, string> = {
@@ -241,6 +241,7 @@ export class WindowView {
       else if (this.#shownRev !== null) this.#backToSeed();
     }
     if (prev && prev.name !== app.name) for (const f of this.faces) if (f.iframe) f.iframe.title = this.#title(f.def);
+    for (const f of this.faces) f.ideas?.setTrouble(app.trouble ?? null);
   }
 
   /** grants:changed: samma byte som vid ny rev. */
@@ -291,7 +292,10 @@ export class WindowView {
       }
       const fv = new FaceView(d, this.rot);
       this.#sizeFace(fv);
-      if (d.id === IDEAS_FACE) fv.ideas = new IdeasView(fv.frames, this.appId, (text) => this.#host.pickIdea(this, text));
+      if (d.id === IDEAS_FACE) {
+        fv.ideas = new IdeasView(fv.frames, this.appId, (text) => this.#host.pickIdea(this, text));
+        fv.ideas.setTrouble(app.trouble ?? null);
+      }
       return fv;
     });
     const obsolete = this.faces.filter((f) => !next.includes(f));

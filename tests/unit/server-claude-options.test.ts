@@ -5,6 +5,8 @@ import path from 'node:path';
 import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import { buildOptions, claudeEnv, NETWORK_DOMAINS, nodePrefixUnderHome, secretDenyRules, TOOLS } from '../../server/claude/options.ts';
+import { ideasQueryOptions } from '../../server/claude/ideas.ts';
+import { routeQueryOptions } from '../../server/claude/route.ts';
 import { testConfig } from './server-claude-kit.ts';
 
 const config = testConfig(path.join(os.tmpdir(), 'wb-opts-home'), { model: 'claude-opus-5-5', effort: 'high' });
@@ -106,6 +108,35 @@ describe('options enligt §8.2', () => {
     assert.ok(o.sandbox?.filesystem?.denyRead?.includes(`${APP}/data/secrets.json`));
     // Även utan sandlåda gäller deny-reglerna för Claudes egna verktyg.
     assert.deepEqual((opts(false).settings as { permissions?: unknown }).permissions, { deny: secretDenyRules(APP) });
+  });
+
+  // Förslagsfrågan körs med cwd i appens mapp, där data/secrets.json ligger, och canUseTool tillfrågas aldrig om
+  // läsningar inne i cwd (§8.5): deny-reglerna är spärren om frågan någon gång får ett verktyg. Fältets fråga körs i
+  // data/route, utan app.
+  test('engångsfrågorna (§8.12, §8.13): inga verktyg; förslagen nekas hemligheterna, fältet har ingen app', async () => {
+    const appsDir = '/Users/x/Projekt/workbench/apps';
+    const ideas = ideasQueryOptions(APP, appsDir, 'SYSTEM');
+    assert.deepEqual(ideas.tools, []);
+    assert.deepEqual(ideas.allowedTools, []);
+    assert.deepEqual(ideas.mcpServers, {});
+    assert.deepEqual(ideas.settingSources, []);
+    assert.equal(ideas.strictMcpConfig, true);
+    assert.equal(ideas.persistSession, false);
+    assert.equal(ideas.cwd, APP);
+    assert.equal(ideas.env?.TMPDIR, `${APP}/data/tmp`);
+    assert.deepEqual(ideas.settings, {
+      crossSessionInbound: 'refuse', disableAllHooks: true,
+      permissions: { deny: [`Read(/${APP}/data/secrets.json)`, `Edit(/${APP}/data/secrets.json)`] },
+    });
+    const no = await ideas.canUseTool?.('Read', { file_path: `${APP}/data/secrets.json` }, { signal: new AbortController().signal, suggestions: [] } as never);
+    assert.equal(no?.behavior, 'deny');
+    const routeDir = '/Users/x/Projekt/workbench/data/route';
+    const route = routeQueryOptions(routeDir, appsDir);
+    assert.equal(route.cwd, routeDir);
+    assert.deepEqual(route.settings, { crossSessionInbound: 'refuse', disableAllHooks: true });
+    for (const k of ['tools', 'allowedTools', 'mcpServers', 'settingSources', 'strictMcpConfig', 'permissionMode', 'persistSession', 'maxTurns'] as const) {
+      assert.deepEqual(route[k], ideas[k], k);
+    }
   });
 
   test('egen TMPDIR i appens data/ och den delade TMPDIR:en stängd (SEC-3)', () => {

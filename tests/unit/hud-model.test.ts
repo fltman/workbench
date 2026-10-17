@@ -214,6 +214,18 @@ test('köat under turen: slutar turen utan mer text följer det köade efter tur
   assert.equal(M.messages(ev).queued, 0);
 });
 
+test('en användarrad vars meddelande aldrig kördes är dämpad när en not pekar ut den (dropped, §13)', () => {
+  const ev = building();
+  const before = M.messages(ev).find((m) => m.kind === 'user' && m.text === 'och en rubrik');
+  assert.deepEqual(before, { key: 'u:q2', kind: 'user', text: 'och en rubrik', via: 'text', dropped: false }, 'innan noten kommit är raden som vanligt');
+  ev.push({ k: 'note', id: 'qn9', text: 'Stoppad – ”och en rubrik” skickades inte', dropped: 'q2', at: at() }, turn('end', { ok: false, interrupted: true }));
+  const users = M.messages(ev).filter((m) => m.kind === 'user').map((m) => [m.text, (m as { dropped?: boolean }).dropped]);
+  assert.deepEqual(users, [['en anteckningsapp', false], ['och en rubrik', true]]);
+  // En not utan dropped (Avbröts, ångra) dämpar ingenting, och ett okänt id gör inget.
+  const other: ChatEvent[] = [...building(), { k: 'note', id: 'qn8', text: 'Avbröts', at: at() }, { k: 'note', id: 'qn7', text: 'x', dropped: 'finns-inte', at: at() }];
+  assert.ok(M.messages(other).every((m) => m.kind !== 'user' || m.dropped === false));
+});
+
 test('svar på ett frågekort köas inte: texten hör till turen och står i ordning (§8.5 punkt 5)', () => {
   const ev: ChatEvent[] = [
     { k: 'user', id: 'k1', text: 'hämta vädret', via: 'text', at: at() },
@@ -226,6 +238,172 @@ test('svar på ett frågekort köas inte: texten hör till turen och står i ord
   ];
   assert.deepEqual(view(ev), ['user:hämta vädret', 'reply:Jag behöver nätet.', 'user:nej, hitta på något', 'reply:Då gör jag en låtsasprognos.']);
   assert.equal(M.messages(ev).queued, 0);
+});
+
+/* Noterna efter turslutet (§8.6, §13): de hör till turen som slutade och står under dess innehåll, ovanför ett meddelande
+   som skickades under §8.6 eller efter Stopp. Serverns ordning (server-claude-sessions.test.ts): meddelandets rad före
+   turslutet, turens noter direkt efter det, och sedan meddelandets egen tur. */
+
+test('noten efter turslutet står under den stoppade turen, ovanför meddelandet som skickades efter Stopp (§13)', () => {
+  const ev: ChatEvent[] = [
+    { k: 'user', id: 'p1', text: 'en klocka', via: 'text', at: at() },
+    turn('start'),
+    { k: 'user', id: 'p2', text: 'gör en väckarklocka i stället', via: 'text', at: at() },
+    { k: 'text', id: 'px1', text: 'Jag bygger en klocka', at: at() },
+    turn('end', { ok: false, interrupted: true }),
+    { k: 'note', id: 'pn1', text: 'Avbröts – ändringarna finns kvar', at: at() },
+  ];
+  assert.deepEqual(view(ev), ['user:en klocka', 'reply:Jag bygger en klocka', 'note:Avbröts – ändringarna finns kvar', 'user:gör en väckarklocka i stället']);
+  ev.push(turn('start'), { k: 'text', id: 'px2', text: 'Klart. Väckarklockan finns.', at: at() }, turn('end', { ok: true }));
+  assert.deepEqual(view(ev), [
+    'user:en klocka', 'reply:Jag bygger en klocka', 'note:Avbröts – ändringarna finns kvar', 'user:gör en väckarklocka i stället', 'reply:Klart. Väckarklockan finns.',
+  ]);
+});
+
+test('noterna efter turslutet står ovanför ett meddelande som skickades under §8.6, i sin ordning (§13)', () => {
+  const ev: ChatEvent[] = [
+    { k: 'user', id: 'r1', text: 'en klocka', via: 'text', at: at() },
+    turn('start'),
+    { k: 'text', id: 'rx1', text: 'Klart. Klockan går.', at: at() },
+    { k: 'user', id: 'r2', text: 'gör den större', via: 'text', at: at() },
+    turn('end', { ok: true }),
+    { k: 'note', id: 'rn1', text: 'Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.', at: at() },
+    { k: 'note', id: 'rn2', text: 'Backenden kraschade 4 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.', at: at() },
+    turn('start'),
+    { k: 'text', id: 'rx2', text: 'Klart. Den är större.', at: at() },
+  ];
+  assert.deepEqual(view(ev), [
+    'user:en klocka', 'reply:Klart. Klockan går.',
+    'note:Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.',
+    'note:Backenden kraschade 4 gånger på 60 s. Den startar igen när Claude ändrar appen eller när du ångrar.',
+    'user:gör den större', 'reply:Klart. Den är större.',
+  ]);
+  assert.equal(new Set(M.messages(ev).map((m) => m.key)).size, 6);
+});
+
+test('noterna efter turslutet: en not med dropped står kvar under sin rad, och det som kommer senare står sist (§13)', () => {
+  // Stopp under §8.6: det hållna meddelandet kördes aldrig (dropped, före turslutet); commiten misslyckades (efter det).
+  const ev: ChatEvent[] = [
+    { k: 'user', id: 's1', text: 'en klocka', via: 'text', at: at() },
+    turn('start'),
+    { k: 'text', id: 'sx1', text: 'Klart. Klockan går.', at: at() },
+    { k: 'user', id: 's2', text: 'och ett alarm', via: 'text', at: at() },
+    { k: 'note', id: 'sn1', text: 'Stoppad – ”och ett alarm” skickades inte', dropped: 's2', at: at() },
+    turn('end', { ok: true }),
+    { k: 'note', id: 'sn2', text: 'Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.', at: at() },
+  ];
+  assert.deepEqual(view(ev), [
+    'user:en klocka', 'reply:Klart. Klockan går.', 'note:Ändringen kunde inte sparas separat, så Ångra tar nu två ändringar på en gång.',
+    'user:och ett alarm', 'note:Stoppad – ”och ett alarm” skickades inte',
+  ]);
+  // Ett nytt meddelande efter turen och en not efter det står i tidsordning, sist.
+  ev.push({ k: 'user', id: 's3', text: 'gör den röd', via: 'text', at: at() }, { k: 'note', id: 'sn3', text: 'Ångrade senaste ändringen.', at: at() });
+  assert.deepEqual(view(ev).slice(-2), ['user:gör den röd', 'note:Ångrade senaste ändringen.']);
+  // En tur utan köat meddelande: noten står sist, som förut.
+  assert.deepEqual(view(history).at(-1), 'note:Ångrade senaste ändringen.');
+});
+
+test('noten efter turslutet står under ett köat meddelande vars tur hann börja med verktyg, utan text (§13)', () => {
+  // Kedjan: turens svar, sedan arbetar Claude med det köade meddelandet (verktyg, ingen text mellan dem) tills Stopp.
+  const ev: ChatEvent[] = [
+    { k: 'user', id: 'b1', text: 'en anteckningsapp', via: 'text', at: at() },
+    turn('start'),
+    { k: 'user', id: 'b2', text: 'och en rubrik', via: 'text', at: at() },
+    { k: 'text', id: 'bx1', text: 'Klart. Anteckningar.', at: at() },
+    { k: 'tool', id: 'bt1', name: 'Edit', label: 'Ändrar index.html', at: at() },
+    turn('end', { ok: false, interrupted: true }),
+    { k: 'note', id: 'bn1', text: 'Avbröts – ändringarna finns kvar', at: at() },
+  ];
+  assert.deepEqual(view(ev), ['user:en anteckningsapp', 'reply:Klart. Anteckningar.', 'user:och en rubrik', 'note:Avbröts – ändringarna finns kvar']);
+  // Ett frågekort i den köade turen är också arbete på den.
+  const asked: ChatEvent[] = [
+    ...ev.slice(0, 4),
+    { k: 'ask', id: 'ba1', ask: { kind: 'permission', tool: 'WebFetch', title: 'Hämta från nätet?', detail: 'https://example.com', canRemember: true, defaultNo: false }, at: at() },
+    { k: 'ask-done', id: 'ba1', decision: 'cancelled' },
+    ...ev.slice(5),
+  ];
+  assert.deepEqual(view(asked).slice(-2), ['user:och en rubrik', 'note:Avbröts – ändringarna finns kvar']);
+});
+
+/* Uppläsningen (§12) när en tur slutar. Fliken som skickade minns att det senaste meddelandet kom med röst (hud.ts);
+   spokenReply avgör vid varje turslut om det meddelandet har fått sitt svar. */
+
+/** Vad fliken läser upp, turslut för turslut, med regeln rule. sent = fliken skickade meddelandet med det id:t. */
+function spoken(events: readonly ChatEvent[], rule: (upTo: ChatEvent[]) => ReturnType<typeof M.spokenReply>, sent: string[]): string[] {
+  const out: string[] = [];
+  let voice = false; // hud.ts: via.get(appId) === 'voice'
+  events.forEach((e, i) => {
+    if (e.k === 'user' && sent.includes(e.id)) voice = e.via === 'voice';
+    if (e.k !== 'turn' || e.phase !== 'end' || !voice) return;
+    const r = rule(events.slice(0, i + 1));
+    if (r === 'wait' || r.via !== 'voice') return;
+    voice = false;
+    if (r.text && e.ok) out.push(r.text);
+  });
+  return out;
+}
+
+/** Regeln före rättelsen: varje turslut svarade på det senaste meddelandet, och turens sista text lästes upp. */
+const oldRule = (upTo: ChatEvent[]): ReturnType<typeof M.spokenReply> => ({ via: 'voice', text: M.closingText(upTo) });
+
+test('uppläsning: ett röstmeddelande under §8.6 läses upp när dess egen tur slutar, inte den förra turens svar (§12)', () => {
+  const ev: ChatEvent[] = [
+    { k: 'user', id: 'v1', text: 'en klocka', via: 'text', at: at() },
+    turn('start'),
+    { k: 'text', id: 'vx1', text: 'Klart. Klockan går.', at: at() },
+    { k: 'user', id: 'v2', text: 'gör en väckarklocka', via: 'voice', at: at() },
+    turn('end', { ok: true }),
+    turn('start'),
+    { k: 'text', id: 'vx2', text: 'Klart. Väckarklockan ringer.', at: at() },
+    turn('end', { ok: true }),
+  ];
+  assert.equal(M.spokenReply(ev.slice(0, 5)), 'wait', 'turen före röstmeddelandet svarade inte på det');
+  assert.deepEqual(M.spokenReply(ev), { via: 'voice', text: 'Klart. Väckarklockan ringer.' });
+  assert.deepEqual(spoken(ev, M.spokenReply, ['v1', 'v2']), ['Klart. Väckarklockan ringer.']);
+  // Kalibrering: den gamla regeln läste den förra turens svar (ett skrivet meddelande) och sedan inget.
+  assert.deepEqual(spoken(ev, oldRule, ['v1', 'v2']), ['Klart. Klockan går.']);
+});
+
+test('uppläsning: ett röstmeddelande efter Stopp läses upp när dess egen tur slutar (§12)', () => {
+  const ev: ChatEvent[] = [
+    { k: 'user', id: 'w1', text: 'en klocka', via: 'text', at: at() },
+    turn('start'),
+    { k: 'user', id: 'w2', text: 'gör en väckarklocka i stället', via: 'voice', at: at() },
+    { k: 'text', id: 'wx1', text: 'Jag bygger en klocka', at: at() },
+    turn('end', { ok: false, interrupted: true }),
+    { k: 'note', id: 'wn1', text: 'Avbröts – ändringarna finns kvar', at: at() },
+    turn('start'),
+    { k: 'text', id: 'wx2', text: 'Klart. Väckarklockan ringer.', at: at() },
+    turn('end', { ok: true }),
+  ];
+  assert.deepEqual(spoken(ev, M.spokenReply, ['w1', 'w2']), ['Klart. Väckarklockan ringer.']);
+  assert.deepEqual(spoken(ev, oldRule, ['w1', 'w2']), [], 'kalibrering: den gamla regeln förbrukade rösten vid den avbrutna turen');
+});
+
+test('uppläsning: ett köat röstmeddelande i kedjan läses upp; skrivet, aldrig kört och en annan fliks meddelande läses inte (§12)', () => {
+  const chain: ChatEvent[] = [
+    { k: 'user', id: 'c1', text: 'en klocka', via: 'text', at: at() },
+    turn('start'),
+    { k: 'text', id: 'cx1', text: 'Jag bygger klockan.', at: at() },
+    { k: 'user', id: 'c2', text: 'och ett alarm', via: 'voice', at: at() },
+    { k: 'text', id: 'cx2', text: 'Klart. Klockan går.', at: at() },
+    { k: 'text', id: 'cx3', text: 'Klart. Alarmet ringer sju.', at: at() },
+    turn('end', { ok: true }),
+  ];
+  assert.deepEqual(spoken(chain, M.spokenReply, ['c1', 'c2']), ['Klart. Alarmet ringer sju.']);
+  // Samma kedja med ett skrivet köat meddelande: inget läses.
+  const typed = chain.map((e) => (e.k === 'user' && e.id === 'c2' ? { ...e, via: 'text' as const } : e));
+  assert.deepEqual(spoken(typed, M.spokenReply, ['c1', 'c2']), []);
+  // Stoppat i kön (dropped): det får inget svar, och rösten förbrukas utan uppläsning.
+  const stopped: ChatEvent[] = [
+    ...chain.slice(0, 4),
+    { k: 'note', id: 'cn1', text: 'Stoppad – ”och ett alarm” avbröts', dropped: 'c2', at: at() },
+    { k: 'text', id: 'cx4', text: 'Jag bygger klockan och', at: at() },
+    turn('end', { ok: false, interrupted: true }),
+  ];
+  assert.deepEqual(M.spokenReply(stopped), { via: 'voice', text: null });
+  // Röstmeddelandet kom från en annan flik: den här fliken skickade bara det skrivna och läser ingenting.
+  assert.deepEqual(spoken(chain, M.spokenReply, ['c1']), []);
 });
 
 /* Kantljuset (§13 punkt 3, §14): panelens innerkant andas medan Claude arbetar, i fas med aktivitetsradens LED.

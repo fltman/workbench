@@ -1,6 +1,8 @@
 // server/store/logs.ts — loggar per app: konsolen, backenden och workbenchens egna notiser (CONTRACT §3, AppLogs).
 //
 // - En ring i minnet per app med de senaste 2000 posterna; tail(n) formaterar "HH:MM:SS [källa] text" (lokal tid).
+//   Första gången en app nämns (append eller tail) i en ny process läses ringen in ur logs.txt.1 och logs.txt, så att
+//   get_app_logs och HUD:ens Visa loggen ser det som hände före en omstart (npm run dev startar om vid varje ändring).
 // - Varje post läggs också till i data/apps/<id>/logs.txt ("YYYY-MM-DD HH:MM:SS [källa] text"). Skrivningarna buntas
 //   (50 ms) så att en pratig backend aldrig blockerar servern. Filen roteras vid 1 MB: logs.txt blir logs.txt.1
 //   (en enda tidigare fil sparas).
@@ -61,12 +63,57 @@ function fileLine(e: Entry): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${clock(d)} [${e.source}] ${e.text}\n`;
 }
 
+const FILE_LINE_RE = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) \[(console|backend|workbench)\] (.*)$/;
+
+/** Posterna i en loggfil (fileLine): en rad som inte börjar med datum och källa fortsätter posten före. */
+function parseLogFile(text: string): Entry[] {
+  const out: Entry[] = [];
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  for (const line of lines) {
+    const m = FILE_LINE_RE.exec(line);
+    if (m) {
+      const [, y, mo, d, h, mi, sec, source, rest] = m;
+      out.push({ at: new Date(+y, +mo - 1, +d, +h, +mi, +sec).getTime(), source: source as Source, text: rest });
+    } else if (out.length) out[out.length - 1].text += `\n${line}`;
+  }
+  return out;
+}
+
 export function createAppLogs(paths: Paths): AppLogs & { flush(): Promise<void> } {
   const rings = new Map<string, Entry[]>();
   let pending = new Map<string, string[]>();
   const sizes = new Map<string, number>(); // känd storlek på logs.txt per app
   let timer: ReturnType<typeof setTimeout> | null = null;
   let chain: Promise<void> = Promise.resolve();
+
+  /**
+   * Appens ring; första gången i processen inläst ur logs.txt.1 och logs.txt (de senaste RING_SIZE posterna, den äldre
+   * filen bara när den nyare inte räcker). Ett ogiltigt id ger undefined.
+   */
+  function ringOf(appId: string): Entry[] | undefined {
+    if (typeof appId !== 'string' || !APP_ID_RE.test(appId)) return undefined;
+    let ring = rings.get(appId);
+    if (ring) return ring;
+    ring = [];
+    try {
+      const file = path.join(paths.appDataDir(appId), 'logs.txt');
+      for (const f of [file, `${file}.1`]) {
+        if (ring.length >= RING_SIZE) break;
+        let text: string;
+        try {
+          text = fs.readFileSync(f, 'utf8');
+        } catch {
+          continue; // finns inte (ingen logg ännu, eller aldrig roterad)
+        }
+        ring.unshift(...parseLogFile(text).slice(-(RING_SIZE - ring.length)));
+      }
+    } catch (err) {
+      console.warn(`[logs] kunde inte läsa loggen för ${appId}: ${String(err)}`);
+    }
+    rings.set(appId, ring);
+    return ring;
+  }
 
   /** Lägg till raderna i logs.txt. Filen blir aldrig större än 1 MB: den roteras mellan två rader. */
   async function writeLines(appId: string, lines: string[]): Promise<void> {
@@ -125,8 +172,7 @@ export function createAppLogs(paths: Paths): AppLogs & { flush(): Promise<void> 
       const text = cleanLogText(line);
       if (!text) return;
       const e: Entry = { at: Date.now(), source: SOURCES.includes(source) ? source : 'workbench', text };
-      let ring = rings.get(appId);
-      if (!ring) rings.set(appId, (ring = []));
+      const ring = ringOf(appId) ?? [];
       ring.push(e);
       if (ring.length > RING_SIZE + RING_SIZE / 4) ring.splice(0, ring.length - RING_SIZE); // trimma i klump
       let lines = pending.get(appId);
@@ -136,7 +182,7 @@ export function createAppLogs(paths: Paths): AppLogs & { flush(): Promise<void> 
     },
 
     tail(appId, n = 80) {
-      const ring = rings.get(appId);
+      const ring = ringOf(appId);
       if (!ring) return [];
       const k = Math.min(RING_SIZE, Math.max(0, Number.isFinite(n) ? Math.floor(n) : 80));
       if (k === 0) return [];
@@ -144,7 +190,8 @@ export function createAppLogs(paths: Paths): AppLogs & { flush(): Promise<void> 
     },
 
     clear(appId) {
-      rings.delete(appId);
+      // En tom ring, inte ingen: annars läste nästa tail in den borttagna appens fil igen.
+      if (typeof appId === 'string' && APP_ID_RE.test(appId)) rings.set(appId, []);
       pending.delete(appId);
       sizes.delete(appId);
     },

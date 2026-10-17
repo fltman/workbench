@@ -27,6 +27,20 @@ export const WB_LEAKS = {
   pagehide: [["  addEventListener('pagehide', () => flush(true));\n", '']],
   /** Rekursionsspärren borta: console.error inifrån formateringen loggar igen. */
   'log-guard': [['    if (inLog) return;\n    inLog = true;\n    try {\n      fn();', '    inLog = true;\n    try {\n      fn();']],
+  /** Kanalen mellan sidorna lämnar också till avsändarens egna lyssnare. */
+  'channel-self': [['    if (ch) ch.postMessage(d);\n', '    if (ch) ch.postMessage(d);\n    deliver(d);\n']],
+  /** wb.store.onChange sänds innan servern har värdet. */
+  'channel-early': [
+    [
+      "      return nativeFetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body }).then((res) => {\n        if (!res.ok) throw failed('wb.store.set(\"' + key + '\")', res);\n        broadcast({ wb: 1, kind: 'store', key });\n",
+      "      broadcast({ wb: 1, kind: 'store', key });\n      return nativeFetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body }).then((res) => {\n        if (!res.ok) throw failed('wb.store.set(\"' + key + '\")', res);\n",
+    ],
+  ],
+  /** Kanalen har historik: det senast sända sparas och spelas upp för varje ny lyssnare, även i en sida som kom senare. */
+  'channel-replay': [
+    ['    if (ch) ch.postMessage(d);\n', "    if (ch) ch.postMessage(d);\n    try { localStorage.setItem('wb-senast', JSON.stringify(d)); } catch {}\n"],
+    ['    chan();\n    fns.add(fn);\n', "    chan();\n    fns.add(fn);\n    try { const last = JSON.parse(localStorage.getItem('wb-senast')); if (last) deliver(last); } catch {}\n"],
+  ],
 } as const satisfies Record<string, readonly Patch[]>;
 
 /** Läckor i web/src/bridge.ts. */
@@ -46,6 +60,12 @@ export const BRIDGE_LEAKS = {
   clamp: [['  return Math.min(hi, Math.max(lo, v));', '  return v;']],
   /** Piltangenter godtas utan ⌃⌥. */
   vocab: [["    if ((code === 'ArrowLeft' || code === 'ArrowRight') && !(ctrl && alt)) return null;\n", '']],
+  /** Märket kläms inte till tre kodpunkter. */
+  'badge-clamp': [['Array.from(t).slice(0, BADGE_MAX)', 'Array.from(t)']],
+  /** Märkets kontrolltecken tas inte bort. */
+  'badge-control': [[".replace(BADGE_STRIP, '')", '']],
+  /** Märket godtar allt och gör det till en sträng. */
+  'badge-type': [["return typeof d.text === 'string' ? { wb: 1, type: 'badge', text: badgeText(d.text) } : null;", "return { wb: 1, type: 'badge', text: badgeText(String(d.text)) };"]],
 } as const satisfies Record<string, readonly Patch[]>;
 
 export function applyLeak(source: string, patches: readonly Patch[]): string {

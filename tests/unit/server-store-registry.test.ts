@@ -6,13 +6,15 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_FACES } from '../../shared/protocol.ts';
 import type { ServerMsg, WindowState } from '../../shared/protocol.ts';
 import { createAppGit } from '../../server/live/git.ts';
 import { makePaths } from '../../server/paths.ts';
-import { createRegistry } from '../../server/store/registry.ts';
+import { createRegistry, troubleLine } from '../../server/store/registry.ts';
 import { createSceneStore } from '../../server/store/scene.ts';
 import type { AppGit, Config, Hub, Paths, SceneStore } from '../../server/types.ts';
+import { applyLeak, type Patch } from '../bridge-harness/leaks.ts';
 
 const roots: string[] = [];
 after(() => {
@@ -43,6 +45,12 @@ function fakeGit(fail = false): AppGit & { calls: string[] } {
       return false;
     },
     async undo() {
+      return false;
+    },
+    async redo() {
+      return false;
+    },
+    async canRedo() {
       return false;
     },
   };
@@ -401,4 +409,196 @@ test('get, list och manifest ger kopior', async () => {
   w.registry.manifest(app.id).faces.length = 0;
   assert.deepEqual(w.registry.get(app.id), app);
   assert.deepEqual(w.registry.manifest(app.id).faces, DEFAULT_FACES);
+});
+
+/* ------------------------------ felsignalen (§7.2) ------------------------------ */
+
+/** En kopia av registry.ts med ett planterat fel (exakta textbyten), för kalibreringen av "sätter inget". */
+const PLANTS = {
+  /** Varje console.error räknas, inte bara ohanterade fel. */
+  'every-error': [['const CONSOLE_TROUBLE = /^error: (Uncaught\\b.*)/;', 'const CONSOLE_TROUBLE = /^error: (.*)/;']],
+  /** Varje rad på backendens stderr räknas. */
+  'every-stderr': [['const STDERR_TROUBLE = /^\\s*\\[?(?:Uncaught\\s+)?(?:[A-Z][A-Za-z]*)?(?:Error|Exception|Rejection)\\b/;', 'const STDERR_TROUBLE = /(?:)/;']],
+  /** Fel räknas även under en tur. */
+  'any-status': [["if (!e || !e.info.built || e.info.status !== 'idle') return;", 'if (!e || !e.info.built) return;']],
+  /** Sidans version (x-wb-rev) spelar ingen roll: den gamla iframen och skärmbildssidan räknas också. */
+  'any-rev': [["      if (source === 'console' && rev !== e.info.rev) return;\n", '']],
+} as const satisfies Record<string, readonly Patch[]>;
+
+async function plantedRegistry(name: keyof typeof PLANTS): Promise<typeof createRegistry> {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const dir = path.join(here, '../../.scratch/registry-plants');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `registry-${name}-${process.pid}.ts`);
+  roots.push(file);
+  const orig = path.join(here, '../../server/store/registry.ts');
+  // Varje relativ import pekar på originalets moduler, så att kopian tål en ny import i registry.ts.
+  const src = applyLeak(fs.readFileSync(orig, 'utf8'), PLANTS[name])
+    .replace(/(from\s+)'(\.{1,2}\/[^']+)'/g, (_, from: string, rel: string) => `${from}'${pathToFileURL(path.resolve(path.dirname(orig), rel)).href}'`);
+  fs.writeFileSync(file, src);
+  return ((await import(pathToFileURL(file).href)) as { createRegistry: typeof createRegistry }).createRegistry;
+}
+
+/** Ett register med en byggd app (status idle), utan något sänt. */
+async function withBuiltApp(make: typeof createRegistry = createRegistry) {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-registry-')));
+  roots.push(home);
+  const paths = makePaths({ home } as Config);
+  const scene = createSceneStore(paths);
+  const hub = fakeHub();
+  const registry = make({ paths, scene, hub, git: fakeGit() });
+  const { app } = await registry.create(REQ);
+  fs.writeFileSync(path.join(paths.appDir(app.id), 'index.html'), '<p>Hej</p>');
+  registry.refresh(app.id);
+  hub.msgs.length = 0;
+  /** En rad från en sida som laddade appens nuvarande version (x-wb-rev, §7.2). */
+  const fromPage = (line: string, appId = app.id): void => registry.noteLog(appId, 'console', line, registry.get(appId)?.rev);
+  return { registry, hub, paths, id: app.id, fromPage };
+}
+
+const UNCAUGHT = "error: Uncaught TypeError: Cannot read properties of null (reading 'x') ⏎     at tick (http://a1b2c3d.localhost:8220/index.html:12:5) ⏎     at index.html:20:1";
+const UNCAUGHT_FIRST = "Uncaught TypeError: Cannot read properties of null (reading 'x')";
+/** Det wb.js och handleLog skriver för ett vanligt console.error och en varning (inte ohanterade fel). */
+const POLLING = ['error: Kunde inte hämta flödet: HTTP 503', 'error: TypeError: Failed to fetch', 'warn: Uncaught-liknande varning', 'log: Uncaught'];
+/** Nodes egna varningar och vanlig text på stderr, och platsraderna före ett felnamn i en krasch. */
+const STDERR_QUIET = [
+  '(node:4242) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.',
+  '(Use `node --trace-deprecation ...` to show where the warning was created)',
+  'Kunde inte ansluta till IMAP, försöker igen om 60 s',
+  'file:///Users/x/apps/a1b2c3d/server.mjs:12',
+  "    throw new Error('trasig');",
+  '    at Server.<anonymous> (file:///Users/x/apps/a1b2c3d/server.mjs:12:11)',
+  'Node.js v25.2.1',
+  'Errors: 0',
+];
+
+test('felsignalen: ett ohanterat fel i en sida sätter trouble (första raden) och sänds en gång; bumpRev tar bort det', async () => {
+  const { registry, hub, id, fromPage } = await withBuiltApp();
+  fromPage(UNCAUGHT);
+  fromPage('error: Uncaught (in promise) Error: avvisat ⏎     at x');
+  fromPage(UNCAUGHT);
+  assert.equal(registry.get(id)?.trouble, UNCAUGHT_FIRST);
+  assert.deepEqual(hub.msgs.map((m) => (m.t === 'app' ? m.app.trouble : m.t)), [UNCAUGHT_FIRST], "en enda 'app' per fel efter turen");
+  assert.deepEqual(registry.troubles(id), [UNCAUGHT_FIRST, 'Uncaught (in promise) Error: avvisat'], 'olika rader, utan dubbletter');
+  assert.equal(registry.list()[0].trouble, UNCAUGHT_FIRST, 'med i snapshoten');
+  registry.bumpRev(id);
+  const last = hub.msgs.at(-1);
+  assert.ok(last?.t === 'app');
+  assert.equal('trouble' in last.app, false, 'ny version: borta i sändningen');
+  assert.equal(registry.get(id)?.trouble, undefined);
+  assert.deepEqual(registry.troubles(id), []);
+});
+
+test('felsignalen: texten kortas till 120 tecken, högst 5 rader sparas åt förslagen, och styrtecken tas bort', async () => {
+  const { registry, id, fromPage } = await withBuiltApp();
+  fromPage(`error: Uncaught Error: ${'å'.repeat(400)}`);
+  const t = registry.get(id)?.trouble ?? '';
+  assert.equal([...t].length, 120);
+  assert.ok(t.startsWith('Uncaught Error: åå') && t.endsWith('…'));
+  for (let i = 0; i < 9; i++) fromPage(`error: Uncaught Error: nr ${i}‮`);
+  const lines = registry.troubles(id);
+  assert.equal(lines.length, 5);
+  assert.ok(lines.every((l) => [...l].length <= 300 && !l.includes('‮')), JSON.stringify(lines.map((l) => l.length)));
+});
+
+test('felsignalen: formattecken (Unicode Cf) blir mellanslag som riktningstecknen, också U+061C och tecken med noll bredd', () => {
+  assert.equal(troubleLine('console', 'error: Uncaught Error: a\u061Cb\u200Bc\u2060d\u202Ee'), 'Uncaught Error: a b c d e');
+  assert.equal(troubleLine('stderr', 'TypeError: \u00ADx\uFEFF'), 'TypeError: x');
+});
+
+test('felsignalen: turens slut tar bort trouble; under en tur, med status error och i en obyggd app sätts inget', async () => {
+  const { registry, id, fromPage } = await withBuiltApp();
+  registry.setStatus(id, 'building');
+  fromPage(UNCAUGHT);
+  registry.setStatus(id, 'waiting');
+  registry.noteLog(id, 'stderr', 'Error: trasig');
+  assert.equal(registry.get(id)?.trouble, undefined, 'under en tur');
+  registry.setStatus(id, 'idle');
+  assert.deepEqual(registry.troubles(id), [], 'felen under turen sparas inte heller');
+  fromPage(UNCAUGHT);
+  assert.equal(registry.get(id)?.trouble, UNCAUGHT_FIRST, 'kontroll: efter turen sätts det');
+  registry.setStatus(id, 'building');
+  assert.equal(registry.get(id)?.trouble, UNCAUGHT_FIRST, 'står kvar medan nästa tur pågår');
+  registry.setStatus(id, 'error');
+  assert.equal(registry.get(id)?.trouble, undefined, 'turens slut (även utan ny version) tar bort det');
+  fromPage(UNCAUGHT);
+  assert.equal(registry.get(id)?.trouble, undefined, 'status error: pricken är redan bärnstensfärgad');
+  const { app: unbuilt } = await registry.create({ ...REQ, x: 2000 });
+  fromPage(UNCAUGHT, unbuilt.id);
+  assert.equal(registry.get(unbuilt.id)?.trouble, undefined, 'obyggd app');
+  assert.doesNotThrow(() => {
+    registry.noteLog('a999999', 'console', UNCAUGHT);
+    registry.noteLog('../x', 'stderr', 'Error: x');
+  });
+  assert.deepEqual(registry.troubles('a999999'), []);
+});
+
+test('kalibrering: ett register som räknar fel även under en tur fälls', async () => {
+  const { registry, id, fromPage } = await withBuiltApp(await plantedRegistry('any-status'));
+  registry.setStatus(id, 'building');
+  fromPage(UNCAUGHT);
+  assert.equal(registry.get(id)?.trouble, UNCAUGHT_FIRST, 'testet ska fälla det planterade felet');
+});
+
+test('felsignalen: ett vanligt console.error, varningar och loggar sätter inget (en pollande app blir inte bärnstensfärgad)', async () => {
+  const { registry, hub, id, fromPage } = await withBuiltApp();
+  for (let i = 0; i < 3; i++) for (const line of POLLING) fromPage(line);
+  assert.equal(registry.get(id)?.trouble, undefined);
+  assert.deepEqual(registry.troubles(id), []);
+  assert.deepEqual(hub.msgs, []);
+});
+
+test('kalibrering: ett register som räknar varje console.error fälls', async () => {
+  const { registry, id, fromPage } = await withBuiltApp(await plantedRegistry('every-error'));
+  for (const line of POLLING) fromPage(line);
+  assert.equal(registry.get(id)?.trouble, 'Kunde inte hämta flödet: HTTP 503', 'testet ska fälla det planterade felet');
+});
+
+/** En sida som laddades före bumpRev (den gamla iframen under bytet, Claudes skärmbildssida) och en utan huvudet. */
+function staleLines(registry: ReturnType<typeof createRegistry>, id: string): void {
+  const old = registry.get(id)!.rev;
+  registry.bumpRev(id);
+  registry.noteLog(id, 'console', UNCAUGHT, old);
+  registry.noteLog(id, 'console', 'error: Uncaught Error: utan version');
+}
+
+test('felsignalen: bara en sida som laddade nuvarande version räknas (x-wb-rev); den gamla sidan sätter inte tillbaka felet', async () => {
+  const { registry, hub, id, fromPage } = await withBuiltApp();
+  fromPage(UNCAUGHT);
+  assert.equal(registry.get(id)?.trouble, UNCAUGHT_FIRST);
+  staleLines(registry, id);
+  assert.equal(registry.get(id)?.trouble, undefined, 'den rättade versionen får inte tillbaka felet');
+  assert.deepEqual(registry.troubles(id), [], 'inte heller åt förslagen');
+  assert.equal(hub.msgs.filter((m) => m.t === 'app' && m.app.trouble).length, 1, 'bara den första sändningen bar felet');
+  // Kontroll i samma körning: en sida med den nya versionen sätter det.
+  fromPage('error: Uncaught Error: ny bugg');
+  assert.equal(registry.get(id)?.trouble, 'Uncaught Error: ny bugg');
+});
+
+test('kalibrering: ett register som inte ser på sidans version fälls', async () => {
+  const { registry, id } = await withBuiltApp(await plantedRegistry('any-rev'));
+  staleLines(registry, id);
+  assert.equal(registry.get(id)?.trouble, UNCAUGHT_FIRST, 'testet ska fälla det planterade felet');
+});
+
+test('felsignalen från backenden (supervisorn lämnar raden bara vid en krasch, §9): en rad som börjar med ett felnamn räknas; Nodes varningar, vanlig text och platsrader inte', async () => {
+  const { registry, id } = await withBuiltApp();
+  for (const line of STDERR_QUIET) registry.noteLog(id, 'stderr', line);
+  assert.equal(registry.get(id)?.trouble, undefined, JSON.stringify(registry.troubles(id)));
+  const errors = [
+    "Error: ENOENT: no such file or directory, open '/x/data/mejl.json'",
+    'TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string. Received undefined',
+    '[UnhandledPromiseRejection: This error originated either by throwing inside of an async function without a catch block.]',
+    'SqliteError: no such table: mejl',
+    '  Uncaught Exception: trasig',
+  ];
+  for (const line of errors) registry.noteLog(id, 'stderr', line);
+  assert.equal(registry.get(id)?.trouble, errors[0]);
+  assert.deepEqual(registry.troubles(id), [errors[0], errors[1], errors[2], errors[3], 'Uncaught Exception: trasig']);
+});
+
+test('kalibrering: ett register som räknar varje stderr-rad fälls', async () => {
+  const { registry, id } = await withBuiltApp(await plantedRegistry('every-stderr'));
+  for (const line of STDERR_QUIET) registry.noteLog(id, 'stderr', line);
+  assert.ok(registry.get(id)?.trouble?.startsWith('(node:4242) [DEP0040]'), 'testet ska fälla det planterade felet');
 });

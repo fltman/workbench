@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import type { Config } from '../../server/types.ts';
-import { createProviders, fixWavHeader, sttOrder, sttPrompt, toWav, transcribeWith } from '../../server/stt.ts';
+import { createProviders, ffmpegOnPath, fixWavHeader, sttOrder, sttPrompt, toWav, transcribeWith } from '../../server/stt.ts';
 import type { SttProviders } from '../../server/stt.ts';
 import { makeConfig, rmDir, tempDir } from './server-http-fakes.test.ts';
 
@@ -98,8 +98,8 @@ function fakeService(reply: (seen: Seen) => { status: number; body: unknown } | 
     res.writeHead(r.status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(r.body));
   });
-  return new Promise((resolve) =>
-    server.listen(0, '127.0.0.1', () =>
+  return new Promise((resolve, reject) =>
+    server.once('error', reject).listen(0, '127.0.0.1', () =>
       resolve({
         url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
         seen,
@@ -269,5 +269,24 @@ describe('OPENAI_API_KEY når aldrig ffmpeg (childEnv)', () => {
       if (saved === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = saved;
     }
+  });
+});
+
+describe('ffmpegOnPath: finns ffmpeg för whisper-vägen (startraden, §7)', () => {
+  let dir: string;
+  before(() => {
+    dir = tempDir('sttpath');
+    for (const d of ['med', 'utan-x', 'katalog', 'tom']) fs.mkdirSync(path.join(dir, d));
+    fs.writeFileSync(path.join(dir, 'med', 'ffmpeg'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(dir, 'utan-x', 'ffmpeg'), '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+    fs.mkdirSync(path.join(dir, 'katalog', 'ffmpeg'));
+  });
+  after(() => rmDir(dir));
+
+  test('en körbar fil i någon katalog i PATH, men inte en fil utan x-bit, en katalog eller ett tomt led', () => {
+    const p = (...ds: string[]): string => ds.map((d) => (d ? path.join(dir, d) : '')).join(path.delimiter);
+    assert.equal(ffmpegOnPath(p('tom', 'med')), true, 'detektorn hittar en körbar ffmpeg');
+    assert.equal(ffmpegOnPath(p('tom', 'utan-x', 'katalog', '')), false);
+    assert.equal(ffmpegOnPath(''), false);
   });
 });

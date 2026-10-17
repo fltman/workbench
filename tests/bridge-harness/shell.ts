@@ -38,7 +38,7 @@ addEventListener('wheel', () => topWheel++, { passive: true });
 
 const mod = (await import(`/web/src/bridge.ts${leak ? `?leak=${encodeURIComponent(leak)}` : ''}`)) as BridgeModule;
 
-for (const p of placements) {
+function place(p: Placement): void {
   const wrap = document.createElement('div');
   wrap.className = 'win';
   wrap.style.width = `${p.w}px`;
@@ -52,7 +52,7 @@ for (const p of placements) {
   document.body.append(wrap);
   iframes.push(iframe);
   const win = iframe.contentWindow;
-  if (!win || !p.registered) continue;
+  if (!win || !p.registered) return;
   const bw: BridgeWindow = {
     appId: p.appId,
     face: p.face,
@@ -64,6 +64,7 @@ for (const p of placements) {
   byWindow.set(win, bw);
   windowOf.set(bw, win);
 }
+for (const p of placements) place(p);
 
 // Bara för läckan "by-origin": en brygga som litar på origin i stället för på event.source.
 (globalThis as unknown as { __resolveByOrigin: (o: string) => BridgeWindow | null }).__resolveByOrigin = (o) =>
@@ -87,6 +88,7 @@ const unsubscribe = mod.createParentBridge({
   onKey: (w, key) => record('key', w, key),
   onFocus: (w) => record('focus', w),
   onFaceRequest: (w, face) => record('face', w, face),
+  onBadge: (w, text) => record('badge', w, text),
 });
 
 Object.assign(window, {
@@ -105,6 +107,11 @@ Object.assign(window, {
     /** Ett välformat meddelande från skalet självt (ska ignoreras). */
     selfPost(msg: unknown) {
       window.postMessage(msg, '*');
+    },
+    /** En iframe till, efter att sidan laddats (en sida som kommer senare än en ändring). */
+    addFrame(p: Placement) {
+      placements.push(p);
+      place(p);
     },
     unsubscribe,
     ready: true,

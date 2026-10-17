@@ -149,12 +149,12 @@ describe('vakten sitter först i routern (kalibrerad mot en planterad läcka)', 
       fs.writeFileSync(path.join(data, 'store.json'), JSON.stringify({ hemlig: 'KANARIE-STORE' }));
       fs.writeFileSync(path.join(s.paths.appDir(CANARY_APP), 'sw.js'), '// KANARIE-SW');
     }
-  });
+  }, { timeout: 30_000 });
   after(async () => {
-    await real.close();
-    await leaky.close();
+    await real?.close();
+    await leaky?.close();
     rmDir(home);
-  });
+  }, { timeout: 30_000 });
 
   /** Detektorn: förfrågan släpptes igenom och gav data. */
   const leaked = (r: Res, canary: string): boolean => r.status < 300 && r.text.includes(canary);
